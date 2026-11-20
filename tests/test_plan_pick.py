@@ -676,5 +676,76 @@ class LogLaunchTests(unittest.TestCase):
             self.assertEqual(buf.getvalue(), "")
 
 
+class ServerHoldTests(unittest.TestCase):
+    HOLD_LINE = "HOLD worker, HOLD chat: load5 30.36 is 1.69x 18 cores"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.pools = self.dir / "pools.json"
+        self.pools.write_text("{}")
+        self.launches = self.dir / "launches.jsonl"
+        self.marker = self.dir / "stub-ran"
+
+    def stub(self, code, line="", touch_marker=False):
+        path = self.dir / "vps-state"
+        script = "#!/bin/sh\n"
+        if line:
+            script += "brief=0\n"
+            script += 'for arg in "$@"; do case "$arg" in --brief) brief=1 ;; esac; done\n'
+            script += f'if [ "$brief" = 1 ]; then printf \'%s\\n\' \'{line}\'; fi\n'
+        if touch_marker:
+            script += f"touch '{self.marker}'\n"
+        script += f"exit {code}\n"
+        path.write_text(script)
+        path.chmod(0o755)
+        return str(path)
+
+    def run_main(self, binary, args=None):
+        ran = []
+        out, err = io.StringIO(), io.StringIO()
+        argv = ["--pools", str(self.pools)] + (["--run"] if args is None else args)
+        with mock.patch.dict(os.environ, {"VPS_STATE_BIN": binary}), \
+             mock.patch.object(pp, "LAUNCHES", str(self.launches)), \
+             mock.patch.object(pp, "run_lanes", lambda *a, **k: ran.append((a, k)) or 0), \
+             redirect_stdout(out), redirect_stderr(err):
+            code = pp.main(argv)
+        return code, out.getvalue(), ran
+
+    def logged(self):
+        return [json.loads(line) for line in self.launches.read_text().splitlines()]
+
+    def test_hold_starts_nothing_and_exits_4(self):
+        code, out, ran = self.run_main(self.stub(2, self.HOLD_LINE))
+        self.assertEqual(code, 4)
+        self.assertEqual(ran, [])
+        self.assertEqual([entry["lane"] for entry in self.logged()], ["server-hold"])
+        self.assertIn(self.HOLD_LINE, out)
+        self.assertIn("plan-pick --run again", out)
+        self.assertEqual(len(out.strip().splitlines()), 1, out)
+
+    def test_careful_add_unknown_and_missing_checks_launch(self):
+        for code, line in ((1, "CAREFUL worker, ADD chat: load5 10.00 is 0.55x 18 cores"),
+                           (0, "ADD worker, ADD chat: load5 2.00 is 0.11x 18 cores"),
+                           (3, "")):
+            with self.subTest(code=code):
+                self.launches.unlink(missing_ok=True)
+                got, out, ran = self.run_main(self.stub(code, line))
+                self.assertEqual((got, len(ran)), (0, 1), out)
+                self.assertFalse(self.launches.exists())
+
+    def test_missing_binary_launches(self):
+        got, out, ran = self.run_main(str(self.dir / "no-such-vps-state"))
+        self.assertEqual((got, len(ran)), (0, 1), out)
+        self.assertFalse(self.launches.exists())
+
+    def test_plain_pick_and_json_skip_the_check(self):
+        binary = self.stub(2, self.HOLD_LINE, touch_marker=True)
+        for args in ([], ["--json"]):
+            with self.subTest(args=args):
+                got, out, ran = self.run_main(binary, args)
+                self.assertEqual((got, ran), (0, []), out)
+                self.assertFalse(self.marker.exists(), out)
+
+
 if __name__ == "__main__":
     unittest.main()
