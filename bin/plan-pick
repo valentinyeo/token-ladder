@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import glob
 import json
 import os
 import re
@@ -24,10 +25,14 @@ BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
 DEFAULT_OPENCODE_CREDIT_FLOOR = 6
 DEFAULT_OPENCODE_CREDIT_FRESH_HOURS = 2
+DEFAULT_OPENCODE_ESTIMATE_HOURS = 24
+DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK = 2.0
+OPENCODE_LANE_PROVIDER = "opencode-go"
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
 LAUNCHES = os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
 PI = os.path.expanduser("~/.npm-global/bin/pi")
+PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
 DEFAULT_CREDIT_FLOOR_USD = 2.0
 DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
@@ -355,7 +360,7 @@ def last_credit(pacing_dir):
     return max(rows, key=lambda r: r["at"]) if rows else None
 
 
-def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
+def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
     stale_s = (number(cfg.get("opencode_stale_hours")) or DEFAULT_STALE_HOURS) * 3600
     windows = last_windows(pacing_dir)
     if not windows or now - windows["at"] > stale_s:
@@ -364,21 +369,74 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
     for name in ("rolling", "5-hour", "weekly", "monthly"):
         if (number(used.get(name)) or 0) >= 100:
             if name == "monthly":
-                return opencode_credit_pool(now, cfg, pacing_dir)
+                return opencode_credit_pool(now, cfg, pacing_dir, sessions)
             return {"state": "OFF", "note": f"OpenCode {name} window is full"}
     return {"state": "ON", "note": "OpenCode windows have room"}
 
 
-def opencode_credit_pool(now, cfg, pacing_dir):
+def lane_spend(since, sessions=PI_SESSIONS, provider=OPENCODE_LANE_PROVIDER,
+               rate=DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK):
+    total = 0.0
+    for path in glob.glob(os.path.join(sessions, "*", "*.jsonl")):
+        try:
+            if os.path.getmtime(path) < since:
+                continue
+            with open(path, errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if provider not in line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            message = row.get("message") if isinstance(row, dict) else None
+            if not isinstance(message, dict) or message.get("provider") != provider:
+                continue
+            at = number(message.get("timestamp"))
+            if at is None or at / 1000 <= since:
+                continue
+            usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+            cost = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
+            total += number(cost.get("total")) or (number(usage.get("totalTokens")) or 0) * rate / 1000000
+    return total
+
+
+def estimated_credit(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
+    hours = number(cfg.get("opencode_estimate_hours")) or DEFAULT_OPENCODE_ESTIMATE_HOURS
+    base = last_credit(pacing_dir)
+    if not base or now - base["at"] > hours * 3600:
+        return None
+    rate = number(cfg.get("opencode_estimate_usd_per_mtok")) or DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK
+    spent = lane_spend(base["at"], sessions, rate=rate)
+    return {"credits_usd": max(0.0, base["credits_usd"] - spent), "base_usd": base["credits_usd"],
+            "base_at": base["at"], "spent_usd": spent}
+
+
+def opencode_credit_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
     floor = number(cfg.get("opencode_credit_floor_usd")) or DEFAULT_OPENCODE_CREDIT_FLOOR
     fresh_s = (number(cfg.get("opencode_credit_fresh_hours")) or DEFAULT_OPENCODE_CREDIT_FRESH_HOURS) * 3600
+    hours = number(cfg.get("opencode_estimate_hours")) or DEFAULT_OPENCODE_ESTIMATE_HOURS
     row = last_credit(pacing_dir)
-    if not row or now - row["at"] > fresh_s:
-        return {"state": "OFF", "note": "OpenCode monthly window is full and no fresh credit reading"}
-    credit = row["credits_usd"]
+    if row and now - row["at"] <= fresh_s:
+        credit = row["credits_usd"]
+        if credit < floor:
+            return {"state": "OFF", "note": f"OpenCode monthly window is full and credit ${credit:.2f} is under ${floor:g}"}
+        return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} credit (floor ${floor:g})"}
+    est = estimated_credit(now, cfg, pacing_dir, sessions)
+    if est is None:
+        return {"state": "OFF", "note": "OpenCode monthly window is full and no credit reading or estimate "
+                                         f"from the last {hours:g} hours"}
+    credit = est["credits_usd"]
+    proof = (f"${est['base_usd']:.2f} read {(now - est['base_at']) / 3600:.1f}h ago "
+             f"less ${est['spent_usd']:.2f} spend seen since")
     if credit < floor:
-        return {"state": "OFF", "note": f"OpenCode monthly window is full and credit ${credit:.2f} is under ${floor:g}"}
-    return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} credit (floor ${floor:g})"}
+        return {"state": "OFF", "note": f"OpenCode monthly window is full and estimated credit ${credit:.2f} "
+                                         f"is under ${floor:g} ({proof})"}
+    return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} estimated credit: "
+                                     f"{proof} (floor ${floor:g})"}
 
 
 def read_pools(source):
