@@ -90,6 +90,18 @@ class PickTests(unittest.TestCase):
         self.assertEqual(pick({"codex": pool("ON", 1.5)}, limits, warn=1.0)["plan"], "cursor")
 
 
+class NoLaneTests(unittest.TestCase):
+    def test_no_lane_names_the_next_free_lane_and_never_asks_to_pay(self):
+        limits = {"vercel": T + 600, "deepseek": T + 3600, "opencode": T + 7200, "openrouter": T + 900}
+        pools = {"codex": {"state": "OFF"}, "grok": {"state": "OFF"}}
+        got = pp.pick(LANES, pools, limits, T)
+        self.assertIsNone(got["command"])
+        self.assertEqual(got["next_free"], {"lane": "vercel", "at": T + 600})
+        self.assertIn("vercel frees at", got["reason"])
+        self.assertIn("wait", got["reason"])
+        self.assertNotIn("top", got["reason"].lower())
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         self.limits = str(Path(tempfile.mkdtemp()) / "limits.json")
@@ -117,6 +129,15 @@ class RunTests(unittest.TestCase):
         Path(self.limits).write_text(json.dumps(limits))
         self.assertEqual(self.go({}), 4)
         self.assertEqual([e["lane"] for e in self.logged()], [None])
+
+    def test_no_lane_left_says_when_the_next_lane_frees(self):
+        limits = {lane["lane"]: T + 60 * (i + 1) for i, lane in enumerate(LANES)}
+        Path(self.limits).write_text(json.dumps(limits))
+        self.assertEqual(self.go({}), 4)
+        said = " ".join(self.said)
+        self.assertIn("frees at", said)
+        self.assertIn("wait", said)
+        self.assertNotIn("top", said.lower())
 
     def test_success_runs_one_lane(self):
         self.assertEqual(self.go({"run vercel": (0, "done")}), 0)

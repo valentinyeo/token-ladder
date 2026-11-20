@@ -82,8 +82,17 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN):
             reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
         return {"plan": name, "command": lane["command"], "reason": reason}
     if not ahead:
-        return {"plan": "none", "command": None,
-                "reason": "every lane is used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())}
+        reason = "every lane is used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
+        frees = {name: number(limits.get(name)) for name in skipped if (number(limits.get(name)) or 0) > now}
+        next_free = None
+        if frees:
+            lane_name = min(frees, key=frees.get)
+            next_free = {"lane": lane_name, "at": frees[lane_name]}
+            reason += (f"; {lane_name} frees at {datetime.fromtimestamp(frees[lane_name], timezone.utc):%H:%M} UTC,"
+                       " so wait for it and run plan-pick --run again")
+        else:
+            reason += "; wait for the next plan reset"
+        return {"plan": "none", "command": None, "reason": reason, "next_free": next_free}
     name = min(ahead, key=ahead.get)
     lane = next(lane for lane in lanes if lane["lane"] == name)
     others = ", ".join(f"{p} ({w})" for p, w in skipped.items() if p != name)
