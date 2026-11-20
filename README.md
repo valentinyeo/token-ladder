@@ -78,7 +78,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 | Claude | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from `~/.claude/.credentials.json` | `five_hour`, `seven_day` (utilization %, `resets_at`) |
 | Codex | `rate_limits` in the newest `~/.codex/sessions/**/*.jsonl` token_count event (or `codex app-server` rate limit call) | `primary` weekly (`used_percent`, `resets_at`), credits balance |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
-| Cursor | dashboard usage (to confirm) | display only, reserved for the grok bot |
+| Cursor | dashboard usage (to confirm) | display only. The plan includes Composer and Grok models, locally and as Cursor cloud agents, at no extra cost (Valentin, 2026-11-20) |
 
 ## Core idea: pace, not percent
 
