@@ -38,13 +38,13 @@ def number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
-def skip_reason(pool, warn):
+def skip_reason(pool, warn, no_pace=False):
     if not isinstance(pool, dict):
         return None
     if pool.get("state") == "OFF":
         return "used up" + (f": {pool['note']}" if pool.get("note") else "")
     ratio = number(pool.get("pace_ratio"))
-    if ratio is not None and ratio > warn:
+    if not no_pace and ratio is not None and ratio > warn:
         return f"pace {ratio:.2f}x is above {warn:g}x"
     return None
 
@@ -59,7 +59,49 @@ def pool_note(pool, warn):
     return f"pace {pool['pace_ratio']:.2f}x, within {warn:g}x"
 
 
-def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN):
+def resolve_burn_lane(spec, lanes):
+    for lane in lanes:
+        if lane["lane"] == spec or lane.get("pool") == spec:
+            return lane["lane"]
+    return None
+
+
+def parse_burn(cfg, lanes, now=None):
+    burn = cfg.get("burn") if isinstance(cfg, dict) else None
+    if not isinstance(burn, dict):
+        return None
+    spec = burn.get("lane")
+    until_s = burn.get("until")
+    if not isinstance(spec, str) or not isinstance(until_s, str):
+        return None
+    try:
+        until = datetime.fromisoformat(until_s)
+        if until.tzinfo is None:
+            until = until.replace(tzinfo=timezone.utc)
+        until_ts = until.timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+    now_ts = time.time() if now is None else now
+    if now_ts >= until_ts:
+        return None
+    name = resolve_burn_lane(spec, lanes)
+    if name is None:
+        return None
+    return {"lane": name, "until": until_ts}
+
+
+def lanes_with_burn(lanes, burn):
+    if not burn:
+        return lanes
+    name = burn["lane"]
+    head = [lane for lane in lanes if lane["lane"] == name]
+    if not head:
+        return lanes
+    tail = [lane for lane in lanes if lane["lane"] != name]
+    return head + tail
+
+
+def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None):
     pools = pools if isinstance(pools, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
     now = time.time() if now is None else now
@@ -71,13 +113,18 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN):
         if until is not None and until > now:
             skipped[name] = f"limited until {datetime.fromtimestamp(until, timezone.utc):%H:%M} UTC"
             continue
-        why = skip_reason(pool, warn)
+        no_pace = burn is not None and name == burn["lane"]
+        why = skip_reason(pool, warn, no_pace)
         if why:
             skipped[name] = why
             if why.startswith("pace"):
                 ahead[name] = number(pool.get("pace_ratio"))
             continue
-        reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(pool, warn)}"
+        if no_pace:
+            hh = datetime.fromtimestamp(burn["until"], timezone.utc).strftime("%H:%M")
+            reason = f"burn: {name} first until {hh} UTC"
+        else:
+            reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(pool, warn)}"
         if skipped:
             reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
         return {"plan": name, "command": lane["command"], "reason": reason}
@@ -214,7 +261,7 @@ def log_launch(path, lane, now, not_vendor):
         stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"Pacer launch: {lane} {stamp}", file=sys.stderr)
 def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, now=None, say=None,
-              launches_path=LAUNCHES, not_vendor=None):
+              launches_path=LAUNCHES, not_vendor=None, burn=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
     hours = {"rate": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
              "silent": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
@@ -225,7 +272,7 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, n
     tried = set()
     while True:
         result = pick([lane for lane in lanes if lane["lane"] not in tried], pools,
-                      read_limits(limits_path), now, warn)
+                      read_limits(limits_path), now, warn, burn)
         if not result["command"]:
             log_launch(launches_path, None, now, not_vendor)
             say(f"no lane left, nothing ran. {result['reason']}")
@@ -467,9 +514,11 @@ def main(argv):
         return 0 if answer["allowed"] else 3
     if args.not_vendor:
         lanes = [lane for lane in lanes if lane.get("vendor") != args.not_vendor.lower()]
+    burn = parse_burn(cfg, lanes)
+    lanes = lanes_with_burn(lanes, burn)
     if args.run:
-        return run_lanes(lanes, pools, cfg, warn, not_vendor=args.not_vendor)
-    result = pick(lanes, pools, read_limits(), warn=warn)
+        return run_lanes(lanes, pools, cfg, warn, not_vendor=args.not_vendor, burn=burn)
+    result = pick(lanes, pools, read_limits(), warn=warn, burn=burn)
     if args.json:
         print(json.dumps(result))
     elif result["command"]:

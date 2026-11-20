@@ -21,6 +21,9 @@ token-ladder grok-set --pct 42 --resets-at 2026-11-01T12:00:00Z
 
 `grok-set` atomically writes `~/.local/state/token-ladder/grok.json` with `pct` (0-100), ISO `resets_at` and `updated_at=now`. The reader also accepts legacy `used_pct` in place of `pct`, but still requires ISO `updated_at`. A missing or malformed file, missing timestamp, expired reset, future update or update older than `grok_stale_hours: 3` makes Grok unknown.
 
+Optional `burn` in `config.json` or `config.local.json`: `{"lane": "<lane or pool>", "until": "<ISO time with zone>"}`.
+While `until` is in the future, `plan-pick` runs that lane first and ignores its pace ratio; other skips still apply and `--claude-helper` is unchanged.
+
 ## Shared pace warnings
 
 Collection compares usage against elapsed reset-window time.
