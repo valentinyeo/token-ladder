@@ -5,6 +5,15 @@
   "unknown_assumed_pct": 70,
   "pool_warn_pct": 80,
   "pace_warn_ratio": 1.1,
+  "loop_interval": {
+    "base_seconds": 7200,
+    "ahead_seconds": 10800,
+    "far_ahead_seconds": 14400,
+    "ahead_ratio": 1.0,
+    "far_ahead_ratio": 1.2,
+    "used_pct": 95,
+    "min_seconds": 1800
+  },
   "lanes": [
     {
       "lane": "vercel",

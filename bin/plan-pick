@@ -37,6 +37,13 @@ DEFAULT_CREDIT_FLOOR_USD = 2.0
 DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
 DEFAULT_STALE_HOURS = 12
+DEFAULT_LOOP_BASE_SECONDS = 7200
+DEFAULT_LOOP_AHEAD_SECONDS = 10800
+DEFAULT_LOOP_FAR_AHEAD_SECONDS = 14400
+DEFAULT_LOOP_AHEAD_RATIO = 1.0
+DEFAULT_LOOP_FAR_AHEAD_RATIO = 1.2
+DEFAULT_LOOP_USED_PCT = 95
+DEFAULT_LOOP_MIN_SECONDS = 1800
 PLANS_NOTE = "Included means no extra cost: never quote API pricing or ask for a spend cap for these."
 
 
@@ -166,6 +173,53 @@ def claude_helper(pools, warn=DEFAULT_PACE_WARN):
     else:
         note = f"pace {pool['pace_ratio']:.2f}x, within {warn:g}x"
     return {"allowed": True, "reason": f"Claude is under its pace: {note}"}
+
+
+def loop_rule(cfg):
+    raw = cfg.get("loop_interval") if isinstance(cfg, dict) else None
+    raw = raw if isinstance(raw, dict) else {}
+
+    def value(key, default):
+        got = number(raw.get(key))
+        return default if got is None else got
+
+    return {"base_seconds": value("base_seconds", DEFAULT_LOOP_BASE_SECONDS),
+            "ahead_seconds": value("ahead_seconds", DEFAULT_LOOP_AHEAD_SECONDS),
+            "far_ahead_seconds": value("far_ahead_seconds", DEFAULT_LOOP_FAR_AHEAD_SECONDS),
+            "ahead_ratio": value("ahead_ratio", DEFAULT_LOOP_AHEAD_RATIO),
+            "far_ahead_ratio": value("far_ahead_ratio", DEFAULT_LOOP_FAR_AHEAD_RATIO),
+            "used_pct": value("used_pct", DEFAULT_LOOP_USED_PCT),
+            "min_seconds": value("min_seconds", DEFAULT_LOOP_MIN_SECONDS)}
+
+
+def loop_answer(rule, seconds, ratio, used, reason):
+    return {"seconds": max(int(seconds), int(rule["min_seconds"])), "pace_ratio": ratio,
+            "used_pct": used, "reason": reason}
+
+
+def loop_interval(pools, cfg):
+    rule = loop_rule(cfg)
+    pool = pools.get("claude") if isinstance(pools, dict) else None
+    if not isinstance(pool, dict):
+        return loop_answer(rule, rule["base_seconds"], None, None, "claude pool unknown")
+    ratio = number(pool.get("pace_ratio"))
+    used = number(pool.get("used_pct"))
+    if used is not None and used >= rule["used_pct"]:
+        return loop_answer(rule, rule["far_ahead_seconds"], ratio, used, f"claude {used:.0f}% used")
+    if ratio is not None and ratio > rule["far_ahead_ratio"]:
+        return loop_answer(rule, rule["far_ahead_seconds"], ratio, used, f"claude pace {ratio:.2f}x far ahead")
+    if ratio is None:
+        return loop_answer(rule, rule["base_seconds"], None, used, "claude pace unknown")
+    if ratio > rule["ahead_ratio"]:
+        return loop_answer(rule, rule["ahead_seconds"], ratio, used, f"claude pace {ratio:.2f}x ahead")
+    return loop_answer(rule, rule["base_seconds"], ratio, used, f"claude pace {ratio:.2f}x on pace")
+
+
+def loop_interval_answer(source, cfg):
+    try:
+        return loop_interval(read_pools(source), cfg)
+    except Exception:
+        return loop_interval({}, cfg)
 
 
 def load_config():
@@ -538,6 +592,8 @@ def main(argv):
     parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
     parser.add_argument("--claude-helper", action="store_true",
                         help="answer whether an in-chat Claude helper is allowed (exit 0 allowed, 3 refused)")
+    parser.add_argument("--loop-interval", action="store_true",
+                        help="print how many seconds a loop should wait before its next tick, from Claude's pace")
     parser.add_argument("--limited", metavar="LANE",
                         help="mark LANE limited after a 429, quota or empty-credit error; plan-pick skips it for a while")
     parser.add_argument("--not-vendor", metavar="VENDOR",
@@ -549,6 +605,13 @@ def main(argv):
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     args = parser.parse_args(argv)
     cfg = load_config()
+    if args.loop_interval:
+        answer = loop_interval_answer(args.pools, cfg)
+        if args.json:
+            print(json.dumps(answer))
+        else:
+            print(f"{answer['seconds']} {answer['reason']}")
+        return 0
     if args.plans:
         plans = plans_from(cfg)
         if args.json:

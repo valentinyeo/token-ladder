@@ -24,6 +24,28 @@ token-ladder grok-set --pct 42 --resets-at 2026-11-01T12:00:00Z
 Optional `burn` in `config.json` or `config.local.json`: `{"lane": "<lane or pool>", "until": "<ISO time with zone>"}`.
 While `until` is in the future, `plan-pick` runs that lane first and ignores its pace ratio; other skips still apply and `--claude-helper` is unchanged.
 
+## Loop interval
+
+Chats that wake on a timer cost a turn every time they wake, so they ask how long to wait before the next tick:
+
+```sh
+plan-pick --loop-interval
+plan-pick --loop-interval --json
+```
+
+The first prints one line, the seconds to wait and why: `7200 claude pace 0.62x on pace`. The second prints `{"seconds": N, "pace_ratio": R, "used_pct": U, "reason": "..."}`.
+
+It reads the Claude pool the same way `token-ladder pools --json` does, and the thresholds live in `config.json` `loop_interval`:
+
+| Claude pool | Seconds |
+|---|---|
+| base | 7200 |
+| pace above 1.0 | 10800 |
+| pace above 1.2, or 95% used or more | 14400 |
+| unreadable | 7200, reason `claude pool unknown` |
+
+Never under 1800 seconds. The command always exits 0: a watcher can call it without guarding. Board-drain's watcher calls it for its heartbeat.
+
 ## Shared pace warnings
 
 Collection compares usage against elapsed reset-window time.
