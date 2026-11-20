@@ -32,6 +32,64 @@ def pick(pools, limits=None, **kw):
     return pp.pick(LANES, pools, limits or {}, T, **kw)
 
 
+def burn_until(delta_s=3600):
+    return datetime.fromtimestamp(T + delta_s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def pick_with_burn(pools, burn_cfg, limits=None, **kw):
+    cfg = {"burn": burn_cfg}
+    burn = pp.parse_burn(cfg, LANES, T)
+    lanes = pp.lanes_with_burn(LANES, burn)
+    return pp.pick(lanes, pools, limits if limits is not None else {}, T, burn=burn, **kw)
+
+
+class BurnTests(unittest.TestCase):
+    def test_active_burn_picks_cursor_over_pace(self):
+        limits = {lane["lane"]: T + 60 for lane in LANES if lane["lane"] not in ("cursor", "openrouter")}
+        got = pick_with_burn({"grok": pool("ON", 3.0), "codex": pool()}, {"lane": "cursor", "until": burn_until()})
+        self.assertEqual(got["plan"], "cursor")
+        self.assertIn("burn: cursor first until", got["reason"])
+
+    def test_burn_lane_by_pool_name(self):
+        limits = {lane["lane"]: T + 60 for lane in LANES if lane["lane"] != "cursor"}
+        got = pick_with_burn({"grok": pool("ON", 3.0)}, {"lane": "grok", "until": burn_until()})
+        self.assertEqual(got["plan"], "cursor")
+
+    def test_used_up_burn_lane_falls_through(self):
+        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
+        got = pick_with_burn({"grok": pool("OFF", 3.0), "codex": pool()}, {"lane": "cursor", "until": burn_until()},
+                             limits=limits)
+        self.assertEqual(got["plan"], "codex")
+        self.assertIn("cursor (used up", got["reason"])
+
+    def test_expired_burn_restores_pace_skip(self):
+        limits = {lane["lane"]: T + 60 for lane in LANES
+                  if lane["lane"] not in ("cursor", "openrouter", "codex")}
+        expired = datetime.fromtimestamp(T - 60, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
+        got = pick_with_burn({"grok": pool("ON", 3.0), "codex": pool("ON", 3.0)}, {"lane": "cursor", "until": expired},
+                             limits=limits)
+        self.assertEqual(got["plan"], "openrouter")
+        self.assertIn("cursor (pace 3.00x", got["reason"])
+
+    def test_malformed_burn_is_ignored(self):
+        cases = ("x", 1, [], {"lane": 1, "until": burn_until()}, {"lane": "cursor"},
+                 {"lane": "cursor", "until": "not-a-time"}, {"lane": "nosuch", "until": burn_until()})
+        for bad in cases:
+            with self.subTest(bad=bad):
+                cfg = {"burn": bad} if bad != "x" else {"burn": "x"}
+                self.assertIsNone(pp.parse_burn(cfg, LANES, T))
+        limits = {lane["lane"]: T + 60 for lane in LANES
+                  if lane["lane"] not in ("cursor", "openrouter", "codex")}
+        got = pp.pick(LANES, {"grok": pool("ON", 3.0), "codex": pool("ON", 3.0)}, limits, T)
+        self.assertEqual(got["plan"], "openrouter")
+
+    def test_burn_does_not_change_claude_helper(self):
+        pools = {"claude": pool("ON", 1.5)}
+        self.assertFalse(pp.claude_helper(pools)["allowed"])
+        self.assertIsNotNone(pp.parse_burn({"burn": {"lane": "cursor", "until": burn_until()}}, LANES, T))
+        self.assertFalse(pp.claude_helper(pools)["allowed"])
+
+
 class PickTests(unittest.TestCase):
     def test_first_lane_wins_when_nothing_reads_it(self):
         got = pick({"codex": pool(), "grok": pool()})
