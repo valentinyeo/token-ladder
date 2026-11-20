@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "plan-pick worker: no board login. Put the fault or note in your final message; the orchestrator files it." >&2
+exit 3

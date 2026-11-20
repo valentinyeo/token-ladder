@@ -1,0 +1,7 @@
+[Unit]
+Description=token-ladder: read AI subscription usage and decide the mode
+
+[Service]
+Type=oneshot
+ExecStartPre=-/usr/bin/python3 %h/projects/poteto-2-advisor/bin/opencode-read --if-due
+ExecStart=/bin/bash -lc '%h/projects/token-ladder/bin/token-ladder collect'

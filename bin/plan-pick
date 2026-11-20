@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+DEFAULT_PACE_WARN = 1.1
+DEFAULT_LIMITED_HOURS = 1.0
+DEFAULT_CREDIT_LIMITED_HOURS = 12.0
+WORKER_SHIMS = os.path.join(HERE, "worker-shims")
+TAIL_CHARS = 20000
+ERROR_CHARS = 4000
+CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|credits?|funds|quota)|"
+                          r"out of credits?|credit balance|exceeded your current quota|no credits? (left|remaining)", re.I)
+RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _]exhausted|"
+                        r"limit (reached|exceeded)|hit your limit", re.I)
+BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
+PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
+DEFAULT_OPENCODE_CREDIT_FLOOR = 6
+DEFAULT_OPENCODE_CREDIT_FRESH_HOURS = 2
+LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
+LAUNCHES = os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
+CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
+PI = os.path.expanduser("~/.npm-global/bin/pi")
+DEFAULT_CREDIT_FLOOR_USD = 2.0
+DEFAULT_CREDIT_REFRESH_MINUTES = 30
+DEFAULT_CREDIT_STALE_HOURS = 6
+DEFAULT_STALE_HOURS = 12
+
+
+def number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def skip_reason(pool, warn):
+    if not isinstance(pool, dict):
+        return None
+    if pool.get("state") == "OFF":
+        return "used up" + (f": {pool['note']}" if pool.get("note") else "")
+    ratio = number(pool.get("pace_ratio"))
+    if ratio is not None and ratio > warn:
+        return f"pace {ratio:.2f}x is above {warn:g}x"
+    return None
+
+
+def pool_note(pool, warn):
+    if not isinstance(pool, dict):
+        return "no usage reader, a 429 or empty credit marks it limited"
+    if pool.get("note"):
+        return pool["note"]
+    if number(pool.get("pace_ratio")) is None:
+        return "pace unknown, not ahead"
+    return f"pace {pool['pace_ratio']:.2f}x, within {warn:g}x"
+
+
+def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN):
+    pools = pools if isinstance(pools, dict) else {}
+    limits = limits if isinstance(limits, dict) else {}
+    now = time.time() if now is None else now
+    skipped, ahead = {}, {}
+    for lane in lanes:
+        name = lane["lane"]
+        pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+        until = number(limits.get(name))
+        if until is not None and until > now:
+            skipped[name] = f"limited until {datetime.fromtimestamp(until, timezone.utc):%H:%M} UTC"
+            continue
+        why = skip_reason(pool, warn)
+        if why:
+            skipped[name] = why
+            if why.startswith("pace"):
+                ahead[name] = number(pool.get("pace_ratio"))
+            continue
+        reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(pool, warn)}"
+        if skipped:
+            reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
+        return {"plan": name, "command": lane["command"], "reason": reason}
+    if not ahead:
+        return {"plan": "none", "command": None,
+                "reason": "every lane is used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())}
+    name = min(ahead, key=ahead.get)
+    lane = next(lane for lane in lanes if lane["lane"] == name)
+    others = ", ".join(f"{p} ({w})" for p, w in skipped.items() if p != name)
+    return {"plan": name, "command": lane["command"],
+            "reason": f"every lane is ahead of pace, used up or limited; least ahead is {name} ({skipped[name]})"
+            + (f"; skipped {others}" if others else "")}
+
+
+def claude_helper(pools, warn=DEFAULT_PACE_WARN):
+    pool = pools.get("claude") if isinstance(pools, dict) else None
+    why = skip_reason(pool, warn)
+    if why:
+        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper"}
+    if not isinstance(pool, dict):
+        note = "no Claude reading, assumed under pace"
+    elif number(pool.get("pace_ratio")) is None:
+        note = "pace unknown, not ahead"
+    else:
+        note = f"pace {pool['pace_ratio']:.2f}x, within {warn:g}x"
+    return {"allowed": True, "reason": f"Claude is under its pace: {note}"}
+
+
+def load_config():
+    try:
+        with open(os.path.join(HERE, "..", "config.json")) as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    try:
+        with open(os.path.join(HERE, "..", "config.local.json")) as fh:
+            local = json.load(fh)
+        if isinstance(local, dict):
+            cfg.update(local)
+    except (OSError, ValueError):
+        pass
+    return cfg
+
+
+def lanes_from(cfg):
+    lanes = cfg.get("lanes")
+    if not isinstance(lanes, list):
+        return []
+    return [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
+            and isinstance(lane.get("command"), str)]
+
+
+def read_limits(path=LIMITS):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def mark_limited(lane, hours, now=None, path=LIMITS):
+    now = time.time() if now is None else now
+    limits = {k: v for k, v in read_limits(path).items() if (number(v) or 0) > now}
+    limits[lane] = now + hours * 3600
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(limits, fh)
+    os.replace(tmp, path)
+    return limits[lane]
+
+
+def limit_kind(code, tail):
+    if code == 0:
+        return None
+    tail = tail[-ERROR_CHARS:]
+    if CREDIT_ERROR.search(tail):
+        return "credit"
+    if BLOCKED_ERROR.search(tail):
+        return "blocked"
+    if RATE_ERROR.search(tail):
+        return "rate"
+    if not tail.strip():
+        return "silent"
+    return None
+
+
+def worker_env(environ):
+    env = {name: value for name, value in environ.items()
+           if name != "HT_TOKEN" and not name.startswith("HYPERTASK_")
+           and not name.startswith("MULTIPROMPT_")}
+    env["PLAN_PICK_WORKER"] = "1"
+    path = env.get("PATH")
+    env["PATH"] = f"{WORKER_SHIMS}{os.pathsep}{path}" if path else WORKER_SHIMS
+    return env
+
+
+def run_command(command):
+    proc = subprocess.Popen(["bash", "-c", command], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
+                            env=worker_env(os.environ))
+    tail = ""
+    for line in proc.stdout:
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        tail = (tail + line)[-TAIL_CHARS:]
+    return proc.wait(), tail
+
+
+def log_launch(path, lane, now, not_vendor):
+    at = now if now is not None else time.time()
+    line = {"at": at, "lane": lane,
+            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "not_vendor": not_vendor}
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a") as fh:
+            fh.write(json.dumps(line) + "\n")
+    except OSError as exc:
+        print(f"plan-pick: launch log not written: {exc}", file=sys.stderr)
+        return
+    if lane is not None:
+        stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"Pacer launch: {lane} {stamp}", file=sys.stderr)
+def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, now=None, say=None,
+              launches_path=LAUNCHES, not_vendor=None):
+    say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
+    hours = {"rate": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
+             "silent": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
+             "credit": number(cfg.get("credit_limited_hours")) or DEFAULT_CREDIT_LIMITED_HOURS,
+             "blocked": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS}
+    why = {"rate": "hit a rate or usage limit", "credit": "is out of credit", "silent": "exited with no output",
+           "blocked": "was blocked by the provider's bot challenge"}
+    tried = set()
+    while True:
+        result = pick([lane for lane in lanes if lane["lane"] not in tried], pools,
+                      read_limits(limits_path), now, warn)
+        if not result["command"]:
+            log_launch(launches_path, None, now, not_vendor)
+            say(f"no lane left, nothing ran. {result['reason']}")
+            return 4
+        say(f"lane {result['plan']}: {result['reason']}")
+        log_launch(launches_path, result["plan"], now, not_vendor)
+        code, tail = runner(result["command"])
+        kind = limit_kind(code, tail)
+        if kind is None:
+            return code
+        tried.add(result["plan"])
+        until = mark_limited(result["plan"], hours[kind], now, limits_path)
+        say(f"lane {result['plan']} {why[kind]} (exit {code}); skipped until "
+            f"{datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC, trying the next lane")
+
+
+def http_json(url, key):
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}", "User-Agent": "token-ladder"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+def pi_key(provider):
+    out = subprocess.run([PI, "auth", "print-api-key", "--provider", provider],
+                         capture_output=True, text=True, timeout=60)
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def balance_deepseek(get, key):
+    infos = get("https://api.deepseek.com/user/balance", key("deepseek")).get("balance_infos") or []
+    return sum(float(i["total_balance"]) for i in infos if i.get("currency") == "USD")
+
+
+def balance_vercel(get, key):
+    return float(get("https://ai-gateway.vercel.sh/v1/credits", key("vercel-ai-gateway"))["token_pass"]["remaining"])
+
+
+def balance_openrouter(get, key):
+    k = key("openrouter-credit")
+    account = get("https://openrouter.ai/api/v1/credits", k)["data"]
+    left = account["total_credits"] - account["total_usage"]
+    remaining = number(get("https://openrouter.ai/api/v1/key", k)["data"].get("limit_remaining"))
+    return left if remaining is None else min(left, remaining)
+
+
+BALANCES = {"deepseek": balance_deepseek, "vercel": balance_vercel, "openrouter": balance_openrouter}
+
+
+def read_credits(path=CREDITS):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers=BALANCES):
+    data = read_credits(path)
+    for name in names:
+        reader = readers.get(name)
+        if not reader:
+            continue
+        try:
+            data[name] = {"usd": round(reader(get, key), 2), "at": now}
+        except Exception as exc:
+            print(f"plan-pick: cannot read {name} credit: {type(exc).__name__}", file=sys.stderr)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh)
+    os.replace(tmp, path)
+    return data
+
+
+def credit_pool(entry, now, cfg):
+    stale_s = (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+    floor = number(cfg.get("credit_floor_usd"))
+    floor = DEFAULT_CREDIT_FLOOR_USD if floor is None else floor
+    if not isinstance(entry, dict) or number(entry.get("usd")) is None or number(entry.get("at")) is None:
+        return None
+    if now - entry["at"] > stale_s:
+        return None
+    if entry["usd"] < floor:
+        return {"state": "OFF", "note": f"${entry['usd']:.2f} credit left, under ${floor:g}"}
+    return {"state": "ON", "note": f"${entry['usd']:.2f} credit left"}
+
+
+def refresh_later(names, now, path):
+    subprocess.Popen([sys.executable, os.path.realpath(__file__), "--read-credits", *names],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+    return read_credits(path)
+
+
+def with_credits(pools, lanes, cfg, now=None, path=CREDITS, refresh=refresh_later):
+    now = time.time() if now is None else now
+    names = [lane["credit"] for lane in lanes if isinstance(lane.get("credit"), str)]
+    data = read_credits(path)
+    every = (number(cfg.get("credit_refresh_minutes")) or DEFAULT_CREDIT_REFRESH_MINUTES) * 60
+    due = [n for n in names if now - (number((data.get(n) or {}).get("at")) or 0) > every]
+    if due:
+        data = refresh(due, now, path)
+    pools = dict(pools) if isinstance(pools, dict) else {}
+    for name in names:
+        state = credit_pool(data.get(name), now, cfg)
+        if state and f"credit:{name}" not in pools:
+            pools[f"credit:{name}"] = state
+    return pools
+
+
+def history_rows(pacing_dir):
+    try:
+        with open(os.path.join(pacing_dir, "opencode-history.jsonl")) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and number(row.get("at")) is not None:
+            rows.append(row)
+    return rows
+
+
+def last_windows(pacing_dir):
+    rows = [r for r in history_rows(pacing_dir) if isinstance(r.get("windows"), dict) and r["windows"]]
+    return max(rows, key=lambda r: r["at"]) if rows else None
+
+
+def last_credit(pacing_dir):
+    rows = [r for r in history_rows(pacing_dir) if number(r.get("credits_usd")) is not None]
+    return max(rows, key=lambda r: r["at"]) if rows else None
+
+
+def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
+    stale_s = (number(cfg.get("opencode_stale_hours")) or DEFAULT_STALE_HOURS) * 3600
+    windows = last_windows(pacing_dir)
+    if not windows or now - windows["at"] > stale_s:
+        return {"state": "unknown", "note": "OpenCode usage reading missing or stale, assumed free"}
+    used = windows["windows"]
+    for name in ("rolling", "5-hour", "weekly", "monthly"):
+        if (number(used.get(name)) or 0) >= 100:
+            if name == "monthly":
+                return opencode_credit_pool(now, cfg, pacing_dir)
+            return {"state": "OFF", "note": f"OpenCode {name} window is full"}
+    return {"state": "ON", "note": "OpenCode windows have room"}
+
+
+def opencode_credit_pool(now, cfg, pacing_dir):
+    floor = number(cfg.get("opencode_credit_floor_usd")) or DEFAULT_OPENCODE_CREDIT_FLOOR
+    fresh_s = (number(cfg.get("opencode_credit_fresh_hours")) or DEFAULT_OPENCODE_CREDIT_FRESH_HOURS) * 3600
+    row = last_credit(pacing_dir)
+    if not row or now - row["at"] > fresh_s:
+        return {"state": "OFF", "note": "OpenCode monthly window is full and no fresh credit reading"}
+    credit = row["credits_usd"]
+    if credit < floor:
+        return {"state": "OFF", "note": f"OpenCode monthly window is full and credit ${credit:.2f} is under ${floor:g}"}
+    return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} credit (floor ${floor:g})"}
+
+
+def read_pools(source):
+    if source == "-":
+        return json.load(sys.stdin)
+    if source:
+        with open(source) as fh:
+            return json.load(fh)
+    out = subprocess.run([sys.executable, os.path.join(HERE, "token-ladder"), "pools", "--json"],
+                         capture_output=True, text=True, timeout=20, check=True).stdout
+    return json.loads(out)
+
+
+def with_opencode(pools, cfg, now=None):
+    pools = pools if isinstance(pools, dict) else {}
+    if "opencode" not in pools:
+        pools = dict(pools, opencode=opencode_pool(time.time() if now is None else now, cfg))
+    return pools
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="plan-pick", description="Pick the lane for the next background worker.")
+    parser.add_argument("--json", action="store_true", help="print plan, command and reason as JSON")
+    parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
+    parser.add_argument("--claude-helper", action="store_true",
+                        help="answer whether an in-chat Claude helper is allowed (exit 0 allowed, 3 refused)")
+    parser.add_argument("--limited", metavar="LANE",
+                        help="mark LANE limited after a 429, quota or empty-credit error; plan-pick skips it for a while")
+    parser.add_argument("--not-vendor", metavar="VENDOR",
+                        help="skip lanes from VENDOR, so a review comes from a different vendor than the author")
+    parser.add_argument("--run", action="store_true",
+                        help="run the picked lane's command; on a failed exit with a 429, 402, quota error or no output, mark it limited and run the next lane")
+    parser.add_argument("--read-credits", nargs="*", metavar="LANE",
+                        help="read the credit balance of these lanes (all credit lanes when none) and store it")
+    parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
+    args = parser.parse_args(argv)
+    cfg = load_config()
+    warn = number(cfg.get("pace_warn_ratio")) or DEFAULT_PACE_WARN
+    lanes = lanes_from(cfg)
+    if args.read_credits is not None:
+        names = args.read_credits or [lane["credit"] for lane in lanes if isinstance(lane.get("credit"), str)]
+        lock = CREDITS + ".lock"
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        try:
+            if time.time() - os.path.getmtime(lock) < 120:
+                return 0
+        except OSError:
+            pass
+        open(lock, "w").close()
+        try:
+            data = refresh_credits(names, time.time())
+        finally:
+            os.unlink(lock)
+        print(", ".join(f"{n} ${data[n]['usd']:.2f}" for n in names if n in data))
+        return 0
+    if args.limited:
+        if args.limited not in {lane["lane"] for lane in lanes}:
+            print(f"plan-pick: unknown lane {args.limited}; lanes: {', '.join(l['lane'] for l in lanes)}", file=sys.stderr)
+            return 2
+        hours = args.hours if args.hours is not None else number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS
+        until = mark_limited(args.limited, hours)
+        print(f"Lane {args.limited} is skipped until {datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC.")
+        return 0
+    try:
+        pools = read_pools(args.pools)
+        if not args.pools:
+            pools = with_credits(with_opencode(pools, cfg), lanes, cfg)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
+        return 1
+    if args.claude_helper:
+        answer = claude_helper(pools, warn)
+        if args.json:
+            print(json.dumps(answer))
+        else:
+            print(f"Claude helper: {'allowed' if answer['allowed'] else 'refused'}. Why: {answer['reason']}.")
+        return 0 if answer["allowed"] else 3
+    if args.not_vendor:
+        lanes = [lane for lane in lanes if lane.get("vendor") != args.not_vendor.lower()]
+    if args.run:
+        return run_lanes(lanes, pools, cfg, warn, not_vendor=args.not_vendor)
+    result = pick(lanes, pools, read_limits(), warn=warn)
+    if args.json:
+        print(json.dumps(result))
+    elif result["command"]:
+        vendor_flag = f" --not-vendor {args.not_vendor}" if args.not_vendor else ""
+        print(f"Worker plan: {result['plan']}. Launch: ~/.local/bin/plan-pick --run{vendor_flag} (reads brief.txt, runs {result['command']}, "
+              f"moves to the next lane on a 429). Why: {result['reason']}.")
+    else:
+        print(f"Worker plan: none. Why: {result['reason']}.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

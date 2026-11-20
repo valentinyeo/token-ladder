@@ -1,0 +1,90 @@
+{
+  "grok_stale_hours": 3,
+  "unknown_assumed_pct": 70,
+  "pool_warn_pct": 80,
+  "pace_warn_ratio": 1.1,
+  "lanes": [
+    {
+      "lane": "vercel",
+      "credit": "vercel",
+      "vendor": "deepseek",
+      "pool": null,
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "deepseek",
+      "credit": "deepseek",
+      "vendor": "deepseek",
+      "pool": null,
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider deepseek --model deepseek-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "opencode",
+      "vendor": "deepseek",
+      "pool": "opencode",
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "codex",
+      "vendor": "openai",
+      "pool": "codex",
+      "command": "~/.local/bin/hax --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "cursor",
+      "vendor": "cursor",
+      "pool": "grok",
+      "command": "~/.local/bin/cursor-agent -p --force --output-format text --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "openrouter",
+      "credit": "openrouter",
+      "vendor": "deepseek",
+      "pool": null,
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+    }
+  ],
+  "limited_hours": 1,
+  "pool_off_pct": 95,
+  "claude_floor_percent": 15,
+  "claude_behind_margin": 5,
+  "five_hour_max_percent": 80,
+  "reset_use_at_percent": 95,
+  "reset_min_hours_before_weekly": 24,
+  "codex_credits": {
+    "approved": "https://app.hypertask.ai/detail/project-4060/911",
+    "floor": 10000
+  },
+  "codex_resets": [
+    {
+      "expires": "2026-10-29T19:47:00+01:00"
+    },
+    {
+      "expires": "2026-11-07T00:20:00+01:00"
+    }
+  ],
+  "tight_ram_free_gb": 16,
+  "tight_load_per_core": 2,
+  "publish": true,
+  "claude_label": "Claude",
+  "codex_label": "Codex",
+  "remote_claude_accounts": [],
+  "primary_hostname": "localhost",
+  "primary_ssh": "localhost",
+  "mirrors": [],
+  "ladder_name": "Valentin Yeo / Hypertask",
+  "push_url": "https://account.multiprompt.dev/v1/usage",
+  "push_token_key": [
+    "Multiprompt Account",
+    "USAGE_PUSH_TOKEN"
+  ],
+  "key_lookup_every_s": 1800,
+  "claude_resets": [],
+  "reset_burn_hours": 36,
+  "cloud": {
+    "codex": [
+      "valentinyeo/token-ladder"
+    ],
+    "claude": []
+  }
+}

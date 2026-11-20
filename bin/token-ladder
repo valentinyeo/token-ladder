@@ -1,0 +1,1461 @@
+#!/usr/bin/env python3
+"""token-ladder: passive monitor of AI subscription usage plus the hooks sessions use to follow it.
+
+Subcommands:
+  collect        read every bar, decide the mode, write status.json, history and dashboard
+  status         print independent Claude, Codex and Grok pool states
+  pools --json   read-only pool usage for Claude, Codex and Grok
+  grok-set       record Grok Bot usage with a fresh timestamp
+  route          choose the local or cloud command for a repository
+  mode X         set an override: claude | codex | auto
+  hook-prompt    UserPromptSubmit hook: print pool states and role instructions
+  hook-bash      PreToolUse(Bash) hook: refuse disallowed models and paid fallbacks
+  hook-agent     PreToolUse(Agent) hook: respect the Claude pool
+"""
+import argparse, fcntl, glob, html, json, math, os, re, selectors, shlex, signal, socket, subprocess, sys, tempfile, time, urllib.request
+from datetime import datetime, timezone
+
+HOME = os.path.expanduser("~")
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+STATE = os.path.join(HOME, ".local/state/token-ladder")
+STATUS = os.path.join(STATE, "status.json")
+OVERRIDE = os.path.join(STATE, "override")
+STALE_SECONDS = 1800
+RESOURCES = os.path.join(STATE, "resources.jsonl")
+PRESSURE = os.path.join(STATE, "pressure.json")
+HISTORY_DAYS = 7
+HISTORY_SAMPLE_SECONDS = 300
+PACE_MIN_ELAPSED_PCT = 10
+LOCAL_CODEX = "hax --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p <prompt>"
+
+
+def cloud_destination(repo, mode, cloud):
+    cloud = cloud or {}
+    codex = cloud.get("codex") or {}
+    claude = cloud.get("claude") or {}
+    if mode == "codex" and codex.get(repo):
+        return "codex-cloud"
+    if mode == "claude" and claude.get(repo):
+        return "claude-cloud"
+    return "local"
+
+
+def route_line(repo, mode, cloud):
+    dest = cloud_destination(repo, mode, cloud)
+    if dest == "codex-cloud":
+        return dest, "codex cloud exec --env " + cloud["codex"][repo]
+    if dest == "claude-cloud":
+        return dest, "claude-cloud-task"
+    if mode == "claude":
+        return dest, "Agent tool in this session"
+    return dest, LOCAL_CODEX
+
+
+def cloud_maps(cfg, stored):
+    declared = (cfg or {}).get("cloud") or {}
+    stored = stored if isinstance(stored, dict) else {}
+
+    def fill(side):
+        repos = declared.get(side) or []
+        if isinstance(repos, dict):
+            repos = list(repos)
+        side_ids = stored.get(side) or {}
+        if not isinstance(side_ids, dict):
+            side_ids = {}
+        return {repo: side_ids[repo] for repo in repos if side_ids.get(repo)}
+
+    return {"codex": fill("codex"), "claude": fill("claude")}
+
+
+def read_cloud_envs():
+    try:
+        with open(os.path.join(STATE, "cloud-envs.json")) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def load_config():
+    with open(os.path.join(REPO, "config.json")) as f:
+        cfg = json.load(f)
+    try:
+        with open(os.path.join(REPO, "config.local.json")) as f:
+            cfg.update(json.load(f))
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def iso_to_ts(s):
+    return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+
+
+def window(used, resets_at, minutes, now):
+    """One usage bar. used in percent, resets_at as unix time."""
+    if used is None or resets_at is None:
+        return {"used": None, "resets_at": None, "hours_left": None, "time_gone": None}
+    if resets_at <= now:
+        used, resets_at = 0.0, resets_at + minutes * 60
+    hours_left = (resets_at - now) / 3600
+    time_gone = max(0.0, min(100.0, 100 * (1 - hours_left * 60 / minutes)))
+    return {"used": round(used, 1), "resets_at": resets_at, "hours_left": round(hours_left, 1),
+            "time_gone": round(time_gone, 1)}
+
+
+
+def window_pace(bar, samples, now):
+    pace = dict(per_hour=None, per_day=None, ratio=None, verdict="unknown", empty_hours=None)
+    used, gone = bar.get("used"), bar.get("time_gone")
+    if type(used) not in (int, float) or not math.isfinite(used) or not 0 <= used <= 100:
+        return pace
+    if type(gone) in (int, float) and math.isfinite(gone) and 0 < gone <= 100:
+        ratio = used / gone
+        pace["ratio"] = round(ratio, 4)
+        pace["verdict"] = "above" if ratio > 1.1 else "below" if ratio < 0.9 else "on"
+    points = {}
+    for sample in samples:
+        ts = sample.get("ts")
+        if type(ts) in (int, float) and math.isfinite(ts) and ts <= now:
+            points[ts] = sample
+    points[now] = {"ts": now, "used": used, "resets_at": bar.get("resets_at")}
+    ordered = sorted(points.items())
+
+    def rate(seconds):
+        start = now - seconds
+        before = [i for i, (ts, _) in enumerate(ordered) if ts <= start]
+        if not before:
+            return None
+        total = 0.0
+        for (left_ts, left), (right_ts, right) in zip(ordered[before[-1]:], ordered[before[-1] + 1:]):
+            if right_ts <= start:
+                continue
+            span = right_ts - left_ts
+            a, b = left.get("used"), right.get("used")
+            if span > 2 * HISTORY_SAMPLE_SECONDS or not all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 100 for v in (a, b)):
+                return None
+            old_reset, new_reset = left.get("resets_at"), right.get("resets_at")
+            known = all(type(v) in (int, float) and math.isfinite(v) for v in (old_reset, new_reset))
+            if known and new_reset < old_reset:
+                return None
+            if known and new_reset != old_reset:
+                delta = b
+            elif b < a:
+                if known:
+                    return None
+                delta = b
+            else:
+                delta = b - a
+            overlap = right_ts - max(start, left_ts)
+            total += delta * overlap / span
+        return total * 3600 / seconds
+
+    hourly = rate(3600)
+    pace["per_hour"] = round(hourly, 4) if hourly is not None else None
+    daily = rate(86400)
+    pace["per_day"] = round(daily * 24, 4) if daily is not None else None
+    if used == 100:
+        pace["empty_hours"] = 0
+    elif hourly is not None and hourly > 0:
+        pace["empty_hours"] = round((100 - used) / hourly, 4)
+    return pace
+
+
+def add_usage_pace(snapshot, history):
+    legacy = {("claude", "week"): "claude_week", ("claude", "five_hour"): "claude_5h", ("codex", "week"): "codex_week"}
+    for account in snapshot["accounts"]:
+        for name in ("week", "five_hour"):
+            bar = account[name]
+            samples = []
+            for row in history:
+                accounts = row.get("accounts")
+                previous = accounts.get(account["id"]) if isinstance(accounts, dict) else None
+                values = previous.get(name) if isinstance(previous, dict) else None
+                if not isinstance(values, dict):
+                    key = legacy.get((account["id"], name))
+                    values = {"used": row.get(key)}
+                samples.append(dict(values, ts=row.get("ts")))
+            source = {} if account.get("stale") else bar
+            bar["pace"] = window_pace(source, samples, snapshot["ts"])
+
+
+def usage_history_record(snapshot):
+    return {"ts": snapshot["ts"], "mode": snapshot["mode"],
+            "claude_week": snapshot["claude"]["week"]["used"],
+            "claude_5h": snapshot["claude"]["five_hour"]["used"],
+            "codex_week": snapshot["codex"]["week"]["used"],
+            "accounts": {account["id"]: {name: {"used": None if account.get("stale") else account[name].get("used"),
+                                               "resets_at": account[name].get("resets_at")}
+                                          for name in ("week", "five_hour")}
+                         for account in snapshot["accounts"]}}
+
+
+def read_claude(now, credentials=None):
+    try:
+        with open(os.path.expanduser(credentials or os.path.join(HOME, ".claude/.credentials.json"))) as f:
+            tok = json.load(f)["claudeAiOauth"]["accessToken"]
+        req = urllib.request.Request("https://api.anthropic.com/api/oauth/usage", headers={
+            "Authorization": f"Bearer {tok}", "anthropic-beta": "oauth-2025-04-20"})
+        d = json.load(urllib.request.urlopen(req, timeout=20))
+        fh, wk = d.get("five_hour") or {}, d.get("seven_day") or {}
+        return {
+            "five_hour": window(fh.get("utilization"), fh.get("resets_at") and iso_to_ts(fh["resets_at"]), 300, now),
+            "week": window(wk.get("utilization"), wk.get("resets_at") and iso_to_ts(wk["resets_at"]), 10080, now),
+            "fable": fable_window(d, now),
+            "error": None,
+        }
+    except Exception as e:
+        return {"five_hour": window(None, None, 300, now), "week": window(None, None, 10080, now),
+                "error": f"{type(e).__name__}: {e}"[:200]}
+
+
+def fable_window(d, now):
+    """Fable is not a separate pool: it is a capped share of the same weekly budget."""
+    for l in d.get("limits") or []:
+        if l.get("kind") == "weekly_scoped" and ((l.get("scope") or {}).get("model") or {}).get("display_name") == "Fable":
+            w = window(l.get("percent"), l.get("resets_at") and iso_to_ts(l["resets_at"]), 10080, now)
+            share = next((x.get("allowance_percent_of_weekly") for x in d.get("weekly_scoped_shares") or []), None)
+            return dict(w, max_share_of_weekly=share)
+    return None
+
+
+def claude_email(path=None):
+    try:
+        with open(path or os.path.join(HOME, ".claude.json")) as f:
+            return json.load(f).get("oauthAccount", {}).get("emailAddress")
+    except (OSError, ValueError):
+        return None
+
+
+def codex_email():
+    try:
+        import base64
+        with open(os.path.join(HOME, ".codex/auth.json")) as f:
+            part = json.load(f)["tokens"]["id_token"].split(".")[1]
+        return json.loads(base64.urlsafe_b64decode(part + "==")).get("email")
+    except Exception:
+        return None
+
+
+REMOTE_CLAUDE = r'''
+import json, os, urllib.request
+h = os.path.expanduser("~")
+out = {"email": json.load(open(h + "/.claude.json")).get("oauthAccount", {}).get("emailAddress")}
+tok = json.load(open(h + "/.claude/.credentials.json"))["claudeAiOauth"]["accessToken"]
+r = urllib.request.Request("https://api.anthropic.com/api/oauth/usage",
+                           headers={"Authorization": "Bearer " + tok, "anthropic-beta": "oauth-2025-04-20"})
+d = json.load(urllib.request.urlopen(r, timeout=20))
+out.update({k: d.get(k) for k in ("five_hour", "seven_day")})
+print(json.dumps(out))
+'''
+
+
+def read_remote_claude(now, host, user=None):
+    """user: another Linux user on that host, read through passwordless sudo."""
+    remote = ["sudo", "-n", "-u", user, "python3", "-"] if user else ["python3", "-"]
+    try:
+        r = subprocess.run(["ssh", "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", host] + remote,
+                           input=REMOTE_CLAUDE, capture_output=True, text=True, timeout=40)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+        fh, wk = d.get("five_hour") or {}, d.get("seven_day") or {}
+        return {"email": d.get("email"), "error": None,
+                "five_hour": window(fh.get("utilization"), fh.get("resets_at") and iso_to_ts(fh["resets_at"]), 300, now),
+                "week": window(wk.get("utilization"), wk.get("resets_at") and iso_to_ts(wk["resets_at"]), 10080, now)}
+    except Exception as e:
+        return {"email": None, "five_hour": window(None, None, 300, now), "week": window(None, None, 10080, now),
+                "error": f"ssh {host}: {type(e).__name__}"}
+
+
+def read_codex_logs():
+    """Newest rate_limits sample from local Codex session logs, by the event's own timestamp.
+    Many sessions write logs at once, so the most recently touched file can hold an older sample
+    (for example one from before a bonus reset); compare event times across files instead."""
+    files = sorted(glob.glob(os.path.join(HOME, ".codex/sessions/*/*/*/*.jsonl")), key=os.path.getmtime, reverse=True)
+    best = None
+    for path in files[:40]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(max(0, os.path.getsize(path) - 400_000))
+                tail = f.read().decode("utf-8", "ignore").splitlines()
+        except OSError:
+            continue
+        for line in reversed(tail):
+            if '"rate_limits"' not in line:
+                continue
+            try:
+                ev = json.loads(line)
+                rl = _find_key(ev, "rate_limits")
+                ts = iso_to_ts(ev["timestamp"])
+            except (ValueError, KeyError, TypeError, AttributeError):
+                continue
+            if not isinstance(rl, dict) or not any(rl.get(s) for s in ("primary", "secondary")):
+                continue
+            if best is None or ts > best[0]:
+                best = (ts, rl)
+            break
+    return best
+
+
+def parse_codex_response(response):
+    """Normalize the account/rateLimits/read reply, not unrelated per-model pools."""
+    if not isinstance(response, dict) or response.get("error") is not None:
+        raise ValueError("rate limits request failed")
+    result = response.get("result") or {}
+    if not isinstance(result, dict):
+        raise ValueError("invalid Codex response")
+    many = result.get("rateLimitsByLimitId") or {}
+    if not isinstance(many, dict):
+        raise ValueError("invalid Codex limits map")
+    rl = many.get("codex") or result.get("rateLimits") or {}
+    if not isinstance(rl, dict) or rl.get("limitId") not in (None, "codex"):
+        raise ValueError("no Codex rate limits")
+    out = {"plan_type": rl.get("planType"), "credits": rl.get("credits")}
+    for slot in ("primary", "secondary"):
+        w = rl.get(slot)
+        if not isinstance(w, dict):
+            continue
+        values = [w.get(k) for k in ("usedPercent", "resetsAt", "windowDurationMins")]
+        if not all(type(v) in (int, float) and math.isfinite(v) for v in values) or values[2] <= 0:
+            raise ValueError("invalid Codex window")
+        out[slot] = dict(zip(("used_percent", "resets_at", "window_minutes"), values))
+    if not any(out.get(s) for s in ("primary", "secondary")):
+        raise ValueError("no Codex rate limits")
+    return out
+
+
+def probe_codex(timeout=20):
+    """Read account limits without starting a thread or making a model call."""
+    deadline = time.monotonic() + timeout
+    with subprocess.Popen(["codex", "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True) as proc:
+        try:
+            def send(message):
+                proc.stdin.write((json.dumps(message) + "\n").encode())
+                proc.stdin.flush()
+            send({"method": "initialize", "id": 1, "params": {
+                "clientInfo": {"name": "token_ladder", "title": "Token Ladder Telemetry", "version": "1"}}})
+            with selectors.DefaultSelector() as selector:
+                selector.register(proc.stdout, selectors.EVENT_READ)
+                pending, initialized, received = b"", False, 0
+                while True:
+                    left = deadline - time.monotonic()
+                    if left <= 0 or not selector.select(left):
+                        raise TimeoutError("Codex probe timed out")
+                    chunk = os.read(proc.stdout.fileno(), 65536)
+                    if not chunk:
+                        raise ValueError("Codex app-server closed")
+                    received += len(chunk)
+                    if received > 1_000_000:
+                        raise ValueError("Codex response too large")
+                    pending += chunk
+                    while b"\n" in pending:
+                        line, pending = pending.split(b"\n", 1)
+                        try:
+                            message = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(message, dict):
+                            continue
+                        if message.get("id") == 1 and not initialized:
+                            if message.get("error") is not None:
+                                raise ValueError("Codex initialize failed")
+                            initialized = True
+                            send({"method": "initialized", "params": {}})
+                            send({"method": "account/rateLimits/read", "id": 2})
+                        elif message.get("id") == 2 and initialized:
+                            return time.time(), parse_codex_response(message)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+
+
+def read_codex(now):
+    best = read_codex_logs()
+    error = None
+    if best is None or now - best[0] >= 600:
+        try:
+            probe = probe_codex()
+            if best is None or probe[0] > best[0]:
+                best = probe
+        except (OSError, ValueError, TypeError, AttributeError) as e:
+            error = f"Codex probe: {type(e).__name__}; " + ("stale log sample" if best else "no log sample")
+    ts, rl = best if best else (None, {})
+    out = {"week": window(None, None, 10080, now), "five_hour": window(None, None, 300, now),
+           "sampled_at": ts, "plan": rl.get("plan_type"), "error": error,
+           "credits": (rl.get("credits") or {}).get("balance")}
+    for slot in ("primary", "secondary"):
+        w = rl.get(slot)
+        if not w:
+            continue
+        key = "week" if w.get("window_minutes", 0) >= 1440 else "five_hour"
+        out[key] = window(w.get("used_percent"), w.get("resets_at"), w.get("window_minutes"), now)
+    return out
+
+
+def _find_key(obj, key):
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = _find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+FEED_URL = "https://whenaireset.com/feed.xml"
+FEED_PROVIDERS = {"Codex": "codex", "Claude Code": "claude"}
+FEED_TITLE = re.compile(r"<title>\[([^\]]+)\] (\w+) reset[^<]*?(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}) UTC")
+
+
+def parse_reset_feed(xml, now):
+    """Global (direct) resets per provider. Banked resets land in each account's own reset list instead."""
+    feed = {}
+    for item in re.findall(r"<item>(.*?)</item>", xml, re.S):
+        m = FEED_TITLE.search(item)
+        if not m or m.group(1) not in FEED_PROVIDERS or m.group(2) != "Direct":
+            continue
+        ts = iso_to_ts(f"{m.group(3)}T{m.group(4)}:00+00:00")
+        f = feed.setdefault(FEED_PROVIDERS[m.group(1)], {"direct_30d": 0, "last_direct": None, "pending_at": None})
+        if now - ts < 30 * 86400:
+            f["direct_30d"] += 1
+        f["last_direct"] = max(f["last_direct"] or 0, ts)
+    for f in feed.values():
+        f["pending_at"] = f["last_direct"]
+    return feed
+
+
+def read_reset_feed(now):
+    """whenaireset.com tracks the official reset announcements (free). Cached for 20 minutes."""
+    cache = os.path.join(STATE, "reset_feed.json")
+    try:
+        c = json.load(open(cache))
+        if now - c["fetched"] < 1200:
+            return c["feed"]
+    except (OSError, ValueError, KeyError):
+        pass
+    try:
+        req = urllib.request.Request(FEED_URL, headers={"User-Agent": "token-ladder"})
+        feed = parse_reset_feed(urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "ignore"), now)
+    except Exception:
+        return None
+    os.makedirs(STATE, exist_ok=True)
+    with open(cache, "w") as fh:
+        json.dump({"fetched": now, "feed": feed}, fh)
+    return feed
+
+
+def read_openrouter():
+    key = os.environ.get("OPENROUTER_API_KEY")
+    if not key:
+        return {"usage": None, "limit": None, "error": "OPENROUTER_API_KEY not set"}
+    try:
+        req = urllib.request.Request("https://openrouter.ai/api/v1/key", headers={"Authorization": f"Bearer {key}"})
+        d = json.load(urllib.request.urlopen(req, timeout=20)).get("data", {})
+        return {"usage": d.get("usage"), "limit": d.get("limit"), "error": None}
+    except Exception as e:
+        return {"usage": None, "limit": None, "error": f"{type(e).__name__}"}
+
+
+def parse_onepassword(text):
+    for line in text.splitlines():
+        parts = line.split(maxsplit=5)
+        if len(parts) == 6 and parts[:2] == ["account", "read_write"]:
+            limit, used, remaining = map(int, parts[2:5])
+            if limit > 0 and used >= 0 and remaining >= 0:
+                return {"used": used, "limit": limit, "reset": parts[5]}
+    raise ValueError("account read_write row missing or invalid")
+
+
+def read_onepassword():
+    try:
+        with open(os.path.join(HOME, ".config/yeo-ux-agents/op-service-account.env")) as f:
+            name, token = f.read().strip().split("=", 1)
+        if name != "OP_SERVICE_ACCOUNT_TOKEN" or not token:
+            raise ValueError("invalid token file")
+        r = subprocess.run(["op", "service-account", "ratelimit"], capture_output=True, text=True, timeout=20,
+                           check=True, env=dict(os.environ, OP_SERVICE_ACCOUNT_TOKEN=token))
+        return parse_onepassword(r.stdout)
+    except Exception as e:
+        return {"error": f"ratelimit unavailable ({type(e).__name__})"}
+
+
+def onepassword_note(s):
+    budget = s.get("onepassword") or {}
+    used, limit = budget.get("used"), budget.get("limit")
+    if budget.get("error") or not isinstance(used, int) or not isinstance(limit, int) or used < 0 or limit <= 0:
+        return "1Password: count unknown."
+    note = f"1Password: {used}/{limit} reads today."
+    if used >= limit * 0.5:
+        note += " Back off: no new key lookups unless the job needs one; read each key once per job."
+    if used >= limit * 0.8:
+        note += " Frozen: key lookups only for live production work; tell Valentin."
+    return note
+
+
+def read_resources():
+    """RAM, load and the weight of claude, node and codex processes on this machine."""
+    mem = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":")
+            mem[k] = int(v.split()[0])
+    load1, load5, _ = os.getloadavg()
+    procs = {n: {"count": 0, "rss_gb": 0.0} for n in ("claude", "node", "codex")}
+    out = subprocess.run(["ps", "-eo", "comm=,rss="], capture_output=True, text=True, timeout=20).stdout
+    for line in out.splitlines():
+        parts = line.rsplit(None, 1)
+        if len(parts) == 2 and parts[0].strip() in procs and parts[1].isdigit():
+            p = procs[parts[0].strip()]
+            p["count"] += 1
+            p["rss_gb"] += int(parts[1]) / 1048576
+    for p in procs.values():
+        p["rss_gb"] = round(p["rss_gb"], 2)
+    return {"ram_free_gb": round(mem["MemAvailable"] / 1048576, 1), "ram_total_gb": round(mem["MemTotal"] / 1048576, 1),
+            "load1": round(load1, 2), "load5": round(load5, 2), "cores": os.cpu_count() or 1, **procs}
+
+
+def raw_tight(r, cfg):
+    return r["ram_free_gb"] < cfg.get("tight_ram_free_gb", 16) or r["load5"] > cfg.get("tight_load_per_core", 2) * r["cores"]
+
+
+def pressure_step(prev, tight_now, runs=2):
+    """Two runs in a row to switch on, two in a row to switch off. Pure, tested."""
+    st, on, off = prev.get("state", "ok"), prev.get("on_streak", 0), prev.get("off_streak", 0)
+    on, off = (on + 1, 0) if tight_now else (0, off + 1)
+    if st == "ok" and on >= runs:
+        st = "tight"
+    elif st == "tight" and off >= runs:
+        st = "ok"
+    return {"state": st, "on_streak": on, "off_streak": off}
+
+
+def record_resources(cfg, now):
+    r = read_resources()
+    try:
+        with open(PRESSURE) as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        prev = {}
+    step = pressure_step(prev, raw_tight(r, cfg))
+    with open(PRESSURE, "w") as f:
+        json.dump(step, f)
+    r["pressure"] = step["state"]
+    keep = []
+    for line in read_lines(RESOURCES):
+        try:
+            if json.loads(line)["ts"] > now - HISTORY_DAYS * 86400:
+                keep.append(line)
+        except (ValueError, KeyError):
+            pass
+    keep.append(json.dumps({"ts": now, **r}))
+    with open(RESOURCES, "w") as f:
+        f.write("\n".join(keep) + "\n")
+    return r
+
+
+def read_lines(path):
+    try:
+        with open(path) as f:
+            return [l for l in f.read().splitlines() if l.strip()]
+    except OSError:
+        return []
+
+
+def resources_line(r):
+    t = " TIGHT" if r.get("pressure") == "tight" else ""
+    return (f"Resources{t}: RAM {r['ram_free_gb']:.0f} of {r['ram_total_gb']:.0f} GB free, load {r['load1']:.1f}/{r['load5']:.1f} "
+            f"on {r['cores']} cores, claude {r['claude']['count']} ({r['claude']['rss_gb']:.1f} GB), "
+            f"node {r['node']['count']} ({r['node']['rss_gb']:.1f} GB), codex {r['codex']['count']} ({r['codex']['rss_gb']:.1f} GB)")
+
+
+def resource_chart(now):
+    """24 h RAM free and 5-min load as inline SVG, from resources.jsonl."""
+    rows = []
+    for l in read_lines(RESOURCES):
+        try:
+            d = json.loads(l)
+            if d["ts"] > now - 86400:
+                rows.append(d)
+        except (ValueError, KeyError):
+            pass
+    if len(rows) < 2:
+        return '<div class="muted">Chart fills in after a few runs.</div>'
+    W, H = 700, 120
+    def line(key, color, top):
+        pts = " ".join(f"{(d['ts'] - (now - 86400)) / 86400 * W:.1f},{H - min(d[key], top) / top * H:.1f}" for d in rows)
+        return f'<polyline fill="none" stroke="{color}" stroke-width="1.5" points="{pts}"/>'
+    ram_top = max(d["ram_total_gb"] for d in rows)
+    load_top = max(max(d["load5"] for d in rows), 1)
+    last = rows[-1]
+    return (f'<svg viewBox="0 0 {W} {H}" width="100%" height="{H}" style="background:#111;border-radius:6px">'
+            f'{line("ram_free_gb", "#3b82f6", ram_top)}{line("load5", "#f59e0b", load_top)}</svg>'
+            f'<div class="muted">Last 24 h. Blue = RAM free (0 to {ram_top:.0f} GB, now {last["ram_free_gb"]:.0f}). '
+            f'Orange = 5-min load (0 to {load_top:.0f}, now {last["load5"]:.1f}).</div>')
+
+
+def effective_hours(w, provider_feed, now):
+    """Hours until the window really ends, counting surprise global resets.
+    Frequent global resets wipe unused room early, so the expected end is sooner than resets_at:
+    h / (1 + rate * h), rate = global resets per hour over the last 30 days. An announced reset that has
+    not landed yet ends the window at its announced time."""
+    h = w["hours_left"]
+    if not provider_feed:
+        return h, None
+    rate = provider_feed.get("direct_30d", 0) / (30 * 24)
+    h_eff = h / (1 + rate * h)
+    p = provider_feed.get("pending_at")
+    if p and w.get("resets_at"):
+        window_start = w["resets_at"] - 7 * 24 * 3600
+        if now - 12 * 3600 < p < now + 12 * 3600 and window_start < p - 12 * 3600:
+            return max(1.0, min(h_eff, (p - now) / 3600)), p
+    return h_eff, None
+
+
+def decide(claude, codex, cfg, now, override=None, feed=None):
+    """Return (mode, why, advice list). Pure function, tested in tests/test_ladder.py.
+    feed: global reset history per provider (read_reset_feed), or None."""
+    feed = feed or {}
+    floor = cfg["claude_floor_percent"]
+    cap5 = cfg["five_hour_max_percent"]
+    resets = sorted([r for r in cfg.get("codex_resets", []) if iso_to_ts(r["expires"]) > now],
+                    key=lambda r: r["expires"])
+    advice = []
+
+    cw, c5, xw = claude["week"], claude["five_hour"], codex["week"]
+    claude_resets = sorted([r for r in cfg.get("claude_resets", []) if iso_to_ts(r["expires"]) > now],
+                           key=lambda r: r["expires"])
+    burn = burn_plan(claude, codex, cfg, now)
+    soon = burn["claude"]["reset_hours"] is not None and burn["claude"]["reset_hours"] <= cfg.get("reset_burn_hours", 24)
+    if claude_resets and cw["used"] is not None and cw["used"] >= cfg["reset_use_at_percent"] \
+            and (soon or cw["hours_left"] > cfg["reset_min_hours_before_weekly"]):
+        advice.append(f"Use the Claude reset expiring {claude_resets[0]['expires'][:16]}: Claude is {cw['used']:.0f}% "
+                      f"full. Valentin presses it in Claude settings, Usage.")
+    elif soon:
+        advice.append(f"BURN CLAUDE: the Claude reset expires {claude_resets[0]['expires'][:16]} "
+                      f"(in {burn['claude']['reset_hours']:.0f} h) and Claude is only "
+                      f"{cw['used'] or 0:.0f}% used. Every department burns Claude now as well: Agent subagents are "
+                      f"allowed in any mode, plus one Claude cloud session per runner with a PR for its claimed ticket "
+                      f"(cloud-offload guide). "
+                      f"Valentin presses the reset once Claude reaches {cfg['reset_use_at_percent']}% or 2 h before "
+                      "it expires, whichever comes first.")
+
+    claude_ok, claude_room, claude_urg = False, False, 0.0
+    if cw["used"] is not None:
+        floor = max(1.0, floor * min(1.0, cw["hours_left"] / 48))
+        room = max(0.0, 100 - floor - cw["used"])
+        target = min(cw["time_gone"], 100 - floor)
+        behind = target - cw["used"]
+        ch, c_pending = effective_hours(cw, feed.get("claude"), now)
+        claude_urg = room / max(ch, 1)
+        if c_pending:
+            advice.append("A global Claude reset is announced: burn Claude now, it gets refilled.")
+        claude_room = room > 0 and (c5["used"] or 0) < cap5
+        claude_ok = claude_room and behind > cfg["claude_behind_margin"]
+
+    codex_ok, codex_urg = False, 0.0
+    if xw["used"] is not None:
+        codex_ok = xw["used"] < 100 and (codex["five_hour"]["used"] or 0) < cap5
+        xh, x_pending = effective_hours(xw, feed.get("codex"), now)
+        codex_urg = (100 - xw["used"]) / max(xh, 1)
+        if x_pending:
+            advice.append(f"OpenAI announced a global Codex reset around "
+                          f"{datetime.fromtimestamp(x_pending, timezone.utc).strftime('%H:%M UTC')}: burn Codex now, "
+                          "it gets refilled.")
+        if resets:
+            h = (iso_to_ts(resets[0]["expires"]) - now) / 3600
+            codex_urg = max(codex_urg, 100 / max(h, 1))
+            if xw["used"] >= cfg["reset_use_at_percent"] and xw["hours_left"] > cfg["reset_min_hours_before_weekly"]:
+                advice.append(f"Use the Codex reset expiring {resets[0]['expires'][:10]}: Codex is "
+                              f"{xw['used']:.0f}% full and its weekly refill is {xw['hours_left']:.0f} h away. "
+                              "Valentin presses it in ChatGPT settings.")
+            elif h < 72 and xw["used"] < 60:
+                advice.append(f"Codex reset expiring {resets[0]['expires'][:10]} is close and Codex is only "
+                              f"{xw['used']:.0f}% used: push more work to Codex.")
+
+    if override == "claude" and cw["used"] is not None and cw["used"] >= 100 - cfg["claude_floor_percent"]:
+        return "codex", (f"forced Claude ended: Claude is {cw['used']:.0f}% used and reached its "
+                         f"{cfg['claude_floor_percent']}% floor, back to Codex"), advice
+    if override in ("claude", "codex"):
+        return override, f"forced by Valentin ({override})", advice
+
+    if claude_ok and (claude_urg > codex_urg or not codex_ok):
+        why = (f"Claude is behind: {cw['used']:.0f}% used with {cw['time_gone']:.0f}% of its week gone, "
+               f"resets in {cw['hours_left']:.0f} h")
+        return "claude", why, advice
+    if codex_ok:
+        return "codex", "Codex has room and Claude is on pace or near its floor", advice
+    if claude_room:
+        return "claude", "Codex is out, Claude still has room above the floor", advice
+    advice.append("Both subscriptions are out or capped. OpenRouter needs Valentin's yes; "
+                  "a Codex reset needs Valentin to press it.")
+    return "codex", "both out: slow down and ask Valentin", advice
+
+
+def burn_plan(claude, codex, cfg, now):
+    def nearest(key):
+        live = sorted(iso_to_ts(r["expires"]) for r in cfg.get(key, []) if iso_to_ts(r["expires"]) > now)
+        return (live[0], (live[0] - now) / 3600) if live else (None, None)
+
+    def entry(name, w, key):
+        ts, h = nearest(key)
+        left = None if w["used"] is None else max(0.0, 100 - w["used"])
+        burn = h is not None and h <= cfg.get("reset_burn_hours", 24) and (w["used"] or 0) < cfg["reset_use_at_percent"]
+        bonus = sum(1 for r in cfg.get(key, []) if iso_to_ts(r["expires"]) > now)
+        return {"left": left, "reset_hours": h,
+                "reset": datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ts else None,
+                "burn_now": burn, "pace": pace_warning(name, w, bonus)}
+
+    return {"claude": entry("Claude", claude["week"], "claude_resets"),
+            "codex": entry("Codex", codex["week"], "codex_resets")}
+
+
+def pace_warning(name, w, bonus_resets=0, week_hours=168):
+    """Warning text when the current burn rate empties the window before it resets, else None.
+    Rate is % used per hour gone; each pending bonus reset adds a full window of room."""
+    if w["used"] is None or w["hours_left"] is None or w["used"] <= 0:
+        return None
+    gone = week_hours - w["hours_left"]
+    if gone <= 0:
+        return None
+    rate = w["used"] / gone
+    empty_in = (100 - w["used"] + 100 * bonus_resets) / rate
+    early = w["hours_left"] - empty_in
+    if early <= 0:
+        return None
+    gap = f"{early / 24:.0f} days" if early >= 48 else f"{early:.0f} h"
+    return f"{name} over pace: at this rate empty in {empty_in:.0f} h, {gap} before reset"
+
+
+def burn_line(s):
+    plan = s.get("burn")
+    if not plan:
+        return ""
+    parts = []
+    for name in ("claude", "codex"):
+        e = plan[name]
+        left = "?" if e["left"] is None else f"{e['left']:.0f}% left"
+        reset = f", reset expires {e['reset']} (in {e['reset_hours']:.0f} h)" if e["reset"] else ", no reset"
+        verdict = "BURN NOW" if e["burn_now"] or s["mode"] == name else "keep"
+        pace = f" ({e['pace']})" if e.get("pace") else ""
+        parts.append(f"{name.capitalize()} {verdict}: {left}{reset}{pace}")
+    return ("Burn plan for every department head (all departments share these accounts): "
+            + "; ".join(parts) + ".")
+
+
+def fmt_bar(name, w):
+    if w["used"] is None:
+        return f"{name}: unknown"
+    return f"{name}: {w['used']:.0f}% used, resets in {w['hours_left']:.0f} h ({w['time_gone']:.0f}% of window gone)"
+
+
+HELPERS = {
+    "orchestrator": ("Orchestrators follow the pstack playbook and spawn their own workers. Spread workers fairly over every plan: "
+                     "read ~/.local/state/pacing/allocation.json; shares.<plan>.runners is the fleet's worker slots per plan; "
+                     "each of the four orchestrators takes an equal part; fill the plan furthest behind pace first "
+                     "(Claude subagents, Pi on DeepSeek via OpenCode Go or Vercel, Codex, Grok via cursor-agent), never Claude alone. "
+                     "Plans reserved for Valentin stay off. No model id containing 'fast', no router or automatic fallback. "
+                     "No CI, builds, tests or AI review on this VPS; they run only on GitHub-hosted runners."),
+}
+
+
+def pool_state(week, five_hour, cfg, now, five_hour_off_pct=None):
+    windows, short_capped = [], False
+    for bar, minutes in ((week, 10080), (five_hour, 300)):
+        bar = dict(bar or {})
+        reset = bar.get("resets_at")
+        if reset is not None:
+            if reset <= now:
+                period = minutes * 60
+                bar = window(0, reset + (int((now - reset) // period) + 1) * period, minutes, now)
+            else:
+                bar["hours_left"] = round((reset - now) / 3600, 1)
+                if bar.get("time_gone") is not None:
+                    bar["time_gone"] = max(0, min(100, 100 * (1 - (reset - now) / (minutes * 60))))
+        if bar.get("used") is not None:
+            windows.append(bar)
+            if minutes == 300 and five_hour_off_pct is not None and bar["used"] >= five_hour_off_pct:
+                short_capped = True
+    if not windows:
+        return {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown"}
+    warn, off = cfg.get("pool_warn_pct", 80), cfg.get("pool_off_pct", 95)
+    state = "ON"
+    if short_capped or any(w["used"] >= off for w in windows):
+        state = "OFF"
+    elif any(w["used"] >= warn or ((w.get("time_gone") or 0) >= warn and
+                                   w["used"] >= w["time_gone"]) for w in windows):
+        state = "WARN"
+    limiting = max(windows, key=lambda w: w["used"])
+    pace_ratios = [window_pace(w, [], now)["ratio"] for w in windows
+                   if (w.get("time_gone") or 0) >= PACE_MIN_ELAPSED_PCT]
+    return {"used_pct": limiting["used"], "hours_left": limiting.get("hours_left"),
+            "resets_at": limiting.get("resets_at"), "state": state,
+            "pace_ratio": max((ratio for ratio in pace_ratios if ratio is not None), default=None)}
+
+
+def read_grok(now, cfg=None):
+    cfg = load_config() if cfg is None else cfg
+    try:
+        with open(os.path.join(STATE, "grok.json")) as f:
+            d = json.load(f)
+        used = d["pct"] if "pct" in d else d["used_pct"]
+        reset, updated = iso_to_ts(d["resets_at"]), iso_to_ts(d["updated_at"])
+        if isinstance(used, bool) or not isinstance(used, (int, float)) or not math.isfinite(used) or not 0 <= used <= 100:
+            return {}
+        if reset <= now or not 0 <= now - updated <= cfg.get("grok_stale_hours", 3) * 3600:
+            return {}
+        return {"used": used, "resets_at": reset, "hours_left": round((reset - now) / 3600, 1),
+                "time_gone": max(0, min(100, 100 * (1 - (reset - now) / (7 * 86400))))}
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+        return {}
+
+
+def write_state(name, data):
+    os.makedirs(STATE, exist_ok=True)
+    path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=STATE, prefix="." + name + "-", delete=False) as f:
+            path = f.name
+            json.dump(data, f, indent=2, allow_nan=False)
+            f.write("\n")
+        os.replace(path, os.path.join(STATE, name))
+    finally:
+        if path and os.path.exists(path):
+            os.unlink(path)
+
+
+def grok_set_command():
+    parser = argparse.ArgumentParser(prog="token-ladder grok-set")
+    parser.add_argument("--pct", required=True, type=float)
+    parser.add_argument("--resets-at", required=True)
+    args = parser.parse_args(sys.argv[2:])
+    now = time.time()
+    if not math.isfinite(args.pct) or not 0 <= args.pct <= 100:
+        parser.error("--pct must be between 0 and 100")
+    try:
+        reset = datetime.fromisoformat(args.resets_at.replace("Z", "+00:00"))
+        if reset.tzinfo is None or reset.timestamp() <= now:
+            raise ValueError()
+    except (ValueError, OverflowError):
+        parser.error("--resets-at must be a future ISO timestamp with a timezone")
+    write_state("grok.json", {"pct": args.pct, "resets_at": reset.isoformat(),
+                             "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat()})
+    print(f"Grok: {args.pct:g}% used, reset {reset.isoformat()}; report saved")
+
+
+def current_pools(s=None, now=None):
+    now = time.time() if now is None else now
+    if s is None:
+        try:
+            s = load_status()
+        except (OSError, ValueError):
+            s = {}
+    if not isinstance(s, dict):
+        s = {}
+    cfg = load_config()
+    pools = {name: pool_state((s.get(name) or {}).get("week"),
+                              (s.get(name) or {}).get("five_hour"), cfg, now, 95 if name == "claude" else None)
+             for name in ("claude", "codex")}
+    pools["grok"] = pool_state(read_grok(now, cfg), None, cfg, now)
+    balance = codex_credits_left(s, cfg)
+    if balance is not None and pools["codex"]["state"] in ("WARN", "OFF"):
+        pools["codex"].update(state="ON", credits=balance)
+    return pools
+
+
+def codex_credits_left(status, cfg):
+    rule = cfg.get("codex_credits") or {}
+    try:
+        balance = float(((status or {}).get("codex") or {}).get("credits"))
+    except (TypeError, ValueError):
+        return None
+    if not rule.get("approved") or not math.isfinite(balance) or balance <= rule.get("floor", 10000):
+        return None
+    return balance
+
+
+def pool_line(name, pool):
+    used = "?" if pool["used_pct"] is None else f"{pool['used_pct']:.0f}%"
+    reset = (datetime.fromtimestamp(pool["resets_at"], timezone.utc).isoformat()
+             if pool.get("resets_at") is not None else "unknown")
+    state = pool["state"]
+    if state == "unknown":
+        state += f" (assume {load_config().get('unknown_assumed_pct', 70):g}% used for planning)"
+    if pool.get("credits") is not None:
+        state += f" (on approved credits, {pool['credits']:,.0f} left)"
+    return f"{name.capitalize()}: {used} used, reset {reset}, {state}"
+
+
+def pools_command():
+    parser = argparse.ArgumentParser(prog="token-ladder pools")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(sys.argv[2:])
+    pools = current_pools()
+    if args.json:
+        print(json.dumps(pools))
+    else:
+        for name, pool in pools.items():
+            print(pool_line(name, pool))
+
+
+def mode_line(s):
+    age = time.time() - s["ts"]
+    stale = f" STALE: last check {age/60:.0f} min ago." if age > STALE_SECONDS else ""
+    pools = current_pools(s)
+    states = "; ".join(f"{name.capitalize()} {p['state']}" for name, p in pools.items())
+    line = f"Token ladder: {states}.{stale} " + " ".join(HELPERS.values())
+    r = s.get("resources")
+    if r and r.get("pressure") == "tight":
+        line += f" Server tight (RAM {r['ram_free_gb']:.0f} GB free, load {r['load5']:.1f}): pace local activity down."
+    return line + " " + onepassword_note(s)
+
+
+def build_accounts(cfg, claude, codex, now):
+    """Clean list of every monitored account, for UIs (multiprompt sidebar). Add or remove
+    subscriptions here via config.json "extra_claude_accounts" ([{id, label, credentials}])."""
+    def acct(id_, label, provider, d, email=None, host="primary+mirror", in_ladder=False):
+        stale = d.get("error") is not None or d["week"]["used"] is None
+        if d.get("sampled_at") and now - d["sampled_at"] > 3 * 3600:
+            stale = True
+        return {"id": id_, "label": label, "provider": provider, "email": email, "host": host,
+                "in_ladder": in_ladder, "cluster": cfg.get("ladder_name") if in_ladder else label, "week": d["week"], "five_hour": d["five_hour"],
+                "stale": stale, "error": d.get("error"), "note": None}
+    out = [acct("claude", cfg.get("claude_label", "Claude"), "claude", claude, claude.get("email"), in_ladder=True),
+           acct("codex", cfg.get("codex_label", "Codex"), "codex", codex, codex.get("email"), in_ladder=True)]
+    for x in cfg.get("extra_claude_accounts", []):
+        out.append(acct(x["id"], x.get("label", x["id"]), "claude", read_claude(now, x.get("credentials"))))
+    for x in cfg.get("remote_claude_accounts", []):
+        d = read_remote_claude(now, x["ssh"], x.get("user"))
+        host = f'{x["user"]}@{x["ssh"]}' if x.get("user") else x["ssh"]
+        a = acct(x["id"], x.get("label", x["id"]), "claude", d, d.get("email"), host=host)
+        a["expected_email"] = x.get("expected_email")
+        a["resets"] = x.get("resets", [])
+        a["note"] = standalone_note(a, out)
+        out.append(a)
+    return out
+
+
+def standalone_note(a, others):
+    """Advice for a plan outside the ladder: use it up evenly over its own week."""
+    if a["error"]:
+        return a["error"]
+    same = next((o for o in others if o["provider"] == a["provider"] and o["email"] and o["email"] == a["email"]), None)
+    if same:
+        note = f"Logged in as {a['email']}, the same plan as '{same['label']}', so it shares that bar."
+        if a.get("expected_email") and a["expected_email"] != a["email"]:
+            note += f" Expected {a['expected_email']}: that plan is not being used at all."
+        return note
+    w = a["week"]
+    behind = w["time_gone"] - w["used"]
+    resets = sorted(r["expires"] for r in a.get("resets", []) if iso_to_ts(r["expires"]) > time.time())
+    if resets and w["used"] >= 95 and w["hours_left"] > 24:
+        return (f"{w['used']:.0f}% full with {w['hours_left']:.0f} h to the refill: press the free reset expiring "
+                f"{resets[0][:10]} in Claude settings, Usage ({a['email']}).")
+    if behind > 10:
+        return f"{behind:.0f} points behind pace: give sessions on {a['host']} more work."
+    if behind < -10:
+        return f"{-behind:.0f} points ahead of pace: slow down on {a['host']} or it runs out early."
+    return "On pace."
+
+
+def over_pace(s, now):
+    alerts = {}
+    for name in ("claude", "codex", "grok"):
+        bars = ((read_grok(now), 168),) if name == "grok" else (
+            ((s.get(name) or {}).get("week") or {}, 168),
+            ((s.get(name) or {}).get("five_hour") or {}, 5))
+        for bar, hours in bars:
+            used, reset = bar.get("used"), bar.get("resets_at")
+            if used is None or reset is None or not 0 < reset - now < hours * 3600:
+                continue
+            elapsed = 100 * (hours * 3600 - (reset - now)) / (hours * 3600)
+            pace = used / elapsed
+            if pace > (1.15 if name == "claude" else 1.3) and pace > alerts.get(name, 0):
+                alerts[name] = pace
+    return alerts
+
+
+def notify_pace(s, now):
+    alerts = over_pace(s, now)
+    if not alerts:
+        return []
+    os.makedirs(STATE, exist_ok=True)
+    with open(os.path.join(STATE, "pace-alerts.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(os.path.join(STATE, "pace-alerts.json")) as f:
+                sent = json.load(f)
+        except (OSError, ValueError):
+            sent = {}
+        pending = {name: pace for name, pace in alerts.items() if now - sent.get(name, 0) >= 7200}
+        if not pending:
+            return []
+        managers = {role: set() for role in ("Product", "Support")}
+        try:
+            panes = subprocess.run(["tmux", "list-panes", "-a", "-f", "#{&&:#{window_active},#{pane_active}}",
+                                    "-F", "#{session_name}\t#{pane_title}"],
+                                   capture_output=True, text=True, timeout=10, check=True)
+            for line in panes.stdout.splitlines():
+                session, _, title = line.partition("\t")
+                role = re.search(r"\bHT (Product Lead|Support(?: Lead)?)\b",
+                                 title, re.IGNORECASE)
+                if role:
+                    managers[role[1].split()[0].capitalize()].add(session)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        records = []
+        topic = os.environ.get("NTFY_TOPIC") or (s.get("config") or {}).get("ntfy_topic")
+        for name, pace in pending.items():
+            message = f"{name.capitalize()} pace {pace:.2f}x. Shift new runners to Codex."
+            try:
+                if topic:
+                    subprocess.run(["curl", "-s", "-m", "10", "-H", "Title: Plan burning too fast", "-H", "Priority: high",
+                                    "-d", f"{name.capitalize()} is burning at {pace:.2f}x its pace. Check which chats use it.",
+                                    "https://ntfy.sh/" + topic],
+                                   capture_output=True, timeout=15)
+            except (OSError, subprocess.SubprocessError):
+                pass
+            sent[name] = now
+            write_state("pace-alerts.json", sent)
+            targets = set().union(*managers.values())
+            missing = [f"HT {role} (offline)" for role, sessions in managers.items() if not sessions]
+            for target in sorted(targets) + missing:
+                status = "queued"
+                if target in targets:
+                    try:
+                        result = subprocess.run(["session-say", target, message, "--from", "token-ladder"],
+                                                capture_output=True, text=True, timeout=20)
+                        if result.returncode == 0 and result.stdout.strip() == "delivered":
+                            status = "delivered"
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+                record = {"ts": now, "brain": name, "pace": pace, "target": target, "status": status}
+                records.append(record)
+                with open(os.path.join(STATE, "pace-alerts.jsonl"), "a") as f:
+                    f.write(json.dumps(record) + "\n")
+                if status != "delivered":
+                    directory = os.path.join(HOME, "poteto-handover")
+                    os.makedirs(directory, exist_ok=True)
+                    with open(os.path.join(directory, "ladder-alerts.md"), "a") as f:
+                        stamp = datetime.fromtimestamp(now, timezone.utc).isoformat()
+                        f.write(f"- {stamp} {target}: [from token-ladder] {message}\n")
+        return records
+
+
+def collect():
+    os.makedirs(STATE, exist_ok=True)
+    cfg, now = load_config(), time.time()
+    claude, codex, orr = read_claude(now), read_codex(now), read_openrouter()
+    claude["email"], codex["email"] = claude_email(), codex_email()
+    override = read_override()
+    feed = read_reset_feed(now)
+    mode, why, advice = decide(claude, codex, cfg, now, override, feed)
+    if override == "claude" and mode != "claude":
+        if os.path.exists(OVERRIDE):
+            os.remove(OVERRIDE)
+        override = None
+    s = {"ts": now, "mode": mode, "why": why, "advice": advice, "override": override or "auto", "global_resets": feed,
+         "claude": claude, "codex": codex, "openrouter": orr, "onepassword": read_onepassword(), "config": cfg,
+         "accounts": build_accounts(cfg, claude, codex, now), "dashboard": dashboard_url(),
+         "resources": record_resources(cfg, now), "burn": burn_plan(claude, codex, cfg, now),
+         "cloud": cloud_maps(cfg, read_cloud_envs())}
+    history = []
+    try:
+        with open(os.path.join(STATE, "history.jsonl")) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    history.append(row)
+    except OSError:
+        pass
+    add_usage_pace(s, history)
+    s["pools"] = current_pools(s, now)
+    s["pace_alerts"] = notify_pace(s, now)
+    try:
+        s["pushed_at"] = float(open(os.path.join(STATE, "last_push_ok")).read())
+    except (OSError, ValueError):
+        s["pushed_at"] = None
+    tmp = STATUS + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, STATUS)
+    with open(os.path.join(STATE, "history.jsonl"), "a") as f:
+        f.write(json.dumps(usage_history_record(s)) + "\n")
+    dash = os.path.join(STATE, "dashboard.html")
+    with open(dash, "w") as f:
+        f.write(render_dashboard(s))
+    every = cfg.get("key_lookup_every_s", 1800)
+    if cfg.get("publish", True) and due("publish", every, now):
+        r = subprocess.run(["yeoshare", dash], capture_output=True, text=True, timeout=60)
+        s["published"] = r.stdout.strip() if r.returncode == 0 else None
+        with open(tmp, "w") as f:
+            json.dump(s, f, indent=1)
+        os.replace(tmp, STATUS)
+    mirror(cfg)
+    last_push = os.path.join(STATE, "last_push_ok")
+    if due("push", every, now) and push_usage(cfg):
+        with open(last_push, "w") as f:
+            f.write(str(now))
+    try:
+        s["pushed_at"] = float(open(last_push).read())
+    except (OSError, ValueError):
+        s["pushed_at"] = None
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=1)
+    os.replace(tmp, STATUS)
+    print(mode_line(s))
+
+
+def due(name, every, now):
+    path = os.path.join(STATE, name + "_tried")
+    try:
+        if now - float(open(path).read()) < every:
+            return False
+    except (OSError, ValueError):
+        pass
+    with open(path, "w") as f:
+        f.write(str(now))
+    return True
+
+
+def push_usage(cfg):
+    """Send status.json to the hosted dashboard (dash.multiprompt.dev). Fails quietly."""
+    url, key = cfg.get("push_url"), cfg.get("push_token_key")
+    if not url or not key:
+        return False
+    try:
+        tok = subprocess.run(["yeo-key", *key], capture_output=True, text=True, timeout=60,
+                             check=True).stdout.strip()
+        with open(STATUS, "rb") as f:
+            body = f.read()
+        req = urllib.request.Request(url, data=body, method="PUT", headers={
+            "Authorization": f"Bearer {tok}", "Content-Type": "application/json",
+            "User-Agent": "token-ladder/0.4 (+https://github.com/valentinyeo/token-ladder)"})
+        return 200 <= urllib.request.urlopen(req, timeout=20).status < 300
+    except Exception:
+        return False
+
+
+def mirror(cfg):
+    """Copy the ladder and its status to the other servers of the same cluster, and the status to
+    standalone-plan users there (their hooks print a token-max line)."""
+    for m in cfg.get("mirrors", []):
+        host = m["ssh"]
+        subprocess.run(["rsync", "-a", "--delete", "--exclude", ".git", "--exclude", "__pycache__",
+                        REPO + "/", f"{host}:projects/token-ladder/"], capture_output=True, timeout=60)
+        subprocess.run(["ssh", "-o", "BatchMode=yes", host, "mkdir -p .local/state/token-ladder"],
+                       capture_output=True, timeout=30)
+        subprocess.run(["rsync", "-a", STATUS, f"{host}:.local/state/token-ladder/status.json"],
+                       capture_output=True, timeout=60)
+        for u in m.get("users", []):
+            subprocess.run(["ssh", "-o", "BatchMode=yes", host,
+                            f"sudo -n install -D -o {u} -m 644 .local/state/token-ladder/status.json "
+                            f"/home/{u}/.local/state/token-ladder/status.json && sudo -n install -D -o {u} -m 755 "
+                            f"projects/token-ladder/bin/token-ladder /home/{u}/.local/bin/token-ladder && "
+                            f"sudo -n install -D -o {u} -m 644 projects/token-ladder/config.json "
+                            f"/home/{u}/.local/config.json && {{ [ ! -f projects/token-ladder/config.local.json ] || "
+                            f"sudo -n install -D -o {u} -m 644 projects/token-ladder/config.local.json "
+                            f"/home/{u}/.local/config.local.json; }}"],
+                           capture_output=True, timeout=30)
+
+
+def read_override():
+    try:
+        v = open(OVERRIDE).read().strip()
+        return v if v in ("claude", "codex") else None
+    except OSError:
+        return None
+
+
+def load_status():
+    with open(STATUS) as f:
+        return json.load(f)
+
+
+def status():
+    for name, pool in current_pools().items():
+        print(pool_line(name, pool))
+
+
+def dashboard_url():
+    p = os.path.realpath(os.path.join(STATE, "dashboard.html"))
+    h = subprocess.run(["sha256sum"], input=(p + "\n").encode(), capture_output=True).stdout.decode()[:8]
+    return f"https://admin.yeoux.net/p/{h}/dashboard.html"
+
+
+def pace_word(w):
+    diff = w["time_gone"] - w["used"]
+    return "BEHIND" if diff > 10 else ("AHEAD" if diff < -10 else "ON PACE")
+
+
+def reset_clock(w):
+    return datetime.fromtimestamp(w["resets_at"], timezone.utc).astimezone().strftime("%a %H:%M")
+
+
+def usage_line(w):
+    if w["used"] is None:
+        return "unknown"
+    return f'{w["used"]:.0f}% used, {pace_word(w)}, resets {reset_clock(w)}, in {w["hours_left"]:.0f} h'
+
+
+def render_dashboard(s):
+    def bar(label, w, note=""):
+        if w["used"] is None:
+            return f'<div class="row"><div class="lbl">{label}</div><div class="muted">unknown {html.escape(note)}</div></div>'
+        tick = f'<div class="tick" style="left:{w["time_gone"]}%" title="time gone"></div>'
+        cls = "hot" if w["used"] >= 90 else ("behind" if w["time_gone"] - w["used"] > 10 else "")
+        return (f'<div class="row"><div class="lbl">{label}</div><div class="track"><div class="fill {cls}" '
+                f'style="width:{w["used"]}%"></div>{tick}</div><div class="num">{usage_line(w)}</div></div>')
+
+    when = datetime.fromtimestamp(s["ts"], timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    resets = "".join(f"<li>Codex full reset, expires {html.escape(r['expires'])}</li>" for r in s["config"].get("codex_resets", []))
+    o = s["openrouter"]
+    orr = f"${o['usage']:.2f} spent" if o["usage"] is not None else html.escape(o["error"] or "unknown")
+    standalone = "".join(
+        f'<section><b>{html.escape(a["label"])}</b> (separate plan, no ladder, use it up by its reset)<div class="muted">Login: '
+        f'{html.escape(str(a["email"]))} on {html.escape(a["host"])}</div>{bar("Week", a["week"])}{bar("5 hours", a["five_hour"])}'
+        f'<div>{html.escape(a["note"] or "")}</div></section>' for a in s.get("accounts", []) if not a["in_ladder"])
+    claude_resets = "".join(f"<li>Claude (Valentin Yeo / Hypertask) full reset, expires {html.escape(r['expires'][:10])}</li>"
+                            for r in s["config"].get("claude_resets", []))
+    claude_resets += "".join(f"<li>{html.escape(a['label'])} Claude full reset, expires {html.escape(r['expires'][:10])}</li>"
+                             for a in s.get("accounts", []) for r in a.get("resets", []))
+    fw = s["claude"].get("fable")
+    if fw:
+        standalone = (f'<section><b>Fable</b> (not extra: a share of the Claude week, max {fw.get("max_share_of_weekly")}%). '
+                      f'Allowed as advisor in CLAUDE mode only.{bar("Fable", fw)}</section>') + standalone
+    advice = "".join(f"<li>{html.escape(a)}</li>" for a in s["advice"]) or "<li>Nothing to do.</li>"
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>Token ladder</title>
+<meta http-equiv="refresh" content="300"><meta name="viewport" content="width=device-width">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/style.css">
+<style>body{{font-family:'Geist Sans',system-ui,sans-serif;background:#0a0a0a;color:#ededed;max-width:760px;margin:40px auto;padding:0 20px}}
+h1{{font-size:22px;margin:0 0 4px}}.muted{{color:#888}}.mode{{font-size:28px;font-weight:600;margin:20px 0 4px}}
+.row{{display:grid;grid-template-columns:140px 1fr 200px;gap:12px;align-items:center;margin:14px 0}}
+.track{{position:relative;height:14px;background:#222;border-radius:7px;overflow:hidden}}
+.fill{{height:100%;background:#3b82f6}}.fill.behind{{background:#f59e0b}}.fill.hot{{background:#ef4444}}
+.tick{{position:absolute;top:0;width:2px;height:100%;background:#fff}}.num{{font-size:13px;color:#aaa}}
+section{{border-top:1px solid #222;margin-top:24px;padding-top:12px}}</style></head><body>
+<h1>Token ladder</h1><div class="muted">Checked {when}. Updates every 5 minutes. White line = how much of the window has passed; a bar left of it is being underused.</div>
+<div class="mode">{s['mode'].upper()} mode</div><div class="muted">{html.escape(s['why'])}. Override: {s['override']}.</div>
+<section><b>{html.escape(s['config'].get('ladder_name', 'Ladder'))} ladder</b> (all non-Client projects, user valentin on the primary server and the mirror server)<div class="muted">Claude login: {html.escape(str(s['claude'].get('email')))} · Codex login: {html.escape(str(s['codex'].get('email')))}</div>{bar('Claude week', s['claude']['week'], s['claude'].get('error') or '')}{bar('Claude 5 hours', s['claude']['five_hour'])}
+{bar('Codex week', s['codex']['week'], s['codex'].get('error') or '')}{bar('Codex 5 hours', s['codex']['five_hour'], '(not reported for this plan)')}</section>
+<section><b>Server</b> ({'TIGHT: new helpers paused' if s['resources']['pressure'] == 'tight' else 'ok'})<div class="muted">{html.escape(resources_line(s['resources']))}</div>{resource_chart(s['ts'])}</section>
+{standalone}<section><b>Bonus resets</b> (pressed by Valentin)<ul>{resets}{claude_resets}</ul></section>
+<section><b>Global resets</b> (whenaireset.com, last 30 days): Codex {(s.get('global_resets') or {}).get('codex', {}).get('direct_30d', '?')}, Claude {(s.get('global_resets') or {}).get('claude', {}).get('direct_30d', '?')}. Frequent resets wipe unused room early, so the ladder treats that plan's week as shorter and burns it sooner.</section>
+<section><b>Codex credits</b> (used only after the weekly limit is hit): {html.escape(str(s['codex'].get('credits')))}<br><b>OpenRouter</b> (pay as you go, only with Valentin's yes): {orr}<br><b>Cursor</b>: reserved for the grok bot, not tracked yet.</section>
+<section><b>Advice</b><ul>{advice}</ul></section>
+<section class="muted">Claude keeps a {s['config']['claude_floor_percent']}% floor for orchestrator sessions. Repo: https://github.com/valentinyeo/token-ladder</section>
+</body></html>"""
+
+
+def hook_prompt():
+    try:
+        sid = json.loads(sys.stdin.read() or "{}").get("session_id") if not sys.stdin.isatty() else None
+        if sid and sid in open(os.path.expanduser("~/.local/state/alert-mute/sessions")).read().split():
+            return
+    except (OSError, ValueError):
+        pass
+    try:
+        s = load_status()
+    except (OSError, ValueError):
+        return
+    if "--account" in sys.argv:
+        print(token_max_line(s, sys.argv[sys.argv.index("--account") + 1]))
+
+
+def token_max_line(s, account_id):
+    """For a plan outside the ladder: one line telling its sessions how hard to push."""
+    a = next((x for x in s.get("accounts", []) if x["id"] == account_id), None)
+    if not a or a["week"]["used"] is None:
+        return f"Token max: no numbers for {account_id} yet. " + onepassword_note(s)
+    w = a["week"]
+    behind = w["time_gone"] - w["used"]
+    if behind > 10:
+        push = ("Plenty left: work in parallel, hand side tasks to Agent subagents, and do the thorough version "
+                "(extra checks, tests, reviews) rather than the cheap one.")
+    elif behind < -10:
+        push = "Ahead of pace: keep to the essentials so the plan lasts until the reset."
+    else:
+        push = "On pace: work normally."
+    return (f"Token max ({a['label']}, {a['email']}): {w['used']:.0f}% used with {w['time_gone']:.0f}% of the week gone, "
+            f"resets in {w['hours_left']:.0f} h. {push} " + onepassword_note(s))
+
+
+WRAPPERS = {"nohup", "setsid", "env", "exec", "nice", "time", "command", "stdbuf"}
+
+
+def shell_commands(cmd):
+    lines, kept, i = cmd.split("\n"), [], 0
+    while i < len(lines):
+        kept.append(lines[i])
+        m = re.search(r"<<-?\s*['\"]?(\w+)", lines[i])
+        if m:
+            i += 1
+            while i < len(lines) and lines[i].strip() != m.group(1):
+                i += 1
+        i += 1
+    lexer = shlex.shlex("\n".join(kept), posix=True, punctuation_chars=";&|()<>\n")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    commands, words = [], []
+    for token in tokens + [";"]:
+        if token and all(c in ";&|()<>\n" for c in token):
+            if words:
+                commands.append(words)
+            words = []
+        else:
+            words.append(token)
+    result = []
+    for words in commands:
+        env = {}
+        while words:
+            word = words[0]
+            if re.match(r"^\w+=", word):
+                key, value = word.split("=", 1)
+                env[key] = value
+                words = words[1:]
+            elif os.path.basename(word) in WRAPPERS:
+                words = words[1:]
+            elif word == "timeout":
+                words = words[2:]
+            elif word.startswith("-"):
+                words = words[1:]
+            else:
+                break
+        if words:
+            result.append((words, env))
+    return result
+
+
+def launches_hax(cmd):
+    return any(os.path.basename(words[0]) == "hax" for words, env in shell_commands(cmd))
+
+
+PI_LANE_PROVIDERS = ("vercel-ai-gateway", "deepseek", "opencode-go", "openrouter-credit")
+DEEPSEEK_FLASH_MODELS = ("deepseek/deepseek-v4.1-flash", "deepseek-v4.1-flash", "deepseek-flash")
+
+
+def bash_refusal(cmd, environment=None):
+    environment = os.environ if environment is None else environment
+    for words, assigned in shell_commands(cmd):
+        exe = os.path.basename(words[0])
+        env = dict(environment, **assigned)
+        if exe in ("cc-deepseek-apikey", "ccr") and env.get("TOKEN_LADDER_DEEPSEEK_OK") != "1":
+            return "no DeepSeek fallback (Valentin 2026-10-25)"
+        if exe not in ("claude", "hax", "codex", "pi", "cursor", "cursor-agent", "agent", "grok"):
+            continue
+        models, providers = [], []
+        for i, word in enumerate(words[1:], 1):
+            if word == "--provider" and i + 1 < len(words):
+                providers.append(words[i + 1])
+            elif word.startswith("--provider="):
+                providers.append(word.split("=", 1)[1])
+            if word in ("--model", "--model-id", "-m") and i + 1 < len(words):
+                models.append(words[i + 1])
+            elif word.startswith(("--model=", "--model-id=", "-m=")):
+                models.append(word.split("=", 1)[1])
+            elif word.startswith("-m") and len(word) > 2:
+                models.append(word[2:])
+            elif re.match(r"model\s*=", word):
+                models.append(word.split("=", 1)[1].strip("\"'"))
+        if any("fast" in model.lower() for model in models):
+            return "Token ladder: fast mode is off; refuse any model id containing 'fast'."
+        providers = [p.lower() for p in providers]
+        if any("baseten" in w.lower() for w in words[1:]):
+            return "Token ladder: never Baseten (Valentin 2026-11-19)."
+        if "openrouter" in providers and env.get("TOKEN_LADDER_OPENROUTER_OK") != "1":
+            return "Token ladder: OpenRouter runs only as the openrouter-credit lane plan-pick prints."
+        deepseek_only = exe == "pi" and models and all(m.lower().startswith(DEEPSEEK_FLASH_MODELS) for m in models)
+        if (any(w == "--api-key" or w.startswith("--api-key=") for w in words[1:]) or
+                any(p not in ("codex", "openrouter") and not (p in PI_LANE_PROVIDERS and deepseek_only) for p in providers)):
+            return "Token ladder: only the lanes plan-pick prints; DeepSeek Flash on pi, no paid-key fallback."
+    return None
+
+
+def hook_bash():
+    try:
+        cmd = json.load(sys.stdin).get("tool_input", {}).get("command", "")
+    except ValueError:
+        return
+    reason = bash_refusal(cmd)
+    if reason:
+        deny(reason)
+
+
+def hook_agent():
+    try:
+        event = json.load(sys.stdin)
+    except ValueError:
+        return
+    if not isinstance(event, dict) or not isinstance(event.get("tool_input"), dict):
+        return
+    if "fast" in str(event["tool_input"].get("model", "")).lower():
+        deny("Token ladder: fast mode is off; refuse any model id containing 'fast'.")
+    if current_pools()["claude"]["state"] == "OFF":
+        deny("Token ladder: Claude pool OFF; wait for its reset, no paid fallback.")
+
+
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+    sys.exit(0)
+
+
+def set_mode(m):
+    if m not in ("claude", "codex", "auto"):
+        sys.exit("usage: token-ladder mode claude|codex|auto")
+    cfg = load_config()
+    if socket.gethostname() != cfg["primary_hostname"]:
+        sys.exit(subprocess.run(["ssh", cfg["primary_ssh"], "projects/token-ladder/bin/token-ladder", "mode", m]).returncode)
+    os.makedirs(STATE, exist_ok=True)
+    if m == "auto":
+        if os.path.exists(OVERRIDE):
+            os.remove(OVERRIDE)
+    else:
+        with open(OVERRIDE, "w") as f:
+            f.write(m)
+    collect()
+
+
+def route_command():
+    parser = argparse.ArgumentParser(prog="token-ladder route")
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args(sys.argv[2:])
+    try:
+        with open(STATUS) as f:
+            status_data = json.load(f)
+    except (OSError, ValueError):
+        status_data = {}
+    if not isinstance(status_data, dict):
+        status_data = {}
+    mode = status_data.get("mode") or "codex"
+    destination, command = route_line(args.repo, mode, status_data.get("cloud"))
+    if args.json:
+        print(json.dumps({"destination": destination, "command": command, "mode": mode, "repo": args.repo}))
+    else:
+        print(destination + "\t" + command)
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    commands = {"collect": collect, "status": status, "hook-prompt": hook_prompt, "hook-bash": hook_bash,
+                "hook-agent": hook_agent, "pools": pools_command, "grok-set": grok_set_command,
+                "route": route_command, "mode": lambda: set_mode(sys.argv[2] if len(sys.argv) > 2 else "")}
+    if cmd not in commands:
+        sys.exit(f"token-ladder: unknown command: {cmd}\n\n{__doc__}")
+    commands[cmd]()
