@@ -1,0 +1,117 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+HINT = 'use valentinyeo/token-ladder/.github/actions/ladder-call'
+RULES = (
+    ('api.deepseek.com', re.compile(r'api\.deepseek\.com')),
+    ('ai-gateway.vercel.sh', re.compile(r'ai-gateway\.vercel\.sh')),
+    ('opencode.ai/zen', re.compile(r'opencode\.ai/zen')),
+    ('openrouter.ai/api', re.compile(r'openrouter\.ai/api')),
+    ('openai.com/v1', re.compile(r'api\.openai\.com')),
+    ('anthropic.com/v1', re.compile(r'api\.anthropic\.com')),
+)
+ALLOW_FILE = Path('.github/ladder-call-allow')
+ALLOW_LINE = re.compile(r'^([^:]+):([^:]+):(\d{4}-\d{2}-\d{2})\s*$')
+ALLOW_ACTION_PREFIXES = (
+    '.github/actions/ladder-call/',
+    '.github/actions/lint-direct-model-calls/',
+)
+
+
+def scan_roots(repo):
+    roots = []
+    for name in ('.github', 'tools'):
+        path = repo / name
+        if path.is_dir():
+            roots.append(path)
+    return roots
+
+
+def load_allow_file(repo, today):
+    path = repo / ALLOW_FILE
+    active = {}
+    problems = []
+    if not path.is_file():
+        return active, problems
+    try:
+        lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError as exc:
+        problems.append((path, 0, f'cannot read allow file: {exc}'))
+        return active, problems
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        match = ALLOW_LINE.match(line)
+        if not match:
+            problems.append((path, lineno, 'invalid allow line'))
+            continue
+        rel, _reason, until_s = match.group(1), match.group(2), match.group(3)
+        try:
+            until = date.fromisoformat(until_s)
+        except ValueError:
+            problems.append((path, lineno, f'invalid date {until_s!r}'))
+            continue
+        if until < today:
+            problems.append((path, lineno, f'expired allow for {rel}'))
+            continue
+        active[rel] = until
+    return active, problems
+
+
+def is_allowlisted(rel_posix, allows):
+    if rel_posix in allows:
+        return True
+    for prefix in ALLOW_ACTION_PREFIXES:
+        if rel_posix.startswith(prefix):
+            return True
+    return False
+
+
+def scan_file(path, repo, today, allows):
+    hits = []
+    try:
+        rel = path.relative_to(repo).as_posix()
+    except ValueError:
+        rel = path.as_posix()
+    if is_allowlisted(rel, allows):
+        return hits
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return hits
+    for lineno, line in enumerate(text.splitlines(), 1):
+        for label, pattern in RULES:
+            if pattern.search(line):
+                hits.append((path, lineno, label, line.rstrip()))
+    return hits
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('repo', nargs='?', default='.')
+    args = parser.parse_args()
+    repo = Path(args.repo).resolve()
+    today = date.today()
+    allows, allow_problems = load_allow_file(repo, today)
+    failures = []
+    for path, lineno, msg in allow_problems:
+        failures.append((path, lineno, 'allow-file', msg))
+    for root in scan_roots(repo):
+        for path in sorted(root.rglob('*')):
+            if not path.is_file():
+                continue
+            failures.extend(scan_file(path, repo, today, allows))
+    for path, lineno, label, detail in failures:
+        print(f'{path}:{lineno}: direct model call ({label}): {HINT}')
+        print(f'  {detail}')
+    if failures:
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

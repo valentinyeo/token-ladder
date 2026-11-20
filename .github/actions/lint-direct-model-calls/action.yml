@@ -1,0 +1,15 @@
+name: lint-direct-model-calls
+description: Fail CI when workflows call model APIs outside token-ladder ladder-call.
+inputs:
+  repo:
+    description: Repository root to scan.
+    required: false
+    default: .
+runs:
+  using: composite
+  steps:
+    - name: lint-direct-model-calls
+      shell: bash
+      run: |
+        set -euo pipefail
+        "${{ github.action_path }}/run" "${{ inputs.repo }}"

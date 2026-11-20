@@ -1,0 +1,37 @@
+name: ladder-call
+description: Chat completion through token-ladder CI lane fallback.
+inputs:
+  request-file:
+    description: JSON chat request (messages, optional max_tokens, response_format).
+    required: true
+  purpose:
+    description: Short label for logs.
+    required: true
+outputs:
+  answer-file:
+    description: Path to the provider response JSON.
+    value: ${{ steps.run.outputs.answer-file }}
+  lane:
+    description: Lane that answered.
+    value: ${{ steps.run.outputs.lane }}
+runs:
+  using: composite
+  steps:
+    - name: ladder-call
+      id: run
+      shell: bash
+      env:
+        AI_GATEWAY_API_KEY: ${{ env.AI_GATEWAY_API_KEY }}
+        OPENCODE_API_KEY: ${{ env.OPENCODE_API_KEY }}
+        DEEPSEEK_API_KEY: ${{ env.DEEPSEEK_API_KEY }}
+        OPENROUTER_API_KEY: ${{ env.OPENROUTER_API_KEY }}
+      run: |
+        set -euo pipefail
+        answer="${RUNNER_TEMP}/ladder-call-answer.json"
+        log="${RUNNER_TEMP}/ladder-call.log"
+        "${{ github.action_path }}/run" --purpose "${{ inputs.purpose }}" \
+          < "${{ inputs.request-file }}" > "$answer" 2> "$log"
+        lane=$(sed -n 's/^ladder-call: lane \(\S*\) answered.*/\1/p' "$log" | tail -1)
+        echo "answer-file=$answer" >> "$GITHUB_OUTPUT"
+        echo "lane=$lane" >> "$GITHUB_OUTPUT"
+        cat "$log" >&2

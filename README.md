@@ -243,3 +243,37 @@ branch and dirty-file status. A detached revision has a null branch. Dirty files
 remain in their original worktree; their contents and environment credentials
 are never copied into the record. This is a handoff snapshot, not a worktree
 backup or an ownership grant.
+
+## CI model calls
+
+GitHub checks that need a hosted chat completion should not call DeepSeek,
+OpenCode, the Vercel AI Gateway, OpenRouter, OpenAI or Anthropic directly.
+Use the shared lane ladder in this repo instead.
+
+`ci/ladder-call` reads a JSON chat request on stdin (`messages`, optional
+`max_tokens` and `response_format`) and `--purpose <label>`. It walks the lanes
+in `ci/lanes.json` when the matching key env var is set:
+`AI_GATEWAY_API_KEY`, `OPENCODE_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`.
+On payment or quota errors, rate limits, 5xx, timeouts or empty answers it
+falls through to the next lane, logs each skip on stderr, prints the provider
+JSON on stdout, and exits `3` only when every lane fails.
+
+```yaml
+- uses: valentinyeo/token-ladder/.github/actions/ladder-call@main
+  env:
+    AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+    OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+    DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+    OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  with:
+    request-file: request.json
+    purpose: pr-verifier
+```
+
+`ci/lint-direct-model-calls` scans `.github/` and `tools/` for direct provider
+URLs (not key env wiring). It fails with
+`use valentinyeo/token-ladder/.github/actions/ladder-call` unless
+`.github/ladder-call-allow` lists an unexpired
+`<path>:<reason>:<until YYYY-MM-DD>` entry for that file; expired allow lines fail.
+The reusable action is
+`valentinyeo/token-ladder/.github/actions/lint-direct-model-calls@main`.
