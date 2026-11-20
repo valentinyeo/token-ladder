@@ -1,5 +1,7 @@
 {
   "grok_stale_hours": 3,
+  "opencode_estimate_hours": 24,
+  "opencode_estimate_usd_per_mtok": 2.0,
   "unknown_assumed_pct": 70,
   "pool_warn_pct": 80,
   "pace_warn_ratio": 1.1,

@@ -313,9 +313,39 @@ def history(rows):
     return tmp
 
 
+def sessions(rows):
+    tmp = Path(tempfile.mkdtemp(), "--tmp-work--")
+    tmp.mkdir()
+    tmp.joinpath("run.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+    return str(tmp.parent)
+
+
+def lane_use(at, provider="opencode-go", tokens=0, cost=None):
+    usage = {"totalTokens": tokens}
+    if cost is not None:
+        usage["cost"] = {"total": cost}
+    return {"type": "message", "message": {"role": "assistant", "provider": provider, "model": "deepseek-v4.1-flash",
+                                             "timestamp": int(at * 1000), "usage": usage}}
+
+
+REAL_AT = 1795174461.7206776
+REAL_USD = 20.57
+REAL_HISTORY = [{"at": REAL_AT, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+                 "credits_usd": REAL_USD, "today_usd": 2.36, "source": "credits"},
+                {"at": REAL_AT + 1800, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+                 "credits_usd": None, "today_usd": None, "source": "api"},
+                {"at": REAL_AT + 3600, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+                 "credits_usd": None, "today_usd": None, "source": "api"}]
+
+
+def api_at(at):
+    return {"at": at, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+            "credits_usd": None, "today_usd": None, "source": "api"}
+
+
 class OpencodePoolTests(unittest.TestCase):
-    def state(self, rows, cfg=None):
-        return pp.opencode_pool(NOW, cfg or {}, history(rows))
+    def state(self, rows, cfg=None, used=None, now=NOW):
+        return pp.opencode_pool(now, cfg or {}, history(rows), sessions(used or []))
 
     def test_missing_file_is_unknown_and_still_usable(self):
         got = pp.opencode_pool(NOW, {}, tempfile.mkdtemp())
@@ -333,11 +363,63 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertEqual(got["state"], "OFF")
         self.assertEqual(pick({"opencode": got, "codex": pool()}, {"vercel": T + 60, "deepseek": T + 60})["plan"], "codex")
 
-    def test_full_month_with_stale_or_missing_credit_is_off(self):
-        for rows in ([{"at": NOW - 600, "windows": {"monthly": 100}}],
-                     [{"at": NOW - 600, "windows": {"monthly": 100}}, {"at": NOW - 3 * 3600, "windows": {}, "credits_usd": 50}]):
-            with self.subTest(rows=rows):
-                self.assertEqual(self.state(rows)["state"], "OFF")
+    def test_full_month_with_no_credit_reading_at_all_is_off(self):
+        self.assertEqual(self.state([{"at": NOW - 600, "windows": {"monthly": 100}}])["state"], "OFF")
+
+    def test_pc_off_estimates_from_the_api_history_and_the_lane_spend(self):
+        now = REAL_AT + 3 * 3600
+        got = self.state(REAL_HISTORY + [api_at(now - 60)], used=[lane_use(REAL_AT + 600, tokens=1_000_000)], now=now)
+        self.assertEqual(got["state"], "ON")
+        self.assertIn("$18.57 estimated credit", got["note"])
+        self.assertIn("$20.57 read 3.0h ago less $2.00 spend seen since", got["note"])
+        lanes = {"vercel": T + 60, "deepseek": T + 60}
+        self.assertEqual(pick({"opencode": got, "codex": pool()}, lanes)["plan"], "opencode")
+
+    def test_estimate_under_the_floor_is_off(self):
+        now = REAL_AT + 4 * 3600
+        got = self.state(REAL_HISTORY + [api_at(now - 60)], used=[lane_use(REAL_AT + 6600, tokens=7_500_000)], now=now)
+        self.assertEqual(got["state"], "OFF")
+        self.assertIn("estimated credit $5.57", got["note"])
+        self.assertIn("under $6", got["note"])
+        lanes = {"vercel": T + 60, "deepseek": T + 60}
+        self.assertEqual(pick({"opencode": got, "codex": pool()}, lanes)["plan"], "codex")
+
+    def test_estimate_older_than_24_hours_is_refused(self):
+        for hours in (23.9, 24.1):
+            with self.subTest(hours=hours):
+                now = REAL_AT + hours * 3600
+                got = self.state(REAL_HISTORY + [api_at(now - 60)], now=now)
+                self.assertEqual(got["state"], "ON" if hours < 24 else "OFF")
+        now = REAL_AT + 25 * 3600
+        self.assertIn("no credit reading or estimate from the last 24 hours",
+                      self.state(REAL_HISTORY + [api_at(now - 60)], now=now)["note"])
+
+    def test_recorded_cost_wins_over_the_token_rate(self):
+        now = REAL_AT + 3 * 3600
+        got = self.state(REAL_HISTORY + [api_at(now - 60)],
+                         used=[lane_use(REAL_AT + 600, tokens=1_000_000, cost=4.0)], now=now)
+        self.assertIn("$16.57 estimated credit", got["note"])
+        self.assertIn("less $4.00 spend seen since", got["note"])
+
+    def test_estimate_counts_only_the_opencode_lane(self):
+        now = REAL_AT + 3 * 3600
+        used = [lane_use(REAL_AT + 600, provider="vercel-ai-gateway", tokens=5_000_000),
+                lane_use(REAL_AT + 700, provider="deepseek", tokens=5_000_000),
+                lane_use(REAL_AT - 600, tokens=5_000_000)]
+        got = self.state(REAL_HISTORY + [api_at(now - 60)], used=used, now=now)
+        self.assertIn("$20.57 estimated credit", got["note"])
+        self.assertIn("less $0.00 spend seen since", got["note"])
+
+    def test_spend_since_the_reading_comes_from_the_lane_logs_only(self):
+        now = REAL_AT + 3 * 3600
+        used = [lane_use(REAL_AT + 60, tokens=500_000), lane_use(REAL_AT + 120, tokens=500_000)]
+        self.assertAlmostEqual(pp.lane_spend(REAL_AT, sessions(used)), 2.0)
+
+    def test_fresh_real_reading_still_wins_over_the_estimate(self):
+        now = REAL_AT + 1800
+        got = self.state(REAL_HISTORY + [api_at(now - 60)], used=[lane_use(REAL_AT + 600, tokens=1_000_000)], now=now)
+        self.assertEqual(got["state"], "ON")
+        self.assertIn("running on $20.57 credit", got["note"])
 
     def test_credit_only_lines_are_ignored(self):
         rows = [{"at": NOW - 600, "windows": {"monthly": 50}}, {"at": NOW - 60, "windows": {}, "credits_usd": 0.1}]
