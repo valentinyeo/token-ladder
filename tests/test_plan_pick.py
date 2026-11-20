@@ -90,6 +90,18 @@ class PickTests(unittest.TestCase):
         self.assertEqual(pick({"codex": pool("ON", 1.5)}, limits, warn=1.0)["plan"], "cursor")
 
 
+class NoLaneTests(unittest.TestCase):
+    def test_no_lane_names_the_next_free_lane_and_never_asks_to_pay(self):
+        limits = {"vercel": T + 600, "deepseek": T + 3600, "opencode": T + 7200}
+        pools = {"codex": {"state": "OFF"}, "grok": {"state": "OFF"}, "credit:openrouter": {"state": "OFF"}}
+        got = pp.pick(LANES, pools, limits, T)
+        self.assertIsNone(got["command"])
+        self.assertEqual(got["next_free"], {"lane": "vercel", "at": T + 600})
+        self.assertIn("vercel frees at", got["reason"])
+        self.assertIn("wait", got["reason"])
+        self.assertNotIn("top", got["reason"].lower())
+
+
 class RunTests(unittest.TestCase):
     def setUp(self):
         self.limits = str(Path(tempfile.mkdtemp()) / "limits.json")
