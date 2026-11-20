@@ -33,6 +33,7 @@ jobs:
       - name: Prepare request
         run: echo '{"messages":[{"role":"user","content":"hi"}]}' > /tmp/ladder-request.json
       - name: ladder-call action
+        id: ladder
         uses: ./.github/actions/ladder-call
         env:
           AI_GATEWAY_API_KEY: stub-gw
@@ -40,6 +41,26 @@ jobs:
         with:
           request-file: /tmp/ladder-request.json
           purpose: ci-actions
+      - name: assert ladder-call outputs
+        run: |
+          set -euo pipefail
+          test "${{ steps.ladder.outputs.lane }}" = opencode-go
+          grep -q action-ok "${{ steps.ladder.outputs.answer-file }}"
+      - name: ladder-call action again in the same job
+        id: ladder2
+        uses: ./.github/actions/ladder-call
+        env:
+          AI_GATEWAY_API_KEY: stub-gw
+          OPENCODE_API_KEY: stub-oc
+        with:
+          request-file: /tmp/ladder-request.json
+          purpose: ci-actions
+      - name: assert per-step ladder-call files do not collide
+        run: |
+          set -euo pipefail
+          test "${{ steps.ladder2.outputs.lane }}" = opencode-go
+          test "${{ steps.ladder.outputs.answer-file }}" != "${{ steps.ladder2.outputs.answer-file }}"
+          grep -q action-ok "${{ steps.ladder2.outputs.answer-file }}"
       - name: lint-direct-model-calls action
         uses: ./.github/actions/lint-direct-model-calls
         with:

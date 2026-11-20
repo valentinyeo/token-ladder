@@ -9,7 +9,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
-SKIP_HTTP = {401, 402, 403, 429}
+SKIP_HTTP = {401, 402, 403, 404, 408, 425, 429}
 
 
 def timeout_seconds():

@@ -27,10 +27,14 @@ runs:
         OPENROUTER_API_KEY: ${{ env.OPENROUTER_API_KEY }}
       run: |
         set -euo pipefail
-        answer="${RUNNER_TEMP}/ladder-call-answer.json"
-        log="${RUNNER_TEMP}/ladder-call.log"
-        "${{ github.action_path }}/run" --purpose "${{ inputs.purpose }}" \
-          < "${{ inputs.request-file }}" > "$answer" 2> "$log"
+        tag="$(printf '%s' "${{ inputs.purpose }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-$$-${RANDOM}" | sha256sum | cut -c1-12)"
+        answer="${RUNNER_TEMP}/ladder-call-answer-${tag}.json"
+        log="${RUNNER_TEMP}/ladder-call-${tag}.log"
+        if ! "${{ github.action_path }}/run" --purpose "${{ inputs.purpose }}" \
+          < "${{ inputs.request-file }}" > "$answer" 2> "$log"; then
+          cat "$log" >&2
+          exit 1
+        fi
         lane=$(sed -n 's/^ladder-call: lane \(\S*\) answered.*/\1/p' "$log" | tail -1)
         echo "answer-file=$answer" >> "$GITHUB_OUTPUT"
         echo "lane=$lane" >> "$GITHUB_OUTPUT"

@@ -276,9 +276,10 @@ Use the shared lane ladder in this repo instead.
 `max_tokens` and `response_format`) and `--purpose <label>`. It walks the lanes
 in `ci/lanes.json` when the matching key env var is set:
 `AI_GATEWAY_API_KEY`, `OPENCODE_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`.
-On payment or quota errors, rate limits, 5xx, timeouts or empty answers it
-falls through to the next lane, logs each skip on stderr, prints the provider
-JSON on stdout, and exits `3` only when every lane fails.
+On payment or quota errors, rate limits, missing models (`404`, `408`, `425`),
+5xx, timeouts or empty answers it falls through to the next lane; a `400`
+request-body error stops the run. Each skip is logged on stderr, the provider
+JSON goes on stdout, and exit `3` means every lane failed.
 
 ```yaml
 - uses: valentinyeo/token-ladder/.github/actions/ladder-call@main
@@ -293,8 +294,11 @@ JSON on stdout, and exits `3` only when every lane fails.
 ```
 
 `ci/lint-direct-model-calls` scans `.github/` and `tools/` for direct provider
-URLs (not key env wiring). It fails with
-`use valentinyeo/token-ladder/.github/actions/ladder-call` unless
+URLs, direct reads of model API key env vars in code, and repo-local model
+fallback (HTTP `402`/`429` or credit handling in the same file as a model key
+or endpoint). Workflow `env:` lines that only pass keys into `ladder-call` are
+allowed. It fails with
+`use valentinyeo/token-ladder/.github/actions/ladder-call@main` unless
 `.github/ladder-call-allow` lists an unexpired
 `<path>:<reason>:<until YYYY-MM-DD>` entry for that file; expired allow lines fail.
 The reusable action is

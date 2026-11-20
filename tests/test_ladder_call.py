@@ -13,6 +13,36 @@ REPO = Path(__file__).resolve().parents[1]
 LADDER = REPO / 'ci' / 'ladder-call'
 LINT = REPO / 'ci' / 'lint-direct-model-calls'
 ACTION_LADDER = REPO / '.github' / 'actions' / 'ladder-call'
+FIXTURE_DIR = REPO / 'tests' / 'fixtures'
+
+
+def run_lint(root):
+    return subprocess.run([str(LINT), str(root)], capture_output=True, text=True, check=False)
+
+
+def action_run_script():
+    lines = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8').splitlines()
+    start = lines.index('      run: |') + 1
+    block = []
+    for line in lines[start:]:
+        if line.startswith('        '):
+            block.append(line[8:])
+        elif not line.strip():
+            block.append('')
+        else:
+            break
+    script = '\n'.join(block)
+    replacements = {
+        '${{ inputs.purpose }}': 'test-purpose',
+        '${{ inputs.request-file }}': '${REQUEST_FILE}',
+        '${{ github.action_path }}': str(ACTION_LADDER),
+        '${{ github.run_id }}': '123',
+        '${{ github.run_attempt }}': '1',
+        '${{ github.job }}': 'unit',
+    }
+    for source, value in replacements.items():
+        script = script.replace(source, value)
+    return script
 
 
 class StubHandler(BaseHTTPRequestHandler):
@@ -261,6 +291,30 @@ class LadderCallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('failed: HTTP 400', result.stderr)
 
+    def test_404_408_425_fall_to_second_lane(self):
+        for status in (404, 408, 425):
+            with self.subTest(status=status):
+                server, port = run_server({
+                    '/v1/chat/completions': (status, None, None),
+                    '/zen/go/v1/chat/completions': (200, {
+                        'choices': [{'message': {'content': 'second-lane-ok'}}],
+                    }, None),
+                })
+                self.addCleanup(server.shutdown)
+                base = f'http://127.0.0.1:{port}'
+                env = {
+                    'AI_GATEWAY_API_KEY': 'gw-key',
+                    'OPENCODE_API_KEY': 'oc-key',
+                    'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
+                    'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
+                }
+                result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'skipped: {status}', result.stderr)
+                self.assertIn('lane opencode-go answered', result.stderr)
+                payload = json.loads(result.stdout)
+                self.assertEqual(payload['choices'][0]['message']['content'], 'second-lane-ok')
+
     def test_timeout_skipped_with_env(self):
         class SlowHandler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -383,6 +437,138 @@ class LintDirectModelCallsTests(unittest.TestCase):
         action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
         self.assertIn('${{ github.action_path }}/run', action_yml)
         self.assertNotIn('/ci/ladder-call', action_yml)
+
+    def test_action_wrapper_logs_on_failure(self):
+        action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
+        self.assertIn('if !', action_yml)
+        self.assertIn('cat "$log" >&2', action_yml)
+        self.assertIn('ladder-call-answer-', action_yml)
+        self.assertIn('${RANDOM}', action_yml)
+        self.assertIn('-$$-', action_yml)
+
+    def test_action_prints_lane_skips_when_ladder_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items() if not k.endswith('_API_KEY')}
+            env['RUNNER_TEMP'] = tmp
+            env['GITHUB_OUTPUT'] = os.path.join(tmp, 'output')
+            request = Path(tmp) / 'request.json'
+            request.write_text('{"messages": []}', encoding='utf-8')
+            env['REQUEST_FILE'] = str(request)
+            script = Path(tmp) / 'step.sh'
+            script.write_text(action_run_script(), encoding='utf-8')
+            first = subprocess.run(['bash', str(script)], capture_output=True, text=True, env=env, check=False)
+            second = subprocess.run(['bash', str(script)], capture_output=True, text=True, env=env, check=False)
+            self.assertEqual(first.returncode, 1)
+            self.assertIn('skipped: no key', first.stderr)
+            self.assertIn('no lane answered', first.stderr)
+            self.assertEqual(second.returncode, 1)
+            answers = sorted(Path(tmp).glob('ladder-call-answer-*.json'))
+            logs = sorted(Path(tmp).glob('ladder-call-*.log'))
+            self.assertEqual(len(answers), 2)
+            self.assertEqual(len(logs), 2)
+            self.assertNotEqual(answers[0].name, answers[1].name)
+
+    def test_flags_real_multiprompt_verifier_with_file_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / '.github' / 'scripts' / 'pstack-verifier' / 'verifier.cjs'
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes((FIXTURE_DIR / 'multiprompt-android-verifier.cjs').read_bytes())
+            result = run_lint(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertRegex(result.stdout, r'verifier\.cjs:10: direct model call \(api\.deepseek\.com\)')
+            self.assertRegex(result.stdout, r'verifier\.cjs:365: direct model call \(direct model key \(env\.DEEPSEEK_API_KEY\)\)')
+            self.assertRegex(result.stdout, r'verifier\.cjs:388: direct model call \(model fallback\)')
+            self.assertIn('@main', result.stdout)
+
+    def test_flags_os_environ_and_getenv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / 'tools' / 'keys.py'
+            script.parent.mkdir(parents=True)
+            script.write_text(
+                "import os\n"
+                "a = os.environ['OPENROUTER_API_KEY']\n"
+                "b = os.getenv('ANTHROPIC_API_KEY')\n"
+                "c = os.environ.get('OPENAI_API_KEY')\n",
+                encoding='utf-8',
+            )
+            result = run_lint(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertRegex(result.stdout, r'keys\.py:2: direct model call \(direct model key \(os\.environ\[')
+            self.assertRegex(result.stdout, r'keys\.py:3: direct model call \(direct model key \(os\.getenv\(')
+            self.assertRegex(result.stdout, r'keys\.py:4: direct model call \(direct model key \(os\.environ\.get\(')
+
+    def test_flags_credit_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / 'tools' / 'call.js'
+            script.parent.mkdir(parents=True)
+            script.write_text(
+                "const key = process.env.DEEPSEEK_API_KEY;\n"
+                "if (answer.includes('out of credit')) retry();\n",
+                encoding='utf-8',
+            )
+            result = run_lint(root)
+            self.assertEqual(result.returncode, 1)
+            self.assertRegex(result.stdout, r'call\.js:2: direct model call \(model fallback\)')
+
+    def test_ladder_call_action_passes_lint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dest = root / '.github' / 'actions' / 'ladder-call' / 'action.yml'
+            dest.parent.mkdir(parents=True)
+            dest.write_bytes((ACTION_LADDER / 'action.yml').read_bytes())
+            result = run_lint(root)
+            self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_flags_process_env_model_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / 'tools' / 'call.js'
+            script.parent.mkdir(parents=True)
+            script.write_text(
+                "const key = process.env.DEEPSEEK_API_KEY;\n"
+                "fetch('https://example.com');\n",
+                encoding='utf-8',
+            )
+            result = subprocess.run([str(LINT), str(root)], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('direct model key', result.stdout)
+            self.assertIn('@main', result.stdout)
+
+    def test_flags_model_fallback_with_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            script = root / '.github' / 'scripts' / 'verifier.cjs'
+            script.parent.mkdir(parents=True)
+            script.write_text(
+                "const ENDPOINT = 'https://api.deepseek.com/chat/completions';\n"
+                "async function callDeepSeek({ key, fetchImpl = fetch }) {\n"
+                "  const response = await fetchImpl(ENDPOINT, { headers: { authorization: key } });\n"
+                "  if (response.status === 429 || response.status >= 500) {\n"
+                "    throw new Error('retry');\n"
+                "  }\n"
+                "}\n"
+                "function requireKey(env) { return env.DEEPSEEK_API_KEY.trim(); }\n",
+                encoding='utf-8',
+            )
+            result = subprocess.run([str(LINT), str(root)], capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('model fallback', result.stdout)
+
+    def test_ladder_actions_workflow_asserts_outputs(self):
+        workflow = (REPO / '.github' / 'workflows' / 'ladder-actions.yml').read_text(encoding='utf-8')
+        self.assertIn('id: ladder', workflow)
+        self.assertIn('steps.ladder.outputs.lane', workflow)
+        self.assertIn('steps.ladder.outputs.answer-file', workflow)
+        self.assertIn('opencode-go', workflow)
+        self.assertIn('action-ok', workflow)
+
+    def test_ladder_actions_workflow_runs_two_calls_in_one_job(self):
+        workflow = (REPO / '.github' / 'workflows' / 'ladder-actions.yml').read_text(encoding='utf-8')
+        self.assertIn('id: ladder2', workflow)
+        self.assertIn('!= "${{ steps.ladder2.outputs.answer-file }}"', workflow)
 
 
 if __name__ == '__main__':

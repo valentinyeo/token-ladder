@@ -5,7 +5,15 @@ import sys
 from datetime import date
 from pathlib import Path
 
-HINT = 'use valentinyeo/token-ladder/.github/actions/ladder-call'
+HINT = 'use valentinyeo/token-ladder/.github/actions/ladder-call@main'
+KEY_ENVS = (
+    'DEEPSEEK_API_KEY',
+    'OPENROUTER_API_KEY',
+    'AI_GATEWAY_API_KEY',
+    'OPENCODE_API_KEY',
+    'OPENAI_API_KEY',
+    'ANTHROPIC_API_KEY',
+)
 RULES = (
     ('api.deepseek.com', re.compile(r'api\.deepseek\.com')),
     ('ai-gateway.vercel.sh', re.compile(r'ai-gateway\.vercel\.sh')),
@@ -14,6 +22,25 @@ RULES = (
     ('openai.com/v1', re.compile(r'api\.openai\.com')),
     ('anthropic.com/v1', re.compile(r'api\.anthropic\.com')),
 )
+KEY_ENV_ALT = '|'.join(re.escape(name) for name in KEY_ENVS)
+KEY_READ = re.compile(
+    rf'process\.env\.(?:{KEY_ENV_ALT})\b'
+    rf'|process\.env\[[\'"](?:{KEY_ENV_ALT})[\'"]\]'
+    rf'|os\.environ\[[\'"](?:{KEY_ENV_ALT})[\'"]\]'
+    rf'|os\.environ\.get\([\'"](?:{KEY_ENV_ALT})[\'"]'
+    rf'|os\.getenv\([\'"](?:{KEY_ENV_ALT})[\'"]'
+    rf'|\benv\.(?:{KEY_ENV_ALT})\b',
+)
+FALLBACK_SIGNAL = re.compile(
+    r'(?:status\s*(?:===|==)\s*(?:402|429)|\b402\b|\b429\b|\bcredits?\b)',
+    re.IGNORECASE,
+)
+MODEL_TOUCH = re.compile(
+    rf'(?:{KEY_ENV_ALT})|api\.deepseek\.com|ai-gateway\.vercel\.sh|opencode\.ai/zen|'
+    r'openrouter\.ai/api|api\.openai\.com|api\.anthropic\.com',
+    re.IGNORECASE,
+)
+YAML_ENV_VALUE = re.compile(r'^\s*(?:[A-Z][A-Z0-9_]*_API_KEY|[A-Z][A-Z0-9_]*_KEY)\s*:')
 ALLOW_FILE = Path('.github/ladder-call-allow')
 ALLOW_LINE = re.compile(r'^([^:]+):([^:]+):(\d{4}-\d{2}-\d{2})\s*$')
 ALLOW_ACTION_PREFIXES = (
@@ -72,6 +99,10 @@ def is_allowlisted(rel_posix, allows):
     return False
 
 
+def yaml_env_wiring_line(line):
+    return bool(YAML_ENV_VALUE.match(line))
+
+
 def scan_file(path, repo, today, allows):
     hits = []
     try:
@@ -84,10 +115,25 @@ def scan_file(path, repo, today, allows):
         text = path.read_text(encoding='utf-8', errors='replace')
     except OSError:
         return hits
-    for lineno, line in enumerate(text.splitlines(), 1):
+    lines = text.splitlines()
+    is_yaml = path.suffix in {'.yml', '.yaml'}
+    has_model_touch = MODEL_TOUCH.search(text) is not None
+    has_fallback = FALLBACK_SIGNAL.search(text) is not None
+    if has_model_touch and has_fallback:
+        for lineno, line in enumerate(lines, 1):
+            if FALLBACK_SIGNAL.search(line):
+                hits.append((path, lineno, 'model fallback', line.rstrip()))
+                break
+    for lineno, line in enumerate(lines, 1):
+        if is_yaml and yaml_env_wiring_line(line):
+            continue
         for label, pattern in RULES:
             if pattern.search(line):
                 hits.append((path, lineno, label, line.rstrip()))
+        key_match = KEY_READ.search(line)
+        if key_match:
+            label = key_match.group(0)
+            hits.append((path, lineno, f'direct model key ({label})', line.rstrip()))
     return hits
 
 
@@ -106,7 +152,12 @@ def main():
             if not path.is_file():
                 continue
             failures.extend(scan_file(path, repo, today, allows))
+    seen = set()
     for path, lineno, label, detail in failures:
+        key = (path, lineno, label)
+        if key in seen:
+            continue
+        seen.add(key)
         print(f'{path}:{lineno}: direct model call ({label}): {HINT}')
         print(f'  {detail}')
     if failures:
