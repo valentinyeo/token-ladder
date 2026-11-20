@@ -716,6 +716,75 @@ class CommandTests(unittest.TestCase):
         self.assertIn(json.loads(out.stdout)["plan"], ("vercel", "deepseek", "opencode", "codex", "cursor", "openrouter", "none"))
 
 
+class LoopIntervalTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+
+    def cli(self, *args):
+        return subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), *args],
+                              capture_output=True, text=True,
+                              env={"HOME": self.home, "PATH": "/usr/bin:/bin",
+                                   "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
+
+    def run_cli(self, pools, *args):
+        path = Path(self.home) / "pools.json"
+        path.write_text(json.dumps(pools))
+        return self.cli("--pools", str(path), "--loop-interval", *args)
+
+    def test_on_pace_waits_the_two_hour_base(self):
+        out = self.run_cli({"claude": pool("ON", 0.6)})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "7200 claude pace 0.60x on pace\n")
+
+    def test_ahead_of_pace_waits_three_hours(self):
+        out = self.run_cli({"claude": pool("ON", 1.16)})
+        self.assertEqual(out.stdout, "10800 claude pace 1.16x ahead\n")
+
+    def test_far_ahead_of_pace_waits_four_hours(self):
+        out = self.run_cli({"claude": pool("ON", 1.34)})
+        self.assertEqual(out.stdout, "14400 claude pace 1.34x far ahead\n")
+
+    def test_used_95_percent_waits_four_hours(self):
+        out = self.run_cli({"claude": {"state": "WARN", "used_pct": 95.0, "pace_ratio": 0.5}})
+        self.assertEqual(out.stdout, "14400 claude 95% used\n")
+
+    def test_missing_claude_pool_uses_the_base(self):
+        out = self.run_cli({"codex": pool()})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "7200 claude pool unknown\n")
+
+    def test_unreadable_pool_file_still_exits_zero(self):
+        out = self.cli("--pools", "/nonexistent", "--loop-interval")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "7200 claude pool unknown\n")
+
+    def test_json_has_the_four_fields(self):
+        got = json.loads(self.run_cli({"claude": pool("ON", 1.16)}, "--json").stdout)
+        self.assertEqual(sorted(got), ["pace_ratio", "reason", "seconds", "used_pct"])
+        self.assertEqual(got["seconds"], 10800)
+        self.assertEqual(got["pace_ratio"], 1.16)
+        self.assertEqual(got["used_pct"], 40.0)
+        self.assertEqual(got["reason"], "claude pace 1.16x ahead")
+
+    def test_json_for_an_unknown_pool_keeps_null_numbers(self):
+        got = json.loads(self.cli("--pools", "/nonexistent", "--loop-interval", "--json").stdout)
+        self.assertEqual(got, {"seconds": 7200, "pace_ratio": None, "used_pct": None,
+                               "reason": "claude pool unknown"})
+
+    def test_config_holds_the_thresholds(self):
+        self.assertEqual(pp.loop_rule(pp.load_config()),
+                         {"base_seconds": 7200, "ahead_seconds": 10800, "far_ahead_seconds": 14400,
+                          "ahead_ratio": 1.0, "far_ahead_ratio": 1.2, "used_pct": 95, "min_seconds": 1800})
+
+    def test_config_changes_are_the_only_source(self):
+        cfg = {"loop_interval": {"ahead_ratio": 0.5}}
+        self.assertEqual(pp.loop_interval({"claude": pool("ON", 0.6)}, cfg)["seconds"], 10800)
+
+    def test_never_below_the_minimum(self):
+        cfg = {"loop_interval": {"far_ahead_seconds": 60, "min_seconds": 1800}}
+        self.assertEqual(pp.loop_interval({"claude": pool("ON", 5.0)}, cfg)["seconds"], 1800)
+
+
 class LogLaunchTests(unittest.TestCase):
     def test_log_launch_prints_pacer_line_and_writes_record(self):
         with tempfile.TemporaryDirectory() as td:
