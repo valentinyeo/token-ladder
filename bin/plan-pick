@@ -129,8 +129,10 @@ def load_config():
         return {}
     if not isinstance(cfg, dict):
         return {}
+    local_path = os.environ.get(
+        "TOKEN_LADDER_LOCAL_CONFIG", os.path.join(HERE, "..", "config.local.json"))
     try:
-        with open(os.path.join(HERE, "..", "config.local.json")) as fh:
+        with open(local_path) as fh:
             local = json.load(fh)
         if isinstance(local, dict):
             cfg.update(local)

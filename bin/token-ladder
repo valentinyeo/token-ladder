@@ -79,8 +79,10 @@ def read_cloud_envs():
 def load_config():
     with open(os.path.join(REPO, "config.json")) as f:
         cfg = json.load(f)
+    local_path = os.environ.get(
+        "TOKEN_LADDER_LOCAL_CONFIG", os.path.join(REPO, "config.local.json"))
     try:
-        with open(os.path.join(REPO, "config.local.json")) as f:
+        with open(local_path) as f:
             cfg.update(json.load(f))
     except FileNotFoundError:
         pass

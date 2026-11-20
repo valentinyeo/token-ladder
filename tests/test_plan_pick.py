@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from _load import REPO, load_bin, tl
+from _load import ISOLATED_LOCAL_CONFIG, REPO, load_bin, tl
 
 pp = load_bin("plan-pick")
 
@@ -546,7 +546,9 @@ class CommandTests(unittest.TestCase):
 
     def cli(self, *args):
         return subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), *args],
-                              capture_output=True, text=True, env={"HOME": self.home, "PATH": "/usr/bin:/bin"})
+                              capture_output=True, text=True,
+                              env={"HOME": self.home, "PATH": "/usr/bin:/bin",
+                                   "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
 
     def run_cli(self, pools, *args):
         path = Path(self.home) / "pools.json"
@@ -578,7 +580,8 @@ class CommandTests(unittest.TestCase):
         (repo / "config.json").write_text(json.dumps(cfg))
         pools = Path(self.home) / "pools.json"
         pools.write_text("{}")
-        env = {"HOME": self.home, "PATH": "/usr/bin:/bin"}
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
         out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
                              capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -648,7 +651,9 @@ class CommandTests(unittest.TestCase):
 
     def test_live_reader_runs_without_a_pools_file(self):
         out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--json"],
-                             capture_output=True, text=True, env={"HOME": tempfile.mkdtemp(), "PATH": "/usr/bin:/bin"})
+                             capture_output=True, text=True,
+                             env={"HOME": tempfile.mkdtemp(), "PATH": "/usr/bin:/bin",
+                                  "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(json.loads(out.stdout)["plan"], ("vercel", "deepseek", "opencode", "codex", "cursor", "openrouter", "none"))
 
