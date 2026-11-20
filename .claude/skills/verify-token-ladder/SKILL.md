@@ -1,49 +1,52 @@
 ---
 name: verify-token-ladder
-description: Verify Token Ladder (Python CLI that reads AI subscription usage). Use after any change to bin/token-ladder or config.json to prove it parses, passes tests and prints sane pool states, all read-only.
+description: Verify Token Ladder CLI and CI (plan-pick, pools, ladder-call). Use after changes to bin/, ci/, or config.json. Fresh clone only; never touch the live home state or spend credit on real lanes.
 ---
 
 # Verify Token Ladder
 
-Surface: CLI, Python 3 standard library only. Read `CLAUDE.md` first. The live copy under the primary home drives real runners and timers: never run this skill there, never run `collect`, `mode` or `grok-set` (they write state). Work in a fresh clone.
+Surface: Python CLI (`bin/token-ladder`, `bin/plan-pick`) and CI helpers (`ci/ladder-call`, `ci/lint-direct-model-calls`). Read `features/README.md` before driving. The live copy under the operator home drives real runners: never run `collect`, `mode`, or `grok-set` there.
 
 ## Launch
 
-No server. Nothing to start or tear down. From the clone root:
+No server. From the repo root:
 
 ```
-python3 -m py_compile bin/token-ladder bin/check-tests-changed tests/*.py && echo COMPILE_OK
+python3 -m py_compile bin/token-ladder bin/plan-pick bin/check-tests-changed tests/*.py ci/ladder-call ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/pick-verifier-model ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py && echo COMPILE_OK
 ```
 
 ## Doctor
 
-Run first. Wrong directory or Python means stop.
-
 ```
-python3 --version; test -x bin/token-ladder && test -f config.json && echo LAYOUT_OK
+python3 --version; test -x bin/token-ladder && test -x bin/plan-pick && test -f config.json && echo LAYOUT_OK
 ```
 
 ## Drive
 
-1. Tests (they set an empty `HOME` themselves, so they never read real state):
-   `python3 -m unittest discover -s tests -p 'test_*.py' 2>&1 | tail -5`
-   Pass means the last line is `ALL TESTS PASSED`.
-2. Diff gate (a `bin/` change needs a test change): `bin/check-tests-changed origin/main`.
-3. Read-only status against an empty home, so no real state is touched:
-   `HOME=$(mktemp -d) bin/token-ladder status`
-   Expect `TOKEN MAX OK`, `FLOOR OK`, `FEED OK`, then one line each for Claude, Codex and Grok. With no state they read `? used, reset unknown`; that is correct.
-4. Other read-only commands that are safe the same way: `pools --json`, `hook-prompt` and `route --repo X` (all with `HOME=$(mktemp -d)`).
+Use `HOME=$(mktemp -d)` and `TOKEN_LADDER_LOCAL_CONFIG` pointing at `.test-missing-config.local.json` (same as unit tests) so pools and state stay isolated.
 
-Comment-free tree is a required CI check: `node tools/strip-comments.mjs --check`.
+Pick one journey from `features/` and run its commands literally. For a PR-sized check also run:
+
+```
+python3 -m unittest discover -s tests -p 'test_*.py' 2>&1 | tail -5
+node tools/strip-comments.mjs --check
+python3 ci/lint-direct-model-calls .
+```
 
 ## Evidence
 
-Paste the real output of steps 1 and 3 (last lines only) plus the exit codes. A change to hook output (`hook-prompt`, `hook-bash`, `hook-agent`) also needs the before and after text from the same command. Compile alone is not proof. Do not use the live `~/.local/state/token-ladder/` as evidence; it is shared.
+Capture exit codes plus the stdout/stderr lines named in the feature file. Paste them in the ticket or PR; do not commit proof under the repo. Compile-only checks are not proof.
 
 ## Cleanup
 
-`rm -rf` only the `mktemp -d` dirs you made. `__pycache__` is gitignored. Evidence is your pasted output; keep it in the ticket or PR, not in the repo.
+`rm -rf` only the `mktemp` homes you created. Evidence stays in the ticket or PR comment.
 
-## Ship
+## Helpers
 
-Per `CLAUDE.md`: PR from a `ceo/<ticket>` branch, required checks `secret-scan`, `tests`, `no-comments` green, squash merge. Never add keys, private hosts or emails to any file.
+Stub HTTP for ladder-call journeys:
+
+```
+port=$(python3 ci/ladder-call-stub-server.py & echo $! > /tmp/tl-stub.pid; sleep 0.2; head -1 /proc/$(cat /tmp/tl-stub.pid)/fd/1 2>/dev/null || true)
+```
+
+Prefer the ladder-actions workflow recipe: start `ci/ladder-call-stub-server.py`, point `LADDER_CALL_URL_OPENCODE_GO` at `http://127.0.0.1:$PORT/zen/go/v1/chat/completions`, pass stub keys, echo a minimal request JSON into `python3 ci/ladder-call --purpose verify-skill`.

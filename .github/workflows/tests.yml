@@ -22,7 +22,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Compile
-        run: python3 -m py_compile bin/token-ladder bin/check-tests-changed bin/plan-pick tests/*.py ci/ladder-call ci/lint-direct-model-calls ci/ladder-call-stub-server.py
+        run: python3 -m py_compile bin/token-ladder bin/check-tests-changed bin/plan-pick tests/*.py ci/ladder-call ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/pick-verifier-model ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py
       - name: Run tests
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - name: Diff checks
