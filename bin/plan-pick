@@ -38,6 +38,10 @@ DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
 DEFAULT_STALE_HOURS = 12
 PLANS_NOTE = "Included means no extra cost: never quote API pricing or ask for a spend cap for these."
+VPS_STATE = "~/.local/share/vstack/skills/vps-state/vps-state"
+SERVER_CHECK_TIMEOUT = 15
+SERVER_HOLD_EXIT = 4
+SERVER_HOLD_LANE = "server-hold"
 
 
 def number(value):
@@ -233,6 +237,22 @@ def log_launch(path, lane, now, not_vendor):
     if lane is not None:
         stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"Pacer launch: {lane} {stamp}", file=sys.stderr)
+
+
+def server_busy(path=None):
+    binary = path or os.environ.get("VPS_STATE_BIN") or VPS_STATE
+    try:
+        out = subprocess.run([os.path.expanduser(binary), "--can-launch", "worker", "--no-write", "--brief"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                             timeout=SERVER_CHECK_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 2:
+        return None
+    lines = out.stdout.strip().splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else "HOLD"
+
+
 def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, now=None, say=None,
               launches_path=LAUNCHES, not_vendor=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
@@ -552,6 +572,12 @@ def main(argv):
     if args.not_vendor:
         lanes = [lane for lane in lanes if lane.get("vendor") != args.not_vendor.lower()]
     if args.run:
+        first = server_busy()
+        if first is not None:
+            print(f"plan-pick: server busy, no worker started: {first}. "
+                  f"Wait a few minutes and run plan-pick --run again.")
+            log_launch(LAUNCHES, SERVER_HOLD_LANE, None, args.not_vendor)
+            return SERVER_HOLD_EXIT
         return run_lanes(lanes, pools, cfg, warn, not_vendor=args.not_vendor)
     result = pick(lanes, pools, read_limits(), warn=warn)
     if args.json:

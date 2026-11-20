@@ -10,6 +10,10 @@ Put this checkout's `bin` directory on PATH using your normal shell configuratio
 
 The systemd user units in `systemd/` run `collect` every five minutes. Copy them to `~/.config/systemd/user/`, then `systemctl --user enable --now token-ladder.timer`. `pools` reads the `status.json` that this timer refreshes.
 
+## plan-pick
+
+`plan-pick --run` asks the server first: it calls `vps-state --can-launch worker --no-write --brief` before launching a lane. On HOLD it starts nothing, prints the vps-state line and exits 4, so run it again in a few minutes. A missing binary, a timeout or any other exit never blocks a launch. Plain picks, `--json`, `--claude-helper` and `--limited` skip the check.
+
 ## What the reader exposes
 
 ```sh
