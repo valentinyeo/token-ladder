@@ -10,7 +10,16 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
 SKIP_HTTP = {401, 402, 403, 429}
-TIMEOUT = 240
+
+
+def timeout_seconds():
+    raw = os.environ.get('LADDER_CALL_TIMEOUT', '').strip()
+    if not raw:
+        return 240
+    try:
+        return int(raw)
+    except ValueError:
+        return 240
 
 
 def lanes_path():
@@ -34,7 +43,23 @@ def message_content(result):
         if not choices:
             return ''
         msg = choices[0].get('message') or {}
-        return (msg.get('content') or '').strip()
+        content = msg.get('content')
+        if content is None:
+            return ''
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get('type') == 'text':
+                        parts.append(part.get('text') or '')
+                    elif 'text' in part:
+                        parts.append(part.get('text') or '')
+                elif isinstance(part, str):
+                    parts.append(part)
+            return ''.join(parts).strip()
+        return ''
     except (AttributeError, IndexError, KeyError, TypeError):
         return ''
 
@@ -51,8 +76,14 @@ def call_lane(lane, key, body):
     payload = dict(body)
     payload['model'] = lane['model']
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
-    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
-        return json.load(response)
+    with urllib.request.urlopen(req, timeout=timeout_seconds()) as response:
+        raw = response.read()
+        if not raw.strip():
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
 
 
 def skip_reason(lane, exc=None, status=None, empty=False):
@@ -89,16 +120,25 @@ def main():
         try:
             result = call_lane(lane, key, body)
         except urllib.error.HTTPError as exc:
-            if exc.code in SKIP_HTTP or exc.code >= 500:
+            if exc.code in SKIP_HTTP:
                 log_skip(lane['name'], skip_reason(lane, exc=exc))
                 continue
-            log_skip(lane['name'], skip_reason(lane, exc=exc))
-            continue
+            if exc.code >= 500:
+                log_skip(lane['name'], skip_reason(lane, exc=exc))
+                continue
+            print(
+                f'ladder-call: lane {lane["name"]} failed: HTTP {exc.code}',
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             if isinstance(getattr(exc, 'reason', None), TimeoutError):
                 log_skip(lane['name'], 'timeout')
             else:
                 log_skip(lane['name'], skip_reason(lane, exc=exc))
+            continue
+        if result is None:
+            log_skip(lane['name'], 'invalid response')
             continue
         if not message_content(result):
             log_skip(lane['name'], 'empty answer')

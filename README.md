@@ -268,8 +268,9 @@ JSON on stdout, and exits `3` only when every lane fails.
 ```
 
 `ci/lint-direct-model-calls` scans `.github/` and `tools/` for direct provider
-URLs or `DEEPSEEK_API_KEY` usage. It fails with
-`use valentinyeo/token-ladder/.github/actions/ladder-call` unless a line contains
-`ladder-call-allow: <reason> until <YYYY-MM-DD>` before that date.
+URLs (not key env wiring). It fails with
+`use valentinyeo/token-ladder/.github/actions/ladder-call` unless
+`.github/ladder-call-allow` lists an unexpired
+`<path>:<reason>:<until YYYY-MM-DD>` entry for that file; expired allow lines fail.
 The reusable action is
 `valentinyeo/token-ladder/.github/actions/lint-direct-model-calls@main`.

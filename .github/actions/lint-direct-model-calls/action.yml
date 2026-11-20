@@ -12,4 +12,4 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        "${{ github.action_path }}/../../../ci/lint-direct-model-calls" "${{ inputs.repo }}"
+        "${{ github.action_path }}/run" "${{ inputs.repo }}"

@@ -29,7 +29,7 @@ runs:
         set -euo pipefail
         answer="${RUNNER_TEMP}/ladder-call-answer.json"
         log="${RUNNER_TEMP}/ladder-call.log"
-        "${{ github.action_path }}/../../../ci/ladder-call" --purpose "${{ inputs.purpose }}" \
+        "${{ github.action_path }}/run" --purpose "${{ inputs.purpose }}" \
           < "${{ inputs.request-file }}" > "$answer" 2> "$log"
         lane=$(sed -n 's/^ladder-call: lane \(\S*\) answered.*/\1/p' "$log" | tail -1)
         echo "answer-file=$answer" >> "$GITHUB_OUTPUT"

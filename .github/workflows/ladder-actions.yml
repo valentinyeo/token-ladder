@@ -1,0 +1,49 @@
+name: Ladder actions
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  composite-actions:
+    name: ladder composite actions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Stub provider server
+        id: stub
+        run: |
+          set -euo pipefail
+          python3 ci/ladder-call-stub-server.py > /tmp/ladder-stub-port &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          for _ in $(seq 1 50); do
+            if [ -s /tmp/ladder-stub-port ]; then
+              break
+            fi
+            sleep 0.1
+          done
+          port="$(cat /tmp/ladder-stub-port)"
+          base="http://127.0.0.1:${port}"
+          echo "LADDER_CALL_URL_VERCEL_AI_GATEWAY=${base}/v1/chat/completions" >> "$GITHUB_ENV"
+          echo "LADDER_CALL_URL_OPENCODE_GO=${base}/zen/go/v1/chat/completions" >> "$GITHUB_ENV"
+      - name: Prepare request
+        run: echo '{"messages":[{"role":"user","content":"hi"}]}' > /tmp/ladder-request.json
+      - name: ladder-call action
+        uses: ./.github/actions/ladder-call
+        env:
+          AI_GATEWAY_API_KEY: stub-gw
+          OPENCODE_API_KEY: stub-oc
+        with:
+          request-file: /tmp/ladder-request.json
+          purpose: ci-actions
+      - name: lint-direct-model-calls action
+        uses: ./.github/actions/lint-direct-model-calls
+        with:
+          repo: .
+      - name: Stop stub server
+        if: always()
+        run: kill "${{ steps.stub.outputs.pid }}" 2>/dev/null || true
