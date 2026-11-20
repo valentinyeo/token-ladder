@@ -22,7 +22,7 @@ Researched 2026-11-20. Facts marked (checked) were run or read on this server. T
 | | Launch | Results | Notes |
 |---|---|---|---|
 | Codex cloud | `codex cloud exec --env <ENV_ID> [--branch B] "<prompt>"`, then `status` | `codex cloud diff` / `apply`, or ask the task to open a PR | Shares the ChatGPT plan allowance. The environment is set up once per repo in the web UI. |
-| Cursor cloud | REST `POST /v1/agents` with `repos[0].url`, `startingRef`, `model.id`, `autoCreatePR` | Poll the run. The PR link is in `git.branches[].prUrl` | Included in our Cursor plan for Composer and Grok models (Valentin, 2026-11-20). Use only those models. Needs a Cursor API key, which costs nothing. About 8 run at once (forum post, unverified). |
+| Cursor cloud | **The Cursor CLI, our normal login, no API key.** Start `cursor-agent --trust --model composer-2.5` interactively in the repo. On an empty prompt, type `&` alone (the bar shows "Move to cloud agent"), then type the brief and press Enter. The CLI checks git, then prints `Open Cloud Agent in: https://cursor.com/agents/bc-...` (tested 2026-11-20). | The cloud agent pushes a branch or PR to GitHub. Watch `gh pr list` / `git ls-remote`. `--resume bc-...` does not work from a script. | Included in our Cursor plan for Composer and Grok (Valentin, 2026-11-20). Use only those models. `& ...` inside `-p` runs locally, and pasting the line in one go also runs locally: `&` must be typed alone first. About 8 at once (forum post, unverified). |
 | Claude cloud | `claude --cloud "<task>"` (clones the pushed branch) | It pushes a branch, so watch `gh pr list` | The repo must have the Claude GitHub App. It counts toward plan limits. |
 
 Docs: https://learn.chatgpt.com/docs/cloud , https://cursor.com/docs/cloud-agent/api/endpoints , https://code.claude.com/docs/en/claude-code-on-the-web
@@ -47,11 +47,10 @@ Docs: https://learn.chatgpt.com/docs/cloud , https://cursor.com/docs/cloud-agent
 
 - The repo must be on GitHub, with the vendor's GitHub app or connector installed.
 - Codex needs one cloud environment per repo, created in the web UI.
-- Cursor needs an API key from the Cursor dashboard. The `cursor` item in the Hypertask safe holds a CLI login token, which the API refuses (tested 2026-11-20).
 - No usage reader exists yet for Codex cloud or Cursor cloud allowances.
 
 ## First steps
 
 1. Build `codex-cloud` first. Everything it needs is already working (checked). Test it on one small token-ladder ticket.
 2. Review and apply or discard the Nov 8 Codex task above.
-3. Build `cursor-cloud` once a Cursor API key is in the safe. Run only Composer and Grok models there: they are included in the plan.
+3. Build `cursor-cloud` by driving the Cursor CLI's `&` handoff: a tracked tmux job types `&`, then the brief, captures the agent URL, then polls GitHub for the PR. Composer and Grok only.
