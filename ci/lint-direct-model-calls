@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+import argparse
+import re
+import sys
+from datetime import date
+from pathlib import Path
+
+HINT = 'use valentinyeo/token-ladder/.github/actions/ladder-call'
+RULES = (
+    ('api.deepseek.com', re.compile(r'api\.deepseek\.com')),
+    ('ai-gateway.vercel.sh', re.compile(r'ai-gateway\.vercel\.sh')),
+    ('opencode.ai/zen', re.compile(r'opencode\.ai/zen')),
+    ('openrouter.ai/api', re.compile(r'openrouter\.ai/api')),
+    ('api.openai.com', re.compile(r'api\.openai\.com')),
+    ('api.anthropic.com', re.compile(r'api\.anthropic\.com')),
+    ('DEEPSEEK_API_KEY', re.compile(r'DEEPSEEK_API_KEY')),
+)
+ALLOW = re.compile(
+    r'ladder-call-allow:\s*(.+?)\s+until\s+(\d{4}-\d{2}-\d{2})\s*$',
+    re.IGNORECASE,
+)
+
+
+def scan_roots(repo):
+    roots = []
+    for name in ('.github', 'tools'):
+        path = repo / name
+        if path.is_dir():
+            roots.append(path)
+    return roots
+
+
+def allowed_until(line, today):
+    match = ALLOW.search(line)
+    if not match:
+        return False
+    try:
+        return date.fromisoformat(match.group(2)) >= today
+    except ValueError:
+        return False
+
+
+def scan_file(path, today):
+    hits = []
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return hits
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if allowed_until(line, today):
+            continue
+        for label, pattern in RULES:
+            if pattern.search(line):
+                hits.append((path, lineno, label, line.rstrip()))
+    return hits
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('repo', nargs='?', default='.')
+    args = parser.parse_args()
+    repo = Path(args.repo).resolve()
+    today = date.today()
+    failures = []
+    for root in scan_roots(repo):
+        for path in sorted(root.rglob('*')):
+            if not path.is_file():
+                continue
+            failures.extend(scan_file(path, today))
+    for path, lineno, label, line in failures:
+        print(f'{path}:{lineno}: direct model call ({label}): {HINT}')
+        print(f'  {line}')
+    if failures:
+        raise SystemExit(1)
+
+
+if __name__ == '__main__':
+    main()

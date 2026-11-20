@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent
+DEFAULT_LANES = REPO / 'lanes.json'
+SKIP_HTTP = {401, 402, 403, 429}
+TIMEOUT = 240
+
+
+def lanes_path():
+    override = os.environ.get('LADDER_CALL_LANES')
+    return Path(override) if override else DEFAULT_LANES
+
+
+def lane_url(lane):
+    key = 'LADDER_CALL_URL_' + lane['name'].upper().replace('-', '_')
+    return os.environ.get(key, lane['url'])
+
+
+def load_lanes():
+    with open(lanes_path(), encoding='utf-8') as fh:
+        return json.load(fh)
+
+
+def message_content(result):
+    try:
+        choices = result.get('choices') or []
+        if not choices:
+            return ''
+        msg = choices[0].get('message') or {}
+        return (msg.get('content') or '').strip()
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ''
+
+
+def call_lane(lane, key, body):
+    url = lane_url(lane)
+    headers = {
+        'Authorization': 'Bearer ' + key,
+        'Content-Type': 'application/json',
+        'User-Agent': 'token-ladder-ladder-call/1',
+    }
+    if lane['name'] == 'opencode-go' and os.environ.get('GITHUB_RUN_ID'):
+        headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+    payload = dict(body)
+    payload['model'] = lane['model']
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+        return json.load(response)
+
+
+def skip_reason(lane, exc=None, status=None, empty=False):
+    if empty:
+        return 'empty answer'
+    if exc is not None:
+        if isinstance(exc, urllib.error.HTTPError):
+            return str(exc.code)
+        if isinstance(exc, TimeoutError):
+            return 'timeout'
+        return type(exc).__name__
+    return str(status)
+
+
+def log_skip(name, reason):
+    print(f'ladder-call: lane {name} skipped: {reason}', file=sys.stderr)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--purpose', required=True)
+    args = parser.parse_args()
+    try:
+        body = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        print('ladder-call: invalid JSON on stdin', file=sys.stderr)
+        raise SystemExit(2)
+    lanes = load_lanes()
+    for lane in lanes:
+        key = os.environ.get(lane['key_env'], '').strip()
+        if not key:
+            log_skip(lane['name'], 'no key')
+            continue
+        try:
+            result = call_lane(lane, key, body)
+        except urllib.error.HTTPError as exc:
+            if exc.code in SKIP_HTTP or exc.code >= 500:
+                log_skip(lane['name'], skip_reason(lane, exc=exc))
+                continue
+            log_skip(lane['name'], skip_reason(lane, exc=exc))
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if isinstance(getattr(exc, 'reason', None), TimeoutError):
+                log_skip(lane['name'], 'timeout')
+            else:
+                log_skip(lane['name'], skip_reason(lane, exc=exc))
+            continue
+        if not message_content(result):
+            log_skip(lane['name'], 'empty answer')
+            continue
+        print(f'ladder-call: lane {lane["name"]} answered ({args.purpose})', file=sys.stderr)
+        json.dump(result, sys.stdout)
+        print()
+        return
+    print('ladder-call: no lane answered', file=sys.stderr)
+    raise SystemExit(3)
+
+
+if __name__ == '__main__':
+    main()
