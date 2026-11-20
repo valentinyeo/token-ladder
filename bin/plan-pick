@@ -37,6 +37,7 @@ DEFAULT_CREDIT_FLOOR_USD = 2.0
 DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
 DEFAULT_STALE_HOURS = 12
+PLANS_NOTE = "Included means no extra cost: never quote API pricing or ask for a spend cap for these."
 
 
 def number(value):
@@ -144,6 +145,20 @@ def lanes_from(cfg):
         return []
     return [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
             and isinstance(lane.get("command"), str)]
+
+
+def plans_from(cfg):
+    plans = cfg.get("plans")
+    if not isinstance(plans, list):
+        return []
+    return [plan for plan in plans if isinstance(plan, dict) and isinstance(plan.get("name"), str)]
+
+
+def plan_line(plan):
+    models = ", ".join(str(model) for model in plan.get("included_models") or [])
+    places = " and ".join(str(place) for place in plan.get("runs_on") or [])
+    return (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}. "
+            f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.")
 
 
 def read_limits(path=LIMITS):
@@ -469,6 +484,8 @@ def with_opencode(pools, cfg, now=None):
 def main(argv):
     parser = argparse.ArgumentParser(prog="plan-pick", description="Pick the lane for the next background worker.")
     parser.add_argument("--json", action="store_true", help="print plan, command and reason as JSON")
+    parser.add_argument("--plans", action="store_true",
+                        help="print what each subscription includes, where it runs and whether it costs extra")
     parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
     parser.add_argument("--claude-helper", action="store_true",
                         help="answer whether an in-chat Claude helper is allowed (exit 0 allowed, 3 refused)")
@@ -483,6 +500,15 @@ def main(argv):
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     args = parser.parse_args(argv)
     cfg = load_config()
+    if args.plans:
+        plans = plans_from(cfg)
+        if args.json:
+            print(json.dumps(plans))
+        else:
+            for plan in plans:
+                print(plan_line(plan))
+            print(PLANS_NOTE)
+        return 0
     warn = number(cfg.get("pace_warn_ratio")) or DEFAULT_PACE_WARN
     lanes = lanes_from(cfg)
     if args.read_credits is not None:
