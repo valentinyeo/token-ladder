@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-"""Extract assistant text from a ladder-call answer file."""
 import json
 import sys
 from pathlib import Path

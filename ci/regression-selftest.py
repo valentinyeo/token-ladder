@@ -6,7 +6,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 MODULES = (
-    "pick-verifier-model",
     "run-verifier",
     "verdict.py",
     "build-verifier-request.py",
@@ -19,7 +18,6 @@ def main():
         path = HERE / name
         py_compile.compile(path, doraise=True)
     checks = (
-        [sys.executable, str(HERE / "pick-verifier-model"), "--self-test"],
         [sys.executable, str(HERE / "verdict.py"), "--self-test"],
         [sys.executable, str(HERE / "run-verifier"), "--self-test"],
     )

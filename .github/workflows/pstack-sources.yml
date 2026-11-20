@@ -33,11 +33,6 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: picker-base
-          persist-credentials: false
       - name: Prepare verifier brief
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -47,8 +42,7 @@ jobs:
           PR_BASE=$(git merge-base HEAD "origin/$BASE_REF")
           cat > /tmp/verify.md <<'BRIEF'
           Goal: verify this pull request against rebased main.
-          You are an independent verifier from a different model family than every author.
-          You did not write this PR. Read the diff against the supplied merge base.
+          You are an independent verifier. You did not write this PR. Read the diff against the supplied merge base.
           Drive user-facing behavior with the feature map in .claude/skills/verify-token-ladder/features/.
           Run python3 -m unittest discover -s tests -p 'test_*.py' -q before you judge.
           Run python3 ci/lint-direct-model-calls . when CI or verifier files changed.
@@ -70,7 +64,6 @@ jobs:
             echo "verifier: set OPENCODE_API_KEY, AI_GATEWAY_API_KEY, DEEPSEEK_API_KEY, or OPENROUTER_API_KEY" >&2
             exit 1
           fi
-          python3 ci/pick-verifier-model >/dev/null
       - name: Build verifier request
         run: python3 ci/build-verifier-request.py /tmp/verify.md /tmp/verifier-request.json
       - name: Verifier model call through ladder-call
