@@ -73,12 +73,14 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 
 ## Data sources (all proven readable on the VPS)
 
+`plan-pick --plans` is the source of truth for what each subscription includes, where it runs and whether it costs extra (from `config.json` `plans`). Read it before quoting a price or asking for a spend cap.
+
 | Source | How | Windows |
 |---|---|---|
 | Claude | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from `~/.claude/.credentials.json` | `five_hour`, `seven_day` (utilization %, `resets_at`) |
 | Codex | `rate_limits` in the newest `~/.codex/sessions/**/*.jsonl` token_count event (or `codex app-server` rate limit call) | `primary` weekly (`used_percent`, `resets_at`), credits balance |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
-| Cursor | dashboard usage (to confirm) | display only, reserved for the grok bot |
+| Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
 
 ## Core idea: pace, not percent
 
@@ -187,7 +189,7 @@ Every prompt also shows the shared 1Password account budget (`1Password: N/1000 
 ## Built (v0.1.0, 2026-10-10)
 
 - `bin/token-ladder`: `collect` (timer), `status`, `pools --json`, `grok-set`, `route`, `mode claude|codex|auto`, `hook-prompt`, `hook-bash`. Python 3, no dependencies.
-- `config.json`: floor, thresholds, Codex bonus reset expiry dates (add new ones here).
+- `config.json`: floor, thresholds, Codex bonus reset expiry dates, and `plans` (what each subscription includes, where it runs and its extra cost; add new plans here).
 - `systemd/`: user timer, every 5 minutes (`systemctl --user status token-ladder.timer`).
 - Hooks in `~/.claude/settings.json`: prompt = pool states; Bash = no model ID containing `fast`, no paid fallback, no `cc-deepseek-apikey`/`ccr` (`TOKEN_LADDER_DEEPSEEK_OK=1` only after Valentin’s yes). Agent uses its own Claude pool, never legacy CODEX routing.
 - State: `~/.local/state/token-ladder/` (`status.json`, `history.jsonl`, `resources.jsonl` (7 days of RAM, load, process weight), `dashboard.html`). Dashboard: https://admin.yeoux.net/p/3320214b/dashboard.html

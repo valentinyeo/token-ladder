@@ -369,6 +369,38 @@ class ConfigTests(unittest.TestCase):
                 self.assertIsNone(tl.bash_refusal(lane["command"], {}), lane["command"])
 
 
+class PlansTests(unittest.TestCase):
+    def setUp(self):
+        self.plans = pp.plans_from(pp.load_config())
+
+    def test_every_plan_lists_models_places_and_cost(self):
+        for plan in self.plans:
+            with self.subTest(plan=plan["name"]):
+                for key in ("included_models", "runs_on", "extra_cost", "source"):
+                    self.assertTrue(plan[key], key)
+                self.assertTrue(set(plan["runs_on"]) <= {"local", "cloud"}, plan["runs_on"])
+
+    def test_cursor_is_composer_and_grok_local_and_cloud_with_no_extra_cost(self):
+        cursor = next(plan for plan in self.plans if plan["vendor"] == "cursor")
+        models = " ".join(cursor["included_models"]).lower()
+        self.assertIn("composer", models)
+        self.assertIn("grok", models)
+        self.assertIn("cloud", cursor["runs_on"])
+        self.assertEqual(cursor["extra_cost"], "none")
+        self.assertEqual(cursor["source"], "Valentin, 2026-11-20")
+
+    def test_every_lane_vendor_has_a_plan(self):
+        vendors = {plan["vendor"] for plan in self.plans}
+        for lane in pp.lanes_from(pp.load_config()):
+            with self.subTest(lane=lane["lane"]):
+                self.assertIn(lane["vendor"], vendors)
+
+    def test_missing_or_garbage_plans_give_an_empty_list(self):
+        for cfg in ({}, {"plans": None}, {"plans": [{"vendor": "cursor"}]}, {"plans": ["Cursor"]}):
+            with self.subTest(cfg=cfg):
+                self.assertEqual(pp.plans_from(cfg), [])
+
+
 class WorkerEnvTests(unittest.TestCase):
     def setUp(self):
         self.shims = str(Path(REPO).resolve() / "bin" / "worker-shims")
@@ -462,6 +494,18 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(got["plan"], "cursor")
         line = self.run_cli({"codex": pool()}, "--not-vendor", "deepseek").stdout
         self.assertTrue(line.startswith("Worker plan: codex. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
+
+    def test_plans_prints_each_plan_and_the_no_extra_cost_rule(self):
+        out = self.cli("--plans")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Cursor (cursor): Composer 2.5, Grok 4.7.", out.stdout)
+        self.assertIn("Included means no extra cost: never quote API pricing or ask for a spend cap for these.",
+                      out.stdout)
+
+    def test_plans_json_is_the_config_list(self):
+        out = self.cli("--plans", "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout), pp.plans_from(pp.load_config()))
 
     def test_limited_unknown_lane_fails(self):
         out = self.cli("--limited", "baseten")
