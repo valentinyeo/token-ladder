@@ -5,6 +5,8 @@ import tempfile
 
 os.environ["HOME"] = tempfile.mkdtemp(prefix="token-ladder-test-home-")
 REPO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+ISOLATED_LOCAL_CONFIG = os.path.join(REPO, ".test-missing-config.local.json")
+os.environ["TOKEN_LADDER_LOCAL_CONFIG"] = ISOLATED_LOCAL_CONFIG
 
 
 def load_bin(name):
