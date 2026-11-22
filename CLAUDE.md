@@ -4,7 +4,7 @@ Token Ladder reads how full each AI subscription is (Claude, Codex, Grok, OpenRo
 
 ## Commands
 
-- Build: `python3 -m py_compile bin/token-ladder bin/check-tests-changed bin/plan-pick tests/*.py ci/ladder-call ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py` (no build output; it only checks every script parses).
+- Build: `python3 -m py_compile bin/token-ladder bin/check-tests-changed bin/plan-pick tests/*.py ci/ladder-call ci/model_families.py ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py` (no build output; it only checks every script parses).
 - Test: `python3 -m unittest discover -s tests -p 'test_*.py'` (CI runs this on every push and pull request).
 - Ship: Open a PR from a `ceo/<ticket>` branch; the required checks `secret-scan`, `tests` and `no-comments` must be green; `gh pr merge --squash --delete-branch`; then `git -C ~/projects/token-ladder pull --ff-only` on the primary server, the live copy (the Claude hooks and the systemd units point at it). The mirror server gets it on the next `collect` run (timer, every 5 minutes, rsync in `mirror()`). Check it live with `bin/token-ladder status`.
 - Diff checks: `bin/check-tests-changed origin/main` (CI runs this).
