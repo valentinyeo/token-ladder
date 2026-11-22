@@ -6,7 +6,7 @@ CI chat completions go through `ci/ladder-call`; workflows must not call model A
 
 - `ladder-stub` answers through the local stub server on the opencode-go path.
 - `answer-text` reads `message.content`, and falls back to `message.reasoning` when a reasoning model returns empty content.
-- `require-verdict` skips a lane whose answer holds no PASS, PASS+NOTES or FAIL verdict, then tries the next lane.
+- `require-verdict` asks a lane once more for a verdict from the tail of its own answer when the answer holds none, then skips to the next lane.
 - `lint-clean` reports no violations on this repository tree.
 
 ## How to get to it (user POV)
@@ -29,5 +29,6 @@ Cleanup: `kill "$stub_pid" 2>/dev/null || true`.
 ## Gotchas
 
 - Without stub URLs, ladder-call hits real providers and may spend quota.
-- A reasoning model can return empty `content` and put its plan in `reasoning` plus `tool_calls`; ladder-call answers from reasoning, and `--require-verdict` moves on when that plan holds no verdict.
+- A reasoning model can return empty `content` and put its plan in `reasoning` plus `tool_calls`; ladder-call answers from reasoning.
+- A reasoning model given a large diff can spend every `max_tokens` on reasoning and never write a verdict; `--require-verdict` then makes one small decide call on the same lane with the tail of that answer.
 - lint flags direct `api.deepseek.com` and similar; fix violations with `ladder-call`, not allow-list entries, unless emergency-documented.

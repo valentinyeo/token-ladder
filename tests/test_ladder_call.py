@@ -378,6 +378,54 @@ class LadderCallTests(unittest.TestCase):
         self.assertIn('lane agent-lane no-verdict answer tail:', result.stderr)
         self.assertIn('verdict-lane answered', result.stderr)
 
+    def test_require_verdict_decides_from_a_long_analysis(self):
+        seen = []
+
+        class DecideHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or 0)
+                seen.append(json.loads(self.rfile.read(length) or b'{}'))
+                if len(seen) == 1:
+                    text = ("I'll start by inspecting the repo state.\n\n**Shell**\n```\npwd\n```")
+                else:
+                    text = 'PASS+NOTES\nReview was cut short; tests and lint passed.'
+                payload = json.dumps({'choices': [{'message': {'content': text}}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), DecideHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        lanes = [{
+            'name': 'agent-lane',
+            'key_env': 'AI_GATEWAY_API_KEY',
+            'url': f'http://127.0.0.1:{server.server_address[1]}/agent',
+            'model': 'm',
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+            args=('--require-verdict',),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane agent-lane answered', result.stderr)
+        self.assertEqual(len(seen), 2)
+        self.assertIn('possibly cut short', seen[1]['messages'][1]['content'])
+        self.assertIn('Decide now', seen[1]['messages'][1]['content'])
+        self.assertLessEqual(seen[1]['max_tokens'], 2048)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload['choices'][0]['message']['content'].startswith('PASS+NOTES'))
+
     def test_require_verdict_env_var(self):
         server, port = run_server({
             '/v1/chat/completions': (200, {'choices': [{'message': {'content': 'no answer here'}}]}, None),
