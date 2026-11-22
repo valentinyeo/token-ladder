@@ -234,6 +234,20 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.ran, ["run opencode"])
         self.assertEqual(pp.read_limits(self.limits), {})
 
+    def test_400_fast_fail_runs_the_next_lane(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        code = self.go({"run opencode": (1, msg), "run vercel": (0, "done")})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ran, ["run opencode", "run vercel"])
+        self.assertEqual(pp.read_limits(self.limits), {})
+        self.assertTrue(any("skipped lane opencode: model request was rejected" in line for line in self.said), self.said)
+
+    def test_failure_after_work_does_not_fall_through(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        self.assertEqual(self.go({"run opencode": (1, msg, 5.0, True)}), 1)
+        self.assertEqual(self.ran, ["run opencode"])
+        self.assertEqual(pp.read_limits(self.limits), {})
+
     def test_success_that_mentions_a_rate_limit_is_kept(self):
         self.assertEqual(self.go({"run opencode": (0, "added a rate limit, 429 on overflow")}), 0)
         self.assertEqual(pp.read_limits(self.limits), {})
@@ -259,6 +273,19 @@ class RunTests(unittest.TestCase):
         for text, kind in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(pp.limit_kind(1, text), kind)
+
+    def test_fast_fail_reads_provider_errors(self):
+        cases = {('{"statusCode":400,"message":"The model request was rejected"}', 5.0, False):
+                     "model request was rejected",
+                 ('HTTP 503 upstream unavailable', 2.0, False): "provider HTTP error",
+                 ("unauthorized: invalid api key", 1.0, False): "provider auth error",
+                 ('stopReason":"error"', 10.0, False): "agent error before work",
+                 ("SyntaxError in your code", 5.0, False): None,
+                 ('{"statusCode":400}', 5.0, True): None,
+                 ('{"statusCode":400}', 35.0, False): None}
+        for (text, elapsed, work), kind in cases.items():
+            with self.subTest(text=text[:40]):
+                self.assertEqual(pp.fast_fail_kind(1, text, elapsed, work), kind)
 
 
 class CreditTests(unittest.TestCase):
@@ -662,6 +689,24 @@ class CommandTests(unittest.TestCase):
         got = json.loads(self.run_cli({}, "--json").stdout)
         self.assertEqual(got["plan"], "openrouter")
         self.assertIn("vercel (limited until", got["reason"])
+
+    def test_run_skips_a_400_lane_end_to_end(self):
+        cfg = {"lanes": [{"lane": "a", "pool": None, "command": "echo '400 model request was rejected'; exit 1"},
+                         {"lane": "b", "pool": None, "command": "echo worker-done"}]}
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (repo / "config.json").write_text(json.dumps(cfg))
+        pools = Path(self.home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("worker-done", out.stdout)
+        self.assertIn("skipped lane a: model request was rejected", out.stderr)
 
     def test_run_skips_a_429_lane_end_to_end(self):
         cfg = {"lanes": [{"lane": "a", "pool": None, "command": "echo '429: Too Many Requests'; exit 1"},

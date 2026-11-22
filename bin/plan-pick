@@ -22,6 +22,11 @@ CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|cr
 RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _]exhausted|"
                         r"limit (reached|exceeded)|hit your limit", re.I)
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
+PROVIDER_HTTP = re.compile(r"\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
+MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
+PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
+PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
+FAST_FAIL_BEFORE_WORK_S = 30
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
 DEFAULT_OPENCODE_CREDIT_FLOOR = 6
 DEFAULT_OPENCODE_CREDIT_FRESH_HOURS = 2
@@ -301,6 +306,26 @@ def limit_kind(code, tail):
     return None
 
 
+def fast_fail_kind(code, tail, elapsed, work):
+    if code == 0 or work or elapsed >= FAST_FAIL_BEFORE_WORK_S:
+        return None
+    tail = tail[-ERROR_CHARS:]
+    if MODEL_REJECTED.search(tail):
+        return "model request was rejected"
+    if PROVIDER_AUTH.search(tail):
+        return "provider auth error"
+    if PROVIDER_HTTP.search(tail):
+        return "provider HTTP error"
+    if PI_AGENT_FAST.search(tail):
+        return "agent error before work"
+    return None
+
+
+def repo_work_mark(cwd):
+    proc = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=5)
+    return proc.stdout if proc.returncode == 0 else None
+
+
 def worker_env(environ):
     env = {name: value for name, value in environ.items()
            if name != "HT_TOKEN" and not name.startswith("HYPERTASK_")
@@ -323,6 +348,23 @@ def run_command(command):
     return proc.wait(), tail
 
 
+def run_worker(command):
+    cwd = os.getcwd()
+    before = repo_work_mark(cwd)
+    start = time.time()
+    code, tail = run_command(command)
+    elapsed = time.time() - start
+    after = repo_work_mark(cwd)
+    work = before is not None and before != after
+    return code, tail, elapsed, work
+
+
+def unpack_run(result):
+    if len(result) == 2:
+        return result[0], result[1], 0.0, False
+    return result
+
+
 def log_launch(path, lane, now, not_vendor):
     at = now if now is not None else time.time()
     line = {"at": at, "lane": lane,
@@ -337,7 +379,7 @@ def log_launch(path, lane, now, not_vendor):
     if lane is not None:
         stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"Pacer launch: {lane} {stamp}", file=sys.stderr)
-def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, now=None, say=None,
+def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, now=None, say=None,
               launches_path=LAUNCHES, not_vendor=None, burn=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
     hours = {"rate": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
@@ -356,10 +398,15 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, n
             return 4
         say(f"lane {result['plan']}: {result['reason']}")
         log_launch(launches_path, result["plan"], now, not_vendor)
-        code, tail = runner(result["command"])
+        code, tail, elapsed, work = unpack_run(runner(result["command"]))
         kind = limit_kind(code, tail)
         if kind is None:
-            return code
+            skip = fast_fail_kind(code, tail, elapsed, work)
+            if skip is None:
+                return code
+            tried.add(result["plan"])
+            say(f"skipped lane {result['plan']}: {skip} (exit {code})")
+            continue
         tried.add(result["plan"])
         until = mark_limited(result["plan"], hours[kind], now, limits_path)
         say(f"lane {result['plan']} {why[kind]} (exit {code}); skipped until "
@@ -641,7 +688,7 @@ def main(argv):
     parser.add_argument("--not-vendor", metavar="VENDOR",
                         help="skip lanes from VENDOR, so a review comes from a different vendor than the author")
     parser.add_argument("--run", action="store_true",
-                        help="run the picked lane's command; on a failed exit with a 429, 402, quota error or no output, mark it limited and run the next lane")
+                        help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
                         help="read the credit balance of these lanes (all credit lanes when none) and store it")
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
