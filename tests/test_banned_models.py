@@ -59,7 +59,6 @@ LANE_ORDER = [
     "opencode-go",
     "vercel-ai-gateway",
     "openrouter",
-    "deepseek",
     "google",
     "cursor",
 ]
