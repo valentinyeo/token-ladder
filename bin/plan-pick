@@ -38,8 +38,6 @@ DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
 DEFAULT_STALE_HOURS = 12
 DEFAULT_OPENCODE_MONTHLY_SLACK_PCT = 25
-OPENCODE_USAGE_API = "https://opencode.ai/inference/go/v1/usage"
-OPENCODE_USAGE_WINDOWS = (("rolling", "5-hour", 5), ("weekly", "weekly", 168), ("monthly", "monthly", 720))
 DEFAULT_LOOP_BASE_SECONDS = 7200
 DEFAULT_LOOP_AHEAD_SECONDS = 10800
 DEFAULT_LOOP_FAR_AHEAD_SECONDS = 14400
@@ -493,20 +491,18 @@ def monthly_slack_pct(cfg):
 
 
 def parse_opencode_windows(raw):
-    used, statuses = {}, {}
+    used = {}
     if not isinstance(raw, dict):
-        return used, statuses
+        return used
     for name, val in raw.items():
         if isinstance(val, dict):
             used[name] = number(val.get("used") if val.get("used") is not None else val.get("percent"))
-            if isinstance(val.get("status"), str):
-                statuses[name] = val["status"]
         else:
             used[name] = number(val)
-    return used, statuses
+    return used
 
 
-def monthly_allowance_exhausted(used, statuses, cfg):
+def monthly_allowance_exhausted(used, cfg):
     monthly = number(used.get("monthly")) or 0
     if monthly < 100:
         return False
@@ -515,24 +511,7 @@ def monthly_allowance_exhausted(used, statuses, cfg):
     weekly = number(used.get("weekly"))
     if short is not None and short < slack and weekly is not None and weekly < slack:
         return False
-    if statuses.get("monthly") == "rate-limited" and short is not None and short < slack and weekly is not None and weekly < slack:
-        return False
     return True
-
-
-def opencode_usage_from_api(body):
-    usage = body.get("usage") if isinstance(body, dict) else None
-    if not isinstance(usage, dict):
-        raise ValueError("missing usage object")
-    used, statuses = {}, {}
-    for field, name, _length in OPENCODE_USAGE_WINDOWS:
-        w = usage.get(field)
-        if not isinstance(w, dict):
-            raise ValueError(f"missing {field} window")
-        used[name] = float(w["percent"])
-        if isinstance(w.get("status"), str):
-            statuses[name] = w["status"]
-    return used, statuses
 
 
 def last_windows(pacing_dir):
@@ -540,11 +519,7 @@ def last_windows(pacing_dir):
     if not rows:
         return None
     row = max(rows, key=lambda r: r["at"])
-    used, statuses = parse_opencode_windows(row["windows"])
-    extra = row.get("window_status") or row.get("statuses")
-    if isinstance(extra, dict):
-        statuses.update({k: v for k, v in extra.items() if isinstance(v, str)})
-    return {"at": row["at"], "used": used, "statuses": statuses, "raw": row["windows"]}
+    return {"at": row["at"], "used": parse_opencode_windows(row["windows"])}
 
 
 def last_credit(pacing_dir):
@@ -558,11 +533,10 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
     if not reading or now - reading["at"] > stale_s:
         return {"state": "unknown", "note": "OpenCode usage reading missing or stale, assumed free"}
     used = reading["used"]
-    statuses = reading.get("statuses") if isinstance(reading.get("statuses"), dict) else {}
     for name in ("rolling", "5-hour", "weekly"):
         if (number(used.get(name)) or 0) >= 100:
             return {"state": "OFF", "note": f"OpenCode {name} window is full"}
-    if monthly_allowance_exhausted(used, statuses, cfg):
+    if monthly_allowance_exhausted(used, cfg):
         return opencode_credit_pool(now, cfg, pacing_dir, sessions)
     if (number(used.get("monthly")) or 0) >= 100:
         return {"state": "ON", "note": "OpenCode monthly meter reads full but shorter windows still have room"}

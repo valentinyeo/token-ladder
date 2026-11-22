@@ -26,14 +26,14 @@
       "credit": "vercel",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "openrouter",
       "credit": "openrouter",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "deepseek",

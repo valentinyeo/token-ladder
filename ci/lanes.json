@@ -9,7 +9,10 @@
     "name": "vercel-ai-gateway",
     "key_env": "AI_GATEWAY_API_KEY",
     "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
-    "model": "deepseek/deepseek-v4.1-flash"
+    "model": "deepseek/deepseek-v4.1-flash",
+    "gateway": {
+      "only": ["token-pass"]
+    }
   },
   {
     "name": "openrouter",

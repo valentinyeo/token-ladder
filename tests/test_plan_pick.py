@@ -116,7 +116,8 @@ class PickTests(unittest.TestCase):
         limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
         got = pick({"codex": pool("OFF", 1.9), "grok": pool("WARN", 1.27)}, limits)
         self.assertEqual(got["plan"], "openrouter")
-        self.assertIn("skipped", got["reason"])
+        until = datetime.fromtimestamp(T + 60, timezone.utc).strftime("%H:%M")
+        self.assertIn(f"skipped opencode (limited until {until} UTC), vercel (limited until {until} UTC)", got["reason"])
 
     def test_pace_exactly_on_the_line_is_allowed(self):
         limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60, "openrouter": T + 60}
@@ -129,7 +130,7 @@ class PickTests(unittest.TestCase):
         limits = {lane["lane"]: T + 60 for lane in LANES if lane["lane"] not in ("codex", "cursor")}
         got = pick({"codex": pool("ON", 2.0), "grok": pool("ON", 1.5)}, limits)
         self.assertEqual(got["plan"], "cursor")
-        self.assertIn("least ahead is cursor", got["reason"])
+        self.assertIn("least ahead is cursor (pace 1.50x is above 1.1x)", got["reason"])
 
     def test_nothing_left_gives_none(self):
         limits = {lane["lane"]: T + 60 for lane in LANES}
@@ -390,13 +391,6 @@ def lane_use(at, provider="opencode-go", tokens=0, cost=None):
 
 REAL_AT = 1795174461.7206776
 REAL_USD = 20.57
-REAL_OPENCODE_USAGE = {
-    "usage": {
-        "rolling": {"status": "ok", "percent": 0, "resetsAt": "2026-11-22T22:55:58.061Z"},
-        "weekly": {"status": "ok", "percent": 0, "resetsAt": "2026-11-23T00:00:00.000Z"},
-        "monthly": {"status": "rate-limited", "percent": 100, "resetsAt": "2026-11-30T23:01:10.000Z"},
-    }
-}
 
 def month_full_windows():
     return {"5-hour": 50.0, "weekly": 50.0, "monthly": 100.0}
@@ -524,17 +518,10 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertIn("opencode", pp.with_opencode({"codex": pool()}, {}, NOW))
 
     def test_monthly_meter_full_with_short_windows_still_on(self):
-        rows = [{"at": NOW - 60, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
-                 "statuses": {"monthly": "rate-limited"}}]
+        rows = [{"at": NOW - 60, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0}}]
         got = self.state(rows)
         self.assertEqual(got["state"], "ON")
         self.assertIn("shorter windows still have room", got["note"])
-
-    def test_opencode_usage_api_shape(self):
-        used, statuses = pp.opencode_usage_from_api(REAL_OPENCODE_USAGE)
-        self.assertEqual(used, {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0})
-        self.assertEqual(statuses["monthly"], "rate-limited")
-        self.assertFalse(pp.monthly_allowance_exhausted(used, statuses, {}))
 
 
 class ConfigTests(unittest.TestCase):
@@ -557,6 +544,18 @@ class ConfigTests(unittest.TestCase):
                 self.assertIn(lane.get("credit"), (None, *pp.BALANCES))
                 self.assertTrue(command.endswith("</dev/null"), command)
                 self.assertIsNone(tl.bash_refusal(lane["command"], {}), lane["command"])
+
+    def test_pi_gateway_lanes_pin_the_provider_lanes_json_names(self):
+        lanes = {lane["lane"]: lane for lane in pp.lanes_from(pp.load_config())}
+        shipped = json.loads((Path(REPO) / "ci" / "lanes.json").read_text(encoding="utf-8"))
+        gateway = next(lane for lane in shipped if lane["name"] == "vercel-ai-gateway")
+        openrouter = next(lane for lane in shipped if lane["name"] == "openrouter")
+        self.assertEqual(gateway["gateway"], {"only": ["token-pass"]})
+        self.assertEqual(openrouter["provider"], {"only": ["StreamLake"], "allow_fallbacks": False})
+        self.assertTrue((Path(REPO) / "tools" / "pi-lane-pins.mjs").is_file())
+        for name in ("vercel", "openrouter"):
+            with self.subTest(lane=name):
+                self.assertIn("-e ~/projects/token-ladder/tools/pi-lane-pins.mjs", lanes[name]["command"])
 
 
 class PlansTests(unittest.TestCase):
