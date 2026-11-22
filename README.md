@@ -269,13 +269,16 @@ backup or an ownership grant.
 ## CI model calls
 
 GitHub checks that need a hosted chat completion should not call DeepSeek,
-OpenCode, the Vercel AI Gateway, OpenRouter, OpenAI or Anthropic directly.
-Use the shared lane ladder in this repo instead.
+OpenCode, the Vercel AI Gateway, OpenRouter, Google Gemini, Cursor, OpenAI or
+Anthropic directly. Use the shared lane ladder in this repo instead.
 
 `ci/ladder-call` reads a JSON chat request on stdin (`messages`, optional
 `max_tokens` and `response_format`) and `--purpose <label>`. It walks the lanes
 in `ci/lanes.json` when the matching key env var is set:
-`AI_GATEWAY_API_KEY`, `OPENCODE_API_KEY`, `DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`.
+`GEMINI_API_KEY`, `CURSOR_API_KEY`, `AI_GATEWAY_API_KEY`, `OPENCODE_API_KEY`,
+`DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`. The `cursor` lane runs
+`cursor-agent` headless; the composite action installs it on the runner when
+needed.
 On payment or quota errors, rate limits, missing models (`404`, `408`, `425`),
 5xx, timeouts or empty answers it falls through to the next lane; a `400`
 request-body error stops the run. Each skip is logged on stderr, the provider
@@ -284,6 +287,8 @@ JSON goes on stdout, and exit `3` means every lane failed.
 ```yaml
 - uses: valentinyeo/token-ladder/.github/actions/ladder-call@main
   env:
+    GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+    CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
     AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
     OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
     DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}

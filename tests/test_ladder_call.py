@@ -22,7 +22,18 @@ def run_lint(root):
 
 def action_run_script():
     lines = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8').splitlines()
-    start = lines.index('      run: |') + 1
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() != 'id: run':
+            continue
+        for j in range(index + 1, len(lines)):
+            if lines[j].strip() == 'run: |':
+                start = j + 1
+                break
+        if start is not None:
+            break
+    if start is None:
+        start = lines.index('      run: |') + 1
     block = []
     for line in lines[start:]:
         if line.startswith('        '):
@@ -78,6 +89,23 @@ def run_server(routes, delay=0):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server, server.server_address[1]
+
+
+def fake_cursor_agent(tmp_dir, mode='ok', answer='cursor-ok'):
+    script = Path(tmp_dir) / 'cursor-agent'
+    if mode == 'ok':
+        body = f'#!/bin/sh\nprintf "%s\\n" "{answer}"\n'
+    elif mode == 'fail':
+        body = '#!/bin/sh\nexit 1\n'
+    elif mode == 'empty':
+        body = '#!/bin/sh\nexit 0\n'
+    elif mode == 'rate':
+        body = '#!/bin/sh\necho "rate limit exceeded"\nexit 0\n'
+    else:
+        raise ValueError(mode)
+    script.write_text(body, encoding='utf-8')
+    script.chmod(0o755)
+    return str(script)
 
 
 def ladder_call(env, stdin_obj, lanes_file=None):
@@ -315,6 +343,189 @@ class LadderCallTests(unittest.TestCase):
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload['choices'][0]['message']['content'], 'second-lane-ok')
 
+    def test_google_lane_answers_from_stub(self):
+        server, port = run_server({
+            '/v1beta/openai/chat/completions': (200, {
+                'choices': [{'message': {'content': 'gemini-ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        base = f'http://127.0.0.1:{port}'
+        lanes = [{
+            'name': 'google',
+            'key_env': 'GEMINI_API_KEY',
+            'url': base + '/v1beta/openai/chat/completions',
+            'model': 'gemini-2.5-flash',
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {
+                'GEMINI_API_KEY': 'g-key',
+                'LADDER_CALL_LANES': lanes_path,
+            },
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane google answered', result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['choices'][0]['message']['content'], 'gemini-ok')
+
+    def test_google_429_falls_to_cursor_then_vercel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor_bin = fake_cursor_agent(tmp, answer='from-cursor')
+            server, port = run_server({
+                '/v1beta/openai/chat/completions': (429, {'error': 'rate'}, None),
+                '/v1/chat/completions': (200, {
+                    'choices': [{'message': {'content': 'from-vercel'}}],
+                }, None),
+            })
+            self.addCleanup(server.shutdown)
+            base = f'http://127.0.0.1:{port}'
+            lanes = [
+                {
+                    'name': 'google',
+                    'key_env': 'GEMINI_API_KEY',
+                    'url': base + '/v1beta/openai/chat/completions',
+                    'model': 'gemini-2.5-flash',
+                },
+                {
+                    'name': 'cursor',
+                    'key_env': 'CURSOR_API_KEY',
+                    'kind': 'cursor',
+                    'model': 'composer-2.5',
+                },
+                {
+                    'name': 'vercel-ai-gateway',
+                    'key_env': 'AI_GATEWAY_API_KEY',
+                    'url': base + '/v1/chat/completions',
+                    'model': 'test-model',
+                },
+            ]
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(lanes, fh)
+                lanes_path = fh.name
+            self.addCleanup(lambda: os.unlink(lanes_path))
+            env = {
+                'GEMINI_API_KEY': 'g',
+                'CURSOR_API_KEY': 'c',
+                'AI_GATEWAY_API_KEY': 'v',
+                'LADDER_CALL_LANES': lanes_path,
+                'LADDER_CALL_CURSOR_AGENT': cursor_bin,
+                'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
+            }
+            result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('lane google skipped: 429', result.stderr)
+            self.assertIn('lane cursor answered', result.stderr)
+            self.assertNotIn('lane vercel-ai-gateway answered', result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload['choices'][0]['message']['content'], 'from-cursor')
+
+    def test_cursor_lane_failure_and_empty_skipped(self):
+        for mode, reason in (('fail', 'exit 1'), ('empty', 'empty answer')):
+            with self.subTest(reason=reason):
+                with tempfile.TemporaryDirectory() as tmp:
+                    script = fake_cursor_agent(tmp, mode=mode)
+                    lanes = [{
+                        'name': 'cursor',
+                        'key_env': 'CURSOR_API_KEY',
+                        'kind': 'cursor',
+                        'model': 'composer-2.5',
+                    }]
+                    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                        json.dump(lanes, fh)
+                        lanes_path = fh.name
+                    try:
+                        result = ladder_call(
+                            {
+                                'CURSOR_API_KEY': 'c',
+                                'LADDER_CALL_LANES': lanes_path,
+                                'LADDER_CALL_CURSOR_AGENT': script,
+                            },
+                            {'messages': [{'role': 'user', 'content': 'hi'}]},
+                        )
+                        self.assertEqual(result.returncode, 3, result.stderr)
+                        self.assertIn(f'lane cursor skipped: {reason}', result.stderr)
+                    finally:
+                        os.unlink(lanes_path)
+
+    def test_cursor_rate_limit_text_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rate_bin = fake_cursor_agent(tmp, mode='rate')
+            lanes = [{
+                'name': 'cursor',
+                'key_env': 'CURSOR_API_KEY',
+                'kind': 'cursor',
+                'model': 'composer-2.5',
+            }]
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(lanes, fh)
+                lanes_path = fh.name
+            self.addCleanup(lambda: os.unlink(lanes_path))
+            result = ladder_call(
+                {
+                    'CURSOR_API_KEY': 'c',
+                    'LADDER_CALL_LANES': lanes_path,
+                    'LADDER_CALL_CURSOR_AGENT': rate_bin,
+                },
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn('lane cursor skipped: rate limit', result.stderr)
+
+    def test_google_429_cursor_fail_falls_to_vercel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor_bin = fake_cursor_agent(tmp, mode='fail')
+            server, port = run_server({
+                '/v1beta/openai/chat/completions': (429, {'error': 'rate'}, None),
+                '/v1/chat/completions': (200, {
+                    'choices': [{'message': {'content': 'from-vercel'}}],
+                }, None),
+            })
+            self.addCleanup(server.shutdown)
+            base = f'http://127.0.0.1:{port}'
+            lanes = [
+                {
+                    'name': 'google',
+                    'key_env': 'GEMINI_API_KEY',
+                    'url': base + '/v1beta/openai/chat/completions',
+                    'model': 'gemini-2.5-flash',
+                },
+                {
+                    'name': 'cursor',
+                    'key_env': 'CURSOR_API_KEY',
+                    'kind': 'cursor',
+                    'model': 'composer-2.5',
+                },
+                {
+                    'name': 'vercel-ai-gateway',
+                    'key_env': 'AI_GATEWAY_API_KEY',
+                    'url': base + '/v1/chat/completions',
+                    'model': 'test-model',
+                },
+            ]
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(lanes, fh)
+                lanes_path = fh.name
+            self.addCleanup(lambda: os.unlink(lanes_path))
+            env = {
+                'GEMINI_API_KEY': 'g',
+                'CURSOR_API_KEY': 'c',
+                'AI_GATEWAY_API_KEY': 'v',
+                'LADDER_CALL_LANES': lanes_path,
+                'LADDER_CALL_CURSOR_AGENT': cursor_bin,
+            }
+            result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('lane google skipped: 429', result.stderr)
+            self.assertIn('lane cursor skipped: exit 1', result.stderr)
+            self.assertIn('lane vercel-ai-gateway answered', result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload['choices'][0]['message']['content'], 'from-vercel')
+
     def test_timeout_skipped_with_env(self):
         class SlowHandler(BaseHTTPRequestHandler):
             def do_POST(self):
@@ -437,6 +648,13 @@ class LintDirectModelCallsTests(unittest.TestCase):
         action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
         self.assertIn('${{ github.action_path }}/run', action_yml)
         self.assertNotIn('/ci/ladder-call', action_yml)
+
+    def test_action_installs_cursor_agent(self):
+        action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
+        self.assertIn('Install cursor-agent', action_yml)
+        self.assertIn('cursor.com/install', action_yml)
+        self.assertIn('GEMINI_API_KEY', action_yml)
+        self.assertIn('CURSOR_API_KEY', action_yml)
 
     def test_action_wrapper_logs_on_failure(self):
         action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
