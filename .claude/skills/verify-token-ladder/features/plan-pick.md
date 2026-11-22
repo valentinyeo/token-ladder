@@ -10,7 +10,7 @@ plan-pick chooses a worker lane from pool state, prints human or JSON plans, gat
 - `loop-interval` prints sleep seconds from Claude pace state.
 - `claude-helper` allows or refuses Sonnet helper use from pool pace.
 - `run-stub` runs a stub lane command end to end without real spend.
-- `prepaid-credit` reads OpenCode windows and console credit live, uses held prepaid credit above $2, and waits until monthly renewal once the floor is reached.
+- `prepaid-credit` uses live OpenCode credit or a balance anchor less recorded run costs for at most seven days, stops at $2, and waits until monthly renewal once the floor is reached.
 - `burn` reports current-month recorded pi costs and the separate measured 30-day DeepSeek direct account total.
 
 ## How to get to it (user POV)
@@ -37,8 +37,11 @@ Preconditions:
 ## Credit and retirement regression
 
 Run `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k PrepaidCreditTests`.
-These checks use an isolated command stub, never a real key or browser. They prove monthly 100% with weekly/5-hour 0% uses $24.64 live credit rather than an 8-hour-old $5.87 estimate.
-They cover the inclusive $2 floor, renewal hold, stale or missing live credit, read-only command flags, DeepSeek direct retirement from workers and CI, and the separate measured burn report.
+Also run `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k AnchoredCreditTests` and `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k test_set_credit_and_usage_logs_drive_selection_without_browser_credit`.
+These checks use isolated state and command stubs, never a real key or browser. They prove monthly 100% with weekly/5-hour 0% uses live credit or a stored anchor.
+They cover recorded run-cost deductions, the $0.50 unknown-run default, copied message deduplication, unmatched launches, the inclusive $2 floor, live anchor replacement, seven-day expiry, renewal hold, UTC/source recording, and preservation during background refresh.
+The CLI journey records an anchor, selects OpenCode without browser credit, adds pi costs, and selects Vercel once the balance drops below $2.
+The existing checks also cover read-only command flags, DeepSeek direct retirement, and the separate measured burn report.
 
 ## Gotchas
 

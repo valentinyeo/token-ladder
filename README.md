@@ -59,24 +59,42 @@ Valentin's 2026-11-22 dashboard showed $24.64 available credit, monthly 100% use
 The monthly renewal was 30 November, about 8 days and 1 hour away. Weekly reset was 2 hours and 19 minutes away.
 Extra Usage is on. Enabled models are `beam-free`, `deepseek-v4.1-flash`, and `glm-5.3-flash`; workers still use DeepSeek Flash only.
 
-Prepaid credit already held gets used. Once the included allowance is gone, workers use OpenCode Extra Usage only while live available credit is above `opencode_credit_floor_usd`, which defaults to $2.
+Prepaid credit already held gets used. Once the included allowance is gone, workers use OpenCode Extra Usage while the live or anchored available credit is above `opencode_credit_floor_usd`, which defaults to $2.
 At or below the floor, the lane is skipped until the monthly renewal. Worker selection records that renewal in the existing lane-limits file, so a later balance change cannot reopen it early.
 Auto top-up is OFF. The reader never purchases credit or changes billing settings.
 
 `opencode_reader_command` configures the installed read-only `opencode-read` command.
 Every pick without an injected OpenCode pool and every `--plans` call runs it with `--print` for current quota windows, then `--credits --print` for current console credit.
 The usage API has no dollar balance. The console credit command requires an open, signed-in Multiprompt browser pane.
-Each command has a 180-second timeout. Failed credit reads never reuse history or extrapolate token costs.
-Live usage must be no older than five minutes; live credit must be no older than one minute.
-Missing or stale live data closes the lane. Historical windows remain visible for diagnosis, labelled unavailable or stale, but cannot authorize a worker.
-The live monthly reset is authoritative; `opencode_monthly_renewal` is the fallback date confirmed by Valentin.
+Each command has a 180-second timeout. Live usage must be no older than five minutes to authorize included usage; live credit must be no older than one minute.
+A successful live credit read replaces the balance anchor, even when included allowance remains or the quota reader fails.
+The live monthly reset is authoritative; historical exhausted windows can authorize prepaid usage only before their reset or the configured `opencode_monthly_renewal`.
+Missing monthly usage cannot authorize a worker.
+
+When the browser pane is unavailable, record a known balance in `~/.local/state/token-ladder/lane-credits.json`:
+
+```sh
+plan-pick --set-credit opencode 24.64
+```
+
+This records the current UTC time and source `Valentin dashboard screenshot`. Use `--credit-at` for the observation time and `--credit-source` to name a different source:
+
+```sh
+plan-pick --set-credit opencode 24.64 --credit-at 2026-11-22T22:00Z --credit-source "Valentin dashboard screenshot"
+```
+
+Without live credit, available credit is the anchor less recorded `opencode-go` pi message costs since that time, grouped by run.
+Other providers and messages at or before the anchor are excluded. Copied message IDs are counted once.
+Launch records are matched to pi runs by directory and launch time. An unmatched launch or a run with missing or invalid costs deducts a conservative $0.50 default, once per run, plus any known costs.
+The plan labels anchored balances, the observation time and source, deductions, and the number of defaulted runs. It never estimates costs from token counts.
+Anchors older than seven days, future anchors, and invalid balances close prepaid usage. A live read replaces the anchor and starts deductions again from its timestamp.
 
 ## Rules
 
 | Rule | Enforced by |
 |---|---|
 | Use prepaid credit already held down to its floor; never top up automatically. OpenCode stops at $2 until monthly renewal. | `PrepaidCreditTests.test_prepaid_credit_floor_is_inclusive_and_configurable`, `test_floor_holds_lane_until_renewal_then_included_allowance_reopens`, `test_live_reader_executes_read_only_commands_and_keeps_zero_credit` in `tests/test_plan_pick.py` |
-| Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Only live credit can authorize Extra Usage. | `PrepaidCreditTests.test_live_prepaid_credit_overrides_stale_estimate_not_monthly_usage`, `test_missing_stale_future_or_invalid_credit_never_runs_prepaid` |
+| Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Live credit or an anchor no older than seven days can authorize Extra Usage. Deduct run costs, or $0.50 per unknown-cost run. | `AnchoredCreditTests`, `CommandTests.test_set_credit_and_usage_logs_drive_selection_without_browser_credit`, `PrepaidCreditTests` |
 | DeepSeek direct is retired; no more top-ups or worker/CI selection. | `PrepaidCreditTests.test_deepseek_direct_is_retired_from_workers_and_ci` |
 
 ### Lane history
@@ -183,7 +201,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 |---|---|---|
 | Claude | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from `~/.claude/.credentials.json` | `five_hour`, `seven_day` (utilization %, `resets_at`) |
 | Codex | `rate_limits` in the newest `~/.codex/sessions/**/*.jsonl` token_count event (or `codex app-server` rate limit call) | `primary` weekly (`used_percent`, `resets_at`), credits balance |
-| OpenCode Go Plus ($40/month) | `opencode-read --print` and `--credits --print`; `plan-pick --plans` | Separate monthly, weekly and 5-hour windows; $200 included allowance; live prepaid credit above $2 after included allowance is gone; never top up |
+| OpenCode Go Plus ($40/month) | `opencode-read --print` and `--credits --print`; `plan-pick --plans` | Separate monthly, weekly and 5-hour windows; $200 included allowance; live or anchored prepaid credit above $2 after included allowance is gone; never top up |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
 | Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
 | Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; chat-only |

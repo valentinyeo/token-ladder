@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import glob
 import json
 import math
@@ -475,22 +476,30 @@ def read_credits(path=CREDITS):
     return data if isinstance(data, dict) else {}
 
 
+def save_credits(entries, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".write-lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_credits(path)
+        data.update(entries)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    return data
+
+
 def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers=BALANCES):
-    data = read_credits(path)
+    updates = {}
     for name in names:
         reader = readers.get(name)
         if not reader:
             continue
         try:
-            data[name] = {"usd": round(reader(get, key), 2), "at": now}
+            updates[name] = {"usd": round(reader(get, key), 2), "at": now}
         except Exception as exc:
             print(f"plan-pick: cannot read {name} credit: {type(exc).__name__}", file=sys.stderr)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, path)
-    return data
+    return save_credits(updates, path)
 
 
 def credit_pool(entry, now, cfg):
@@ -563,7 +572,8 @@ def last_windows(pacing_dir):
     if not rows:
         return None
     row = max(rows, key=lambda r: r["at"])
-    return {"at": row["at"], "used": parse_opencode_windows(row["windows"])}
+    return {"at": row["at"], "used": parse_opencode_windows(row["windows"]),
+            "resets_at": row.get("resets_at", {})}
 
 
 def read_opencode(cfg):
@@ -571,12 +581,16 @@ def read_opencode(cfg):
     if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
         raise ValueError("OpenCode reader command missing")
     command = [os.path.expanduser(arg) for arg in command]
-    out = subprocess.run(command + ["--print"], capture_output=True, text=True, timeout=180, check=True)
-    usage = json.loads(out.stdout)
-    windows = usage["windows"]
-    reading = {"at": datetime.fromisoformat(usage["measured_at"].replace("Z", "+00:00")).timestamp(),
-               "windows": {w["name"]: w["used"] for w in windows},
-               "resets_at": {w["name"]: w.get("resets_at") for w in windows}}
+    reading = {}
+    try:
+        out = subprocess.run(command + ["--print"], capture_output=True, text=True, timeout=180, check=True)
+        usage = json.loads(out.stdout)
+        windows = usage["windows"]
+        reading = {"at": datetime.fromisoformat(usage["measured_at"].replace("Z", "+00:00")).timestamp(),
+                   "windows": {w["name"]: w["used"] for w in windows},
+                   "resets_at": {w["name"]: w.get("resets_at") for w in windows}}
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
     try:
         out = subprocess.run(command + ["--credits", "--print"], capture_output=True, text=True,
                              timeout=180, check=True)
@@ -587,7 +601,7 @@ def read_opencode(cfg):
     return reading
 
 
-def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
+def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launches_path=LAUNCHES):
     plan = next((p for p in plans_from(cfg) if p.get("vendor") == "opencode"), {})
     allowance = number(plan.get("included_allowance_usd"))
     try:
@@ -595,8 +609,14 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         reading = None
     now = time.time() if now is None else now
-    live = reading is not None
-    reading = reading or last_windows(pacing_dir)
+    credit = number((reading or {}).get("credits_usd"))
+    credit_at = number((reading or {}).get("credits_at"))
+    live_credit = (credit is not None and math.isfinite(credit) and credit >= 0 and credit_at is not None
+                   and math.isfinite(credit_at) and 0 <= now - credit_at <= 60)
+    if live_credit:
+        save_credits({"opencode": {"usd": credit, "at": credit_at, "source": "OpenCode live console"}}, CREDITS)
+    live = bool(reading and reading.get("windows"))
+    reading = reading if live else last_windows(pacing_dir)
     if not reading:
         return {"state": "OFF", "note": "OpenCode live usage unavailable; never top up"}
     used = parse_opencode_windows(reading.get("windows", reading.get("used")))
@@ -620,7 +640,8 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
     at = number(reading.get("at"))
     if not live or at is None or not 0 <= now - at <= 300:
         result["note"] += "; live usage unavailable or stale; never top up"
-        return result
+        if not result["included_exhausted"]:
+            return result
     if (monthly is None or not math.isfinite(monthly) or monthly < 0 or allowance is None
             or not math.isfinite(allowance) or allowance <= 0):
         result["note"] += "; allowance missing; never top up"
@@ -631,14 +652,27 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR):
         else:
             result.update(state="ON", funding="included")
         return result
-    credit, credit_at = number(reading.get("credits_usd")), number(reading.get("credits_at"))
-    if credit is None or not math.isfinite(credit) or credit_at is None or not 0 <= now - credit_at <= 60:
-        result["note"] += "; live credit unavailable or stale; never top up"
-        return result
+    if live_credit:
+        result["note"] += f"; live available credit ${credit:.2f}"
+    else:
+        anchor = read_credits(CREDITS).get("opencode")
+        anchor = anchor if isinstance(anchor, dict) else {}
+        credit, credit_at = number(anchor.get("usd")), number(anchor.get("at"))
+        if (credit is None or not math.isfinite(credit) or credit < 0 or credit_at is None
+                or not math.isfinite(credit_at) or not 0 <= now - credit_at <= 7 * 86400):
+            result["note"] += "; live credit unavailable; balance anchor missing, invalid or older than 7 days; never top up"
+            return result
+        spent, unknown = opencode_spend(credit_at, now, sessions, launches_path)
+        credit = max(0.0, round(credit - spent, 10))
+        stamp = datetime.fromtimestamp(credit_at, timezone.utc).isoformat()
+        result["note"] += (f"; anchored credit ${credit:.2f}: ${anchor['usd']:.2f} at {stamp}"
+                           f" ({anchor.get('source', 'unknown source')}) less ${spent:.2f} run costs")
+        if unknown:
+            result["note"] += f"; includes conservative $0.50 default for {unknown} run(s) with unknown cost"
     floor = number(cfg.get("opencode_credit_floor_usd"))
     floor = 2 if floor is None or not math.isfinite(floor) or floor < 0 else floor
     result.update(credits_usd=credit, credit_floor_usd=floor)
-    result["note"] += f"; live available credit ${credit:.2f} (floor ${floor:g}); never top up"
+    result["note"] += f" (floor ${floor:g}); never top up"
     if credit <= floor:
         result.update(floor_reached=True)
         result["note"] += "; skip until monthly renewal"
@@ -664,6 +698,49 @@ def jsonl_rows(path):
                     yield row
     except OSError:
         return
+
+
+def opencode_spend(since, now, sessions, launches_path):
+    launches = [row for row in jsonl_rows(launches_path)
+                if number(row.get("at")) is not None and row["at"] <= now]
+    launches.sort(key=lambda row: row["at"])
+    runs = {("launch", i): {"usd": 0.0, "messages": 0, "unknown": False}
+            for i, row in enumerate(launches) if row.get("lane") == "opencode" and row["at"] > since}
+    seen = set()
+    for path in sorted(glob.glob(os.path.join(sessions, "*", "*.jsonl"))):
+        cwd, session = None, path
+        for row in jsonl_rows(path):
+            if row.get("type") == "session":
+                cwd, session = row.get("cwd"), row.get("id") or path
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("provider") != "opencode-go" or message.get("role") != "assistant":
+                continue
+            at = number(message.get("timestamp"))
+            if at is None or not since < at / 1000 <= now:
+                continue
+            if row.get("id"):
+                identity = (row["id"], at)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            key = ("session", session)
+            for i in range(len(launches) - 1, -1, -1):
+                launch = launches[i]
+                if cwd and launch.get("cwd") == cwd and launch["at"] <= at / 1000:
+                    if launch.get("lane") == "opencode":
+                        key = ("launch", i)
+                    break
+            run = runs.setdefault(key, {"usd": 0.0, "messages": 0, "unknown": False})
+            run["messages"] += 1
+            usage = message.get("usage")
+            cost = usage.get("cost") if isinstance(usage, dict) else None
+            usd = number(cost.get("total")) if isinstance(cost, dict) else None
+            if usd is None or not math.isfinite(usd) or usd < 0:
+                run["unknown"] = True
+            else:
+                run["usd"] += usd
+    unknown = sum(run["unknown"] or run["messages"] == 0 for run in runs.values())
+    return sum(run["usd"] for run in runs.values()) + unknown * 0.50, unknown
 
 
 def burn_report(cfg, now=None, sessions=PI_SESSIONS, launches_path=LAUNCHES):
@@ -778,9 +855,30 @@ def main(argv):
                         help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
                         help="read the credit balance of these lanes (all credit lanes when none) and store it")
+    parser.add_argument("--set-credit", nargs=2, metavar=("LANE", "USD"),
+                        help="record an OpenCode prepaid balance anchor without reading live state")
+    parser.add_argument("--credit-source", default="Valentin dashboard screenshot", help="balance anchor source")
+    parser.add_argument("--credit-at", help="balance anchor time in ISO 8601 with timezone (default: now UTC)")
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     args = parser.parse_args(argv)
     cfg = load_config()
+    if args.set_credit is not None:
+        lane, value = args.set_credit
+        try:
+            usd = float(value)
+            at = time.time()
+            if args.credit_at:
+                stamp = datetime.fromisoformat(args.credit_at.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    raise ValueError("timezone required")
+                at = stamp.timestamp()
+            if lane != "opencode" or not math.isfinite(usd) or usd < 0 or at > time.time() or not args.credit_source.strip():
+                raise ValueError("invalid anchor")
+        except (ValueError, OverflowError):
+            parser.error("--set-credit requires opencode, a finite nonnegative USD balance, a nonfuture timezone-aware time and a source")
+        save_credits({lane: {"usd": usd, "at": at, "source": args.credit_source}}, CREDITS)
+        print(f"Stored {lane} balance anchor at {datetime.fromtimestamp(at, timezone.utc).isoformat()} ({args.credit_source}).")
+        return 0
     if args.loop_interval:
         answer = loop_interval_answer(args.pools, cfg)
         if args.json:
