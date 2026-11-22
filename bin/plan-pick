@@ -287,6 +287,8 @@ def plan_line(plan):
             line += f" {usage['unit']}"
         line += f". Limit: {limit:g}" if limit is not None else ". Limit: unknown"
         line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
+        if usage.get("used_up") and usage.get("used_up_at"):
+            line += f" Used up at {usage['used_up_at']}."
     return line
 
 
