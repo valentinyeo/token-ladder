@@ -49,7 +49,7 @@ class PoolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state, patch.object(tl, "STATE", state):
             s = {"claude": {"week": bar(96)}, "codex": {"week": bar(10)}}
             pools = tl.current_pools(s, NOW)
-            self.assertEqual([p["state"] for p in pools.values()], ["OFF", "ON", "unknown"])
+            self.assertEqual([p["state"] for p in pools.values()], ["OFF", "ON", "unknown", "unknown"])
             self.assertIn("assume 70% used for planning", tl.pool_line("grok", pools["grok"]))
             path = Path(state, "grok.json")
             path.write_text(json.dumps({"used_pct": 81, "resets_at": "2026-10-26T16:03:00+02:00", "updated_at": "2026-10-25T16:03:00+02:00"}))
@@ -76,7 +76,7 @@ class PoolTests(unittest.TestCase):
                 patch.object(tl.subprocess, "run", side_effect=AssertionError("no subprocess")), \
                 patch.object(tl.urllib.request, "urlopen", side_effect=AssertionError("no network")):
             tl.pools_command()
-            self.assertEqual(set(json.loads(out.getvalue())), {"claude", "codex", "grok"})
+            self.assertEqual(set(json.loads(out.getvalue())), {"claude", "codex", "grok", "google"})
             self.assertEqual(os.listdir(state), [])
 
 

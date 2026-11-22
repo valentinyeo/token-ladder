@@ -245,6 +245,20 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.ran, ["run opencode"])
         self.assertEqual(pp.read_limits(self.limits), {})
 
+    def test_400_fast_fail_runs_the_next_lane(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        code = self.go({"run opencode": (1, msg), "run vercel": (0, "done")})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ran, ["run opencode", "run vercel"])
+        self.assertEqual(pp.read_limits(self.limits), {})
+        self.assertTrue(any("skipped lane opencode: model request was rejected" in line for line in self.said), self.said)
+
+    def test_failure_after_work_does_not_fall_through(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        self.assertEqual(self.go({"run opencode": (1, msg, 5.0, True)}), 1)
+        self.assertEqual(self.ran, ["run opencode"])
+        self.assertEqual(pp.read_limits(self.limits), {})
+
     def test_success_that_mentions_a_rate_limit_is_kept(self):
         self.assertEqual(self.go({"run opencode": (0, "added a rate limit, 429 on overflow")}), 0)
         self.assertEqual(pp.read_limits(self.limits), {})
@@ -270,6 +284,19 @@ class RunTests(unittest.TestCase):
         for text, kind in cases.items():
             with self.subTest(text=text):
                 self.assertEqual(pp.limit_kind(1, text), kind)
+
+    def test_fast_fail_reads_provider_errors(self):
+        cases = {('{"statusCode":400,"message":"The model request was rejected"}', 5.0, False):
+                     "model request was rejected",
+                 ('HTTP 503 upstream unavailable', 2.0, False): "provider HTTP error",
+                 ("unauthorized: invalid api key", 1.0, False): "provider auth error",
+                 ('stopReason":"error"', 10.0, False): "agent error before work",
+                 ("SyntaxError in your code", 5.0, False): None,
+                 ('{"statusCode":400}', 5.0, True): None,
+                 ('{"statusCode":400}', 35.0, False): None}
+        for (text, elapsed, work), kind in cases.items():
+            with self.subTest(text=text[:40]):
+                self.assertEqual(pp.fast_fail_kind(1, text, elapsed, work), kind)
 
 
 class CreditTests(unittest.TestCase):
@@ -611,6 +638,46 @@ class PlansTests(unittest.TestCase):
                 self.assertEqual(pp.plans_from(cfg), [])
 
 
+class GoogleWorkerExclusionTests(unittest.TestCase):
+    def test_google_pool_or_lane_is_never_picked_even_without_a_reading(self):
+        for lane in ({"lane": "google", "pool": None, "command": "echo forbidden"},
+                     {"lane": "renamed", "pool": "google", "command": "echo forbidden"}):
+            for reading in (None, {}, pool("ON", 0.1), pool("OFF"), pool("ON", 2.0)):
+                pools = {} if reading is None else {"google": reading}
+                with self.subTest(lane=lane, reading=reading):
+                    burn = {"lane": lane["lane"], "until": T + 60}
+                    got = pp.pick([lane], pools, now=T, burn=burn)
+                    self.assertEqual(got["plan"], "none")
+                    self.assertIsNone(got["command"])
+                    self.assertIn("chat-only", got["reason"])
+
+    def test_worker_fallback_and_least_ahead_selection_exclude_google(self):
+        google = {"lane": "google", "pool": "google", "command": "echo forbidden"}
+        worker = {"lane": "worker", "pool": "worker", "command": "echo allowed"}
+        for ratio in (0.1, 2.0):
+            with self.subTest(ratio=ratio):
+                got = pp.pick([google, worker], {"google": pool("ON", 0.0), "worker": pool("ON", ratio)}, now=T)
+                self.assertEqual(got["plan"], "worker")
+
+    def test_run_never_launches_google(self):
+        lane = {"lane": "google", "pool": "google", "command": "echo forbidden"}
+        runner = mock.Mock(side_effect=AssertionError("no Google worker"))
+        with tempfile.TemporaryDirectory() as home:
+            result = pp.run_lanes([lane], {}, {}, 1.1, runner=runner,
+                                  limits_path=os.path.join(home, "limits.json"), now=T, say=lambda text: None,
+                                  launches_path=os.path.join(home, "launches.jsonl"))
+        self.assertEqual(result, 4)
+        runner.assert_not_called()
+
+    def test_google_is_a_chat_only_plan_without_a_shipped_lane(self):
+        cfg = pp.load_config()
+        google = next(plan for plan in pp.plans_from(cfg) if plan["vendor"] == "google")
+        self.assertEqual(google["pool"], "google")
+        self.assertTrue(google["chat_only"])
+        self.assertFalse(any(lane.get("pool") == "google" or lane["lane"] == "google"
+                             for lane in pp.lanes_from(cfg)))
+
+
 class WorkerEnvTests(unittest.TestCase):
     def setUp(self):
         self.shims = str(Path(REPO).resolve() / "bin" / "worker-shims")
@@ -668,6 +735,18 @@ class CommandTests(unittest.TestCase):
         path.write_text(json.dumps(pools))
         return self.cli("--pools", str(path), *args)
 
+    def plan_not_from(self, vendor, earlier=(), *args):
+        home = tempfile.mkdtemp()
+        pools = Path(home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        cmd = [sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--pools", str(pools)]
+        for lane in earlier:
+            subprocess.run(cmd + ["--limited", lane], capture_output=True, text=True, env=env)
+        return subprocess.run(cmd + ["--not-vendor", vendor, *args], capture_output=True, text=True, env=env)
+
     def test_json_output_has_three_fields(self):
         out = self.run_cli({"codex": pool()}, "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -684,6 +763,24 @@ class CommandTests(unittest.TestCase):
         got = json.loads(self.run_cli({}, "--json").stdout)
         self.assertEqual(got["plan"], "openrouter")
         self.assertIn("vercel (limited until", got["reason"])
+
+    def test_run_skips_a_400_lane_end_to_end(self):
+        cfg = {"lanes": [{"lane": "a", "pool": None, "command": "echo '400 model request was rejected'; exit 1"},
+                         {"lane": "b", "pool": None, "command": "echo worker-done"}]}
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (repo / "config.json").write_text(json.dumps(cfg))
+        pools = Path(self.home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("worker-done", out.stdout)
+        self.assertIn("skipped lane a: model request was rejected", out.stderr)
 
     def test_run_skips_a_429_lane_end_to_end(self):
         cfg = {"lanes": [{"lane": "a", "pool": None, "command": "echo '429: Too Many Requests'; exit 1"},
@@ -737,6 +834,44 @@ class CommandTests(unittest.TestCase):
         line = self.run_cli({"codex": pool()}, "--not-vendor", "deepseek").stdout
         self.assertTrue(line.startswith("Worker plan: codex. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
 
+    def test_not_vendor_excludes_each_lane_by_its_own_vendor(self):
+        cases = (("opencode", (), "vercel"),
+                 ("vercel", ("opencode",), "openrouter"),
+                 ("openrouter", ("opencode", "vercel"), "deepseek"),
+                 ("deepseek", ("opencode", "vercel", "openrouter"), "codex"),
+                 ("codex", ("opencode", "vercel", "openrouter", "deepseek"), "cursor"),
+                 ("cursor", ("opencode", "vercel", "openrouter", "deepseek", "codex"), None))
+        for vendor, earlier, expected in cases:
+            with self.subTest(vendor=vendor):
+                out = self.plan_not_from(vendor, earlier)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                start = f"Worker plan: {expected}." if expected else "Worker plan: none."
+                self.assertTrue(out.stdout.startswith(start), out.stdout)
+
+    def test_not_vendor_also_applies_to_json(self):
+        out = self.plan_not_from("vercel", ("opencode",), "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["plan"], "openrouter")
+
+    def test_run_skips_a_lane_excluded_by_its_own_name(self):
+        cfg = {"lanes": [{"lane": "vercel", "credit": "vercel", "vendor": "deepseek",
+                          "command": "echo vercel-ran"},
+                         {"lane": "openrouter", "vendor": "deepseek", "command": "echo worker-done"}]}
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (repo / "config.json").write_text(json.dumps(cfg))
+        pools = Path(self.home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools),
+                              "--run", "--not-vendor", "vercel"], capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("worker-done", out.stdout)
+        self.assertNotIn("vercel-ran", out.stdout)
+
     def test_plans_prints_each_plan_and_the_no_extra_cost_rule(self):
         out = self.cli("--plans")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -778,6 +913,35 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("opencode: $1.5000", out.stdout)
         self.assertIn("/tmp/my-brief: $1.5000", out.stdout)
+
+    def test_plans_json_includes_config_and_google_usage(self):
+        out = self.cli("--plans", "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        plans = json.loads(out.stdout)
+        google = next(plan for plan in plans if plan["vendor"] == "google")
+        self.assertEqual(google["usage"]["state"], "unknown")
+        self.assertTrue(google["usage"]["chat_only"])
+        self.assertIsNone(google["usage"]["limit"])
+        for plan in plans:
+            plan.pop("usage", None)
+            plan.pop("status", None)
+            plan.pop("note", None)
+        self.assertEqual(plans, pp.plans_from(pp.load_config()))
+
+    def test_plans_prints_google_count_without_claiming_a_known_quota(self):
+        usage = {"state": "unknown", "used": 3, "limit": None, "pace_ratio": None,
+                 "unit": "local history entries today (UTC)", "chat_only": True}
+        out = self.run_cli({"google": usage}, "--plans")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Pool: google. Chat-only, never workers.", out.stdout)
+        self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown.", out.stdout)
+        plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
+        self.assertEqual(next(plan for plan in plans if plan.get("pool") == "google")["usage"], usage)
+
+    def test_plans_survives_unavailable_google_reading(self):
+        out = self.cli("--plans", "--pools", "/nonexistent")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Pool: google. Chat-only, never workers. Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
 
     def test_limited_unknown_lane_fails(self):
         out = self.cli("--limited", "baseten")

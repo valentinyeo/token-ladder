@@ -4,7 +4,7 @@ token-ladder reports subscription pool states read-only via `pools --json` and t
 
 ## Sub-features
 
-- `pools-json` prints claude, codex, and grok pool objects without network or subprocess side effects.
+- `pools-json` prints claude, codex, grok and chat-only google pool objects without network or subprocess side effects.
 - `status-lines` prints TOKEN MAX, FLOOR, FEED, and per-provider lines on an empty home.
 
 ## How to get to it (user POV)
@@ -18,7 +18,7 @@ Preconditions:
 - `export HOME=$(mktemp -d)`
 - `export TOKEN_LADDER_LOCAL_CONFIG=$PWD/.test-missing-config.local.json`
 
-- **Pools JSON.** Run `bin/token-ladder pools --json`. Exit `0`. stdout JSON object has exactly keys `claude`, `codex`, `grok`. `$HOME` stays empty (no new files).
+- **Pools JSON.** Run `bin/token-ladder pools --json`. Exit `0`. stdout JSON object has exactly keys `claude`, `codex`, `grok`, `google`. `$HOME` stays empty (no new files).
 - **Status empty home.** Run `bin/token-ladder status`. Exit `0`. stdout lines include `TOKEN MAX OK`, `FLOOR OK`, `FEED OK`, and provider lines with `? used, reset unknown`.
 
 ## Gotchas

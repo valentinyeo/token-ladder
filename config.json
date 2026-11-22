@@ -105,6 +105,16 @@
       "source": "Valentin, 2026-11-22"
     },
     {
+      "name": "Google Antigravity plan",
+      "vendor": "google",
+      "pool": "google",
+      "chat_only": true,
+      "included_models": ["Gemini 4 Neon"],
+      "runs_on": ["local"],
+      "extra_cost": "none within the plan quota; never buys overages",
+      "source": "Valentin, 2026-11-22; https://antigravity.google/docs/plans.md"
+    },
+    {
       "name": "OpenRouter",
       "vendor": "openrouter",
       "included_models": ["unknown"],
