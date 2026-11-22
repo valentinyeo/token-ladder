@@ -2,6 +2,7 @@ name: Pstack sources
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -33,6 +34,12 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+      - name: Read author model families
+        id: authors
+        run: |
+          set -euo pipefail
+          families=$(python3 ci/model_families.py "$GITHUB_EVENT_PATH")
+          echo "exclude-families=$families" >> "$GITHUB_OUTPUT"
       - name: Prepare verifier brief
         env:
           BASE_REF: ${{ github.event.pull_request.base.ref }}
@@ -58,10 +65,12 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         run: |
           set -euo pipefail
-          if [ -z "$OPENCODE_API_KEY" ] && [ -z "$AI_GATEWAY_API_KEY" ] && [ -z "$DEEPSEEK_API_KEY" ] && [ -z "$OPENROUTER_API_KEY" ]; then
-            echo "verifier: set OPENCODE_API_KEY, AI_GATEWAY_API_KEY, DEEPSEEK_API_KEY, or OPENROUTER_API_KEY" >&2
+          if [ -z "$OPENCODE_API_KEY" ] && [ -z "$AI_GATEWAY_API_KEY" ] && [ -z "$DEEPSEEK_API_KEY" ] && [ -z "$OPENROUTER_API_KEY" ] && [ -z "$GEMINI_API_KEY" ] && [ -z "$CURSOR_API_KEY" ]; then
+            echo "verifier: set OPENCODE_API_KEY, AI_GATEWAY_API_KEY, DEEPSEEK_API_KEY, OPENROUTER_API_KEY, GEMINI_API_KEY, or CURSOR_API_KEY" >&2
             exit 1
           fi
       - name: Build verifier request
@@ -74,10 +83,13 @@ jobs:
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
         with:
           request-file: /tmp/verifier-request.json
           purpose: pr-verifier
           require-verdict: 'true'
+          exclude-families: ${{ steps.authors.outputs.exclude-families }}
       - name: Read ladder-call answer
         env:
           ANSWER_FILE: ${{ steps.ladder.outputs.answer-file }}

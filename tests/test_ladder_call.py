@@ -166,6 +166,39 @@ def write_vercel_then_opencode(port):
 
 
 class LadderCallTests(unittest.TestCase):
+    def test_excluded_family_is_never_called(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'PASS'}}],
+            }, None),
+        })
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        lanes = [
+            {'name': 'opencode-go', 'model': 'deepseek-v4.1-flash'},
+            {'name': 'google', 'model': 'gemini-2.5-flash'},
+        ]
+        for lane in lanes:
+            lane.update(key_env='STUB_API_KEY', url=f'http://127.0.0.1:{port}/v1/chat/completions')
+        with tempfile.TemporaryDirectory() as scratch:
+            plan = Path(scratch) / 'lanes.json'
+            plan.write_text(json.dumps(lanes), encoding='utf-8')
+            result = ladder_call({'STUB_API_KEY': 'stub'}, {'messages': []},
+                                 lanes_file=plan, args=('--exclude-families', 'deepseek,openai'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane opencode-go skipped: excluded family deepseek', result.stderr)
+        self.assertIn('lane google answered', result.stderr)
+        self.assertEqual([body['model'] for body in StubHandler.last_bodies], ['gemini-2.5-flash'])
+
+    def test_all_families_excluded_fails_before_checking_keys(self):
+        result = ladder_call({}, {'messages': []},
+                             args=('--exclude-families', 'deepseek,google,cursor'))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('all lanes excluded by author model families', result.stderr)
+        self.assertNotIn('no key', result.stderr)
+        self.assertEqual(result.stdout, '')
+
     def test_gateway_402_falls_to_opencode(self):
         server, port = run_server({
             '/v1/chat/completions': (402, {'error': 'payment'}, None),
@@ -929,6 +962,21 @@ class LintDirectModelCallsTests(unittest.TestCase):
             self.assertEqual(len(answers), 2)
             self.assertEqual(len(logs), 2)
             self.assertNotEqual(answers[0].name, answers[1].name)
+
+    def test_action_passes_family_exclusions_to_ladder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items() if not k.endswith('_API_KEY')}
+            env['RUNNER_TEMP'] = tmp
+            env['GITHUB_OUTPUT'] = os.path.join(tmp, 'output')
+            env['EXCLUDE_FAMILIES'] = 'deepseek,google,cursor'
+            request = Path(tmp) / 'request.json'
+            request.write_text('{"messages": []}', encoding='utf-8')
+            env['REQUEST_FILE'] = str(request)
+            result = subprocess.run(['bash', '-c', action_run_script()],
+                                    capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('all lanes excluded by author model families', result.stderr)
+        self.assertNotIn('no key', result.stderr)
 
     def test_flags_real_multiprompt_verifier_with_file_line(self):
         with tempfile.TemporaryDirectory() as tmp:

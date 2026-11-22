@@ -11,6 +11,10 @@ inputs:
     description: Skip a lane whose answer holds no PASS, PASS+NOTES or FAIL verdict.
     required: false
     default: 'false'
+  exclude-families:
+    description: Comma-separated model families whose lanes must not be called.
+    required: false
+    default: ''
 outputs:
   answer-file:
     description: Path to the provider response JSON.
@@ -38,6 +42,7 @@ runs:
       id: run
       shell: bash
       env:
+        EXCLUDE_FAMILIES: ${{ inputs.exclude-families }}
         GEMINI_API_KEY: ${{ env.GEMINI_API_KEY }}
         CURSOR_API_KEY: ${{ env.CURSOR_API_KEY }}
         AI_GATEWAY_API_KEY: ${{ env.AI_GATEWAY_API_KEY }}
@@ -50,7 +55,7 @@ runs:
         tag="$(printf '%s' "${{ inputs.purpose }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-$$-${RANDOM}" | sha256sum | cut -c1-12)"
         answer="${RUNNER_TEMP}/ladder-call-answer-${tag}.json"
         log="${RUNNER_TEMP}/ladder-call-${tag}.log"
-        args=(--purpose "${{ inputs.purpose }}")
+        args=(--purpose "${{ inputs.purpose }}" --exclude-families "${EXCLUDE_FAMILIES:-}")
         if [ "${{ inputs.require-verdict }}" = "true" ]; then
           args+=(--require-verdict)
         fi

@@ -266,7 +266,7 @@ def plans_from(cfg):
     return [plan for plan in plans if isinstance(plan, dict) and isinstance(plan.get("name"), str)]
 
 
-def plan_line(plan):
+def plan_line(plan, credit=None):
     models = ", ".join(str(model) for model in plan.get("included_models") or [])
     places = " and ".join(str(place) for place in plan.get("runs_on") or [])
     allowance = ""
@@ -287,7 +287,14 @@ def plan_line(plan):
             line += f" {usage['unit']}"
         line += f". Limit: {limit:g}" if limit is not None else ". Limit: unknown"
         line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
-    return line
+        if usage.get("used_up") and usage.get("used_up_at"):
+            line += f" Used up at {usage['used_up_at']}."
+    allowance = number(plan.get("usd_per_cycle"))
+    left = number((credit or {}).get("usd"))
+    if allowance is None or left is None:
+        return line
+    reset = f", resets {credit['resets_at']}" if credit.get("resets_at") else ""
+    return f"{line} ${left:.2f} of ${allowance:g} left this cycle{reset}."
 
 
 
@@ -453,7 +460,8 @@ def balance_deepseek(get, key):
 
 
 def balance_vercel(get, key):
-    return float(get("https://ai-gateway.vercel.sh/v1/credits", key("vercel-ai-gateway"))["token_pass"]["remaining"])
+    token_pass = get("https://ai-gateway.vercel.sh/v1/credits", key("vercel-ai-gateway"))["token_pass"]
+    return {"usd": float(token_pass["remaining"]), "resets_at": token_pass.get("resets_at")}
 
 
 def balance_openrouter(get, key):
@@ -465,6 +473,13 @@ def balance_openrouter(get, key):
 
 
 BALANCES = {"deepseek": balance_deepseek, "vercel": balance_vercel, "openrouter": balance_openrouter}
+
+
+def reading(reader, get, key):
+    got = reader(get, key)
+    entry = dict(got) if isinstance(got, dict) else {"usd": got}
+    entry["usd"] = round(float(entry["usd"]), 2)
+    return entry
 
 
 def read_credits(path=CREDITS):
@@ -496,10 +511,41 @@ def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers
         if not reader:
             continue
         try:
-            updates[name] = {"usd": round(reader(get, key), 2), "at": now}
+            updates[name] = dict(reading(reader, get, key), at=now)
         except Exception as exc:
             print(f"plan-pick: cannot read {name} credit: {type(exc).__name__}", file=sys.stderr)
     return save_credits(updates, path)
+
+
+def plan_credits(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
+    now = time.time() if now is None else now
+    every = (number(cfg.get("credit_refresh_minutes")) or DEFAULT_CREDIT_REFRESH_MINUTES) * 60
+    stale_s = (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+    data = read_credits(path)
+    due = []
+    for plan in plans:
+        name = plan.get("credit")
+        entry = data.get(name) if isinstance(name, str) else None
+        if isinstance(name, str) and (not isinstance(entry, dict) or number(entry.get("usd")) is None
+                                      or now - (number(entry.get("at")) or 0) > every):
+            due.append(name)
+    if due:
+        data = refresh(due, now, path)
+    fresh = {}
+    for plan in plans:
+        name = plan.get("credit")
+        entry = data.get(name) if isinstance(name, str) else None
+        if not isinstance(entry, dict):
+            continue
+        read_at, left = number(entry.get("at")), number(entry.get("usd"))
+        if read_at is not None and left is not None and now - read_at <= stale_s:
+            fresh[name] = entry
+    return fresh
+
+
+def plan_lines(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
+    credits = plan_credits(plans, cfg, now, path, refresh)
+    return [plan_line(plan, credits.get(plan.get("credit"))) for plan in plans]
 
 
 def credit_pool(entry, now, cfg):
@@ -908,8 +954,8 @@ def main(argv):
         if args.json:
             print(json.dumps(plans))
         else:
-            for plan in plans:
-                print(plan_line(plan))
+            for line in plan_lines(plans, cfg):
+                print(line)
             print(PLANS_NOTE)
         return 0
     warn = number(cfg.get("pace_warn_ratio")) or DEFAULT_PACE_WARN
