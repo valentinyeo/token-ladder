@@ -760,8 +760,20 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("Pool: google. Chat-only, never workers.", out.stdout)
         self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown.", out.stdout)
+        self.assertNotIn("Used up", out.stdout)
         plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
         self.assertEqual(next(plan for plan in plans if plan.get("pool") == "google")["usage"], usage)
+
+    def test_plans_names_google_used_up_and_the_time_seen(self):
+        usage = {"state": "OFF", "used": 3, "limit": None, "pace_ratio": None,
+                 "unit": "local history entries today (UTC)", "chat_only": True,
+                 "used_up": True, "used_up_at": "2026-11-22T09:05:00Z"}
+        out = self.run_cli({"google": usage}, "--plans")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown. "
+                      "Used up at 2026-11-22T09:05:00Z.", out.stdout)
+        plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
+        self.assertTrue(next(plan for plan in plans if plan.get("pool") == "google")["usage"]["used_up"])
 
     def test_plans_survives_unavailable_google_reading(self):
         out = self.cli("--plans", "--pools", "/nonexistent")
