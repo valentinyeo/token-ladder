@@ -43,6 +43,107 @@ def pick_with_burn(pools, burn_cfg, limits=None, **kw):
     return pp.pick(lanes, pools, limits if limits is not None else {}, T, burn=burn, **kw)
 
 
+class PrepaidCreditTests(unittest.TestCase):
+    def test_live_prepaid_credit_overrides_stale_estimate_not_monthly_usage(self):
+        cfg = pp.load_config()
+        live = {"at": NOW, "windows": month_full_windows(), "credits_usd": 24.64,
+                "credits_at": NOW, "resets_at": {"monthly": NOW + 8 * 86400}}
+        with mock.patch.object(pp, "read_opencode", return_value=live):
+            got = pp.opencode_pool(NOW, cfg, history([
+                {"at": NOW - 8 * 3600, "windows": month_full_windows(), "credits_usd": 5.87}]))
+        self.assertEqual(got["state"], "ON")
+        self.assertEqual(got["used_pct"], 100)
+        self.assertEqual(got["credits_usd"], 24.64)
+        self.assertEqual(pick({"opencode": got})["plan"], "opencode")
+        self.assertIn("included allowance used up", got["note"])
+        self.assertIn("monthly 100%, weekly 0%, 5-hour 0%", got["note"])
+
+    def live_state(self, credit=24.64, **changes):
+        live = {"at": NOW, "windows": month_full_windows(), "credits_usd": credit,
+                "credits_at": NOW, "resets_at": {"monthly": NOW + 8 * 86400}}
+        live.update(changes)
+        with mock.patch.object(pp, "read_opencode", return_value=live):
+            return pp.opencode_pool(NOW, pp.load_config(), tempfile.mkdtemp())
+
+    def test_prepaid_credit_floor_is_inclusive_and_configurable(self):
+        for credit, state in ((0, "OFF"), (1.99, "OFF"), (2, "OFF"), (2.01, "ON")):
+            with self.subTest(credit=credit):
+                got = self.live_state(credit)
+                self.assertEqual(got["state"], state)
+                self.assertIn("never top up", got["note"])
+        cfg = dict(pp.load_config(), opencode_credit_floor_usd=25)
+        with mock.patch.object(pp, "read_opencode", return_value={
+                "at": NOW, "windows": month_full_windows(), "credits_usd": 24.64, "credits_at": NOW}):
+            self.assertEqual(pp.opencode_pool(NOW, cfg)["state"], "OFF")
+
+    def test_missing_stale_future_or_invalid_credit_never_runs_prepaid(self):
+        for changes in ({"credits_usd": None}, {"credits_at": None}, {"credits_at": NOW - 8 * 3600},
+                        {"credits_at": NOW + 60}, {"credits_usd": float("nan")},
+                        {"credits_usd": float("inf")}):
+            with self.subTest(changes=changes):
+                self.assertEqual(self.live_state(**changes)["state"], "OFF")
+
+    def test_prepaid_requires_extra_usage_and_auto_topup_off(self):
+        for overrides in ({"opencode_extra_usage": False}, {"opencode_auto_topup": True},
+                          {"opencode_auto_topup": None}):
+            with mock.patch.object(pp, "load_config", return_value=dict(pp.load_config(), **overrides)):
+                self.assertEqual(self.live_state()["state"], "OFF")
+
+    def test_floor_holds_lane_until_renewal_then_included_allowance_reopens(self):
+        renewal = NOW + 8 * 86400
+        cfg = pp.load_config()
+        live = {"at": NOW, "windows": month_full_windows(), "credits_usd": 2,
+                "credits_at": NOW, "resets_at": {"monthly": renewal}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pp, "read_opencode", return_value=live):
+            path = str(Path(tmp, "limits.json"))
+            mark = pp.mark_limited
+            with mock.patch.object(pp, "mark_limited", side_effect=lambda lane, hours, now:
+                                   mark(lane, hours, now, path)):
+                got = pp.with_opencode({}, cfg, NOW)
+            limits = pp.read_limits(path)
+            self.assertEqual(limits["opencode"], renewal)
+            live.update(at=NOW + 60, credits_at=NOW + 60, credits_usd=24.64)
+            got = pp.with_opencode({}, cfg, NOW + 60)
+            self.assertEqual(pp.pick(LANES, got, limits, NOW + 60)["plan"], "vercel")
+            live.update(at=renewal, windows={"monthly": 0, "weekly": 0, "5-hour": 0})
+            got = pp.with_opencode({}, cfg, renewal)
+            self.assertEqual(pp.pick(LANES, got, limits, renewal)["plan"], "opencode")
+
+    def test_live_reader_executes_read_only_commands_and_keeps_zero_credit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp, "reader.py")
+            calls = Path(tmp, "calls.jsonl")
+            script.write_text("import json, sys\n"
+                              f"with open({str(calls)!r}, 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                              "if '--credits' in sys.argv:\n"
+                              f" print(json.dumps({{'at': {NOW}, 'credits_usd': 0}}))\n"
+                              "else:\n"
+                              " print(json.dumps({'measured_at': '2027-01-15T08:00:00Z', 'windows': ["
+                              "{'name': 'monthly', 'used': 100, 'resets_at': 1801000000}, "
+                              "{'name': 'weekly', 'used': 0}, {'name': '5-hour', 'used': 0}]}))\n")
+            reading = pp.read_opencode({"opencode_reader_command": [sys.executable, str(script)]})
+            self.assertEqual(reading["credits_usd"], 0)
+            self.assertEqual(reading["windows"], month_full_windows())
+            self.assertEqual([json.loads(line) for line in calls.read_text().splitlines()],
+                             [["--print"], ["--credits", "--print"]])
+
+    def test_deepseek_direct_is_retired_from_workers_and_ci(self):
+        cfg = pp.load_config()
+        self.assertNotIn("deepseek", [lane["lane"] for lane in pp.lanes_from(cfg)])
+        ci_lanes = json.loads(Path(REPO, "ci/lanes.json").read_text())
+        self.assertNotIn("deepseek", [lane["name"] for lane in ci_lanes])
+
+    def test_burn_includes_separate_measured_30_day_direct_cost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = pp.burn_report(pp.load_config(), NOW, tmp, str(Path(tmp, "missing")))
+        text = "\n".join(pp.burn_lines(report))
+        self.assertIn("$59.93", text)
+        self.assertIn("8.11B tokens", text)
+        self.assertIn("67,963 requests", text)
+        self.assertIn("30 days", text)
+        self.assertIn("$7.40 per 1B", text)
+
+
 class BurnTests(unittest.TestCase):
     def test_active_burn_picks_cursor_over_pace(self):
         limits = {lane["lane"]: T + 60 for lane in LANES if lane["lane"] not in ("cursor", "openrouter")}
@@ -433,7 +534,10 @@ def month_full_windows():
 
 class OpencodePoolTests(unittest.TestCase):
     def state(self, rows, cfg=None, now=NOW):
-        return pp.opencode_pool(now, pp.load_config() if cfg is None else cfg, history(rows))
+        windows = [row for row in rows if row.get("windows")]
+        live = max(windows, key=lambda row: row["at"]) if windows else None
+        with mock.patch.object(pp, "read_opencode", return_value=live):
+            return pp.opencode_pool(now, pp.load_config() if cfg is None else cfg, history(rows))
 
     def test_above_go_plus_allowance_never_runs_paid_extra_usage(self):
         row = json.loads(Path(REPO, "tests/fixtures/opencode-go-plus-exhausted.json").read_text())
@@ -453,9 +557,9 @@ class OpencodePoolTests(unittest.TestCase):
     def test_missing_file_refuses_paid_extra_usage(self):
         got = pp.opencode_pool(NOW, pp.load_config(), tempfile.mkdtemp())
         self.assertEqual(got["state"], "OFF")
-        self.assertIn("paid extra usage refused", got["note"])
+        self.assertIn("never top up", got["note"])
 
-    def test_full_month_never_runs_on_credit(self):
+    def test_full_month_never_runs_on_history_credit(self):
         for credit in (0, 5.9, 24.64, 1000, None):
             with self.subTest(credit=credit):
                 got = self.state([{"at": NOW - 600, "windows": month_full_windows(), "credits_usd": credit}])
@@ -477,7 +581,7 @@ class OpencodePoolTests(unittest.TestCase):
             with self.subTest(at=at):
                 got = self.state([{"at": at, "windows": {"monthly": 20}}])
                 self.assertEqual(got["state"], "OFF")
-                self.assertIn("missing or stale", got["note"])
+                self.assertIn("unavailable or stale", got["note"])
 
     def test_stale_exhaustion_stays_used_up(self):
         got = self.state([{"at": NOW - 24 * 3600, "windows": month_full_windows()}])
@@ -491,11 +595,11 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertIn("$2.00 of $200.00", got["note"])
 
     def test_credit_only_lines_are_ignored(self):
-        rows = [{"at": NOW - 600, "windows": {"monthly": 50}}, {"at": NOW - 60, "windows": {}, "credits_usd": 0.1}]
+        rows = [{"at": NOW - 60, "windows": {"monthly": 50}}, {"at": NOW - 60, "windows": {}, "credits_usd": 0.1}]
         self.assertEqual(self.state(rows)["state"], "ON")
 
     def test_windows_with_room_are_on(self):
-        got = self.state([{"at": NOW - 600, "windows": {"rolling": 20, "weekly": 40, "monthly": 60}}])
+        got = self.state([{"at": NOW - 60, "windows": {"rolling": 20, "weekly": 40, "monthly": 60}}])
         self.assertEqual(got["state"], "ON")
 
     def test_full_short_window_is_off(self):
@@ -508,7 +612,7 @@ class OpencodePoolTests(unittest.TestCase):
         tmp = tempfile.mkdtemp()
         Path(tmp, "opencode-history.jsonl").write_text("not json\n[]\n" + json.dumps(
             {"at": NOW - 60, "windows": {"monthly": 5}}) + "\n")
-        self.assertEqual(pp.opencode_pool(NOW, pp.load_config(), tmp)["state"], "ON")
+        self.assertEqual(pp.opencode_pool(NOW, pp.load_config(), tmp)["state"], "OFF")
 
     def test_injected_opencode_state_is_never_overwritten(self):
         pools = {"opencode": pool("OFF")}
@@ -577,7 +681,7 @@ class ConfigTests(unittest.TestCase):
         cfg = pp.load_config()
         lanes = pp.lanes_from(cfg)
         self.assertEqual([lane["lane"] for lane in lanes],
-                         ["opencode", "vercel", "openrouter", "deepseek", "codex", "cursor"])
+                         ["opencode", "vercel", "openrouter", "codex", "cursor"])
         self.assertEqual(cfg["pace_warn_ratio"], pp.DEFAULT_PACE_WARN)
 
     def test_shipped_commands_obey_the_model_rules(self):
@@ -722,13 +826,24 @@ class CommandTests(unittest.TestCase):
         (self.pacing / "opencode-history.jsonl").write_text(
             json.dumps({"at": datetime.now(timezone.utc).timestamp(),
                         "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 0.0}}) + "\n")
+        reader = Path(self.home, "reader.py")
+        reader.write_text("import json, os, sys\n"
+                          "from datetime import datetime, timezone\n"
+                          "from pathlib import Path\n"
+                          "row = json.loads((Path(os.environ['PLAN_PICK_PACING_DIR']) / 'opencode-history.jsonl').read_text().splitlines()[-1])\n"
+                          "if '--credits' in sys.argv:\n"
+                          " print(json.dumps({'at': row['at'], 'credits_usd': row.get('credits_usd')}))\n"
+                          "else:\n"
+                          " print(json.dumps({'measured_at': datetime.fromtimestamp(row['at'], timezone.utc).isoformat(), 'windows': [{'name': k, 'used': v} for k, v in row['windows'].items()]}))\n")
+        self.local_config = str(Path(self.home, "local.json"))
+        Path(self.local_config).write_text(json.dumps({"opencode_reader_command": [sys.executable, str(reader)]}))
 
     def cli(self, *args):
         return subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), *args],
                               capture_output=True, text=True,
                               env={"HOME": self.home, "PATH": "/usr/bin:/bin",
                                    "PLAN_PICK_PACING_DIR": str(self.pacing),
-                                   "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
+                                   "TOKEN_LADDER_LOCAL_CONFIG": self.local_config})
 
     def run_cli(self, pools, *args):
         path = Path(self.home) / "pools.json"
@@ -741,7 +856,7 @@ class CommandTests(unittest.TestCase):
         pools.write_text("{}")
         env = {"HOME": home, "PATH": "/usr/bin:/bin",
                "PLAN_PICK_PACING_DIR": str(self.pacing),
-               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+               "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
         cmd = [sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--pools", str(pools)]
         for lane in earlier:
             subprocess.run(cmd + ["--limited", lane], capture_output=True, text=True, env=env)
@@ -775,7 +890,7 @@ class CommandTests(unittest.TestCase):
         pools.write_text("{}")
         env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
                "PLAN_PICK_PACING_DIR": str(self.pacing),
-               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+               "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
         out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
                              capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -793,7 +908,7 @@ class CommandTests(unittest.TestCase):
         pools.write_text("{}")
         env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
                "PLAN_PICK_PACING_DIR": str(self.pacing),
-               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+               "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
         out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
                              capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -821,7 +936,7 @@ class CommandTests(unittest.TestCase):
                              capture_output=True, text=True,
                              env={"HOME": self.home, "PATH": "/usr/bin:/bin",
                                   "PLAN_PICK_PACING_DIR": str(self.pacing),
-                                  "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
+                                  "TOKEN_LADDER_LOCAL_CONFIG": self.local_config})
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout, "included-worker\n")
         self.assertIn("used up", out.stderr)
@@ -837,10 +952,9 @@ class CommandTests(unittest.TestCase):
     def test_not_vendor_excludes_each_lane_by_its_own_vendor(self):
         cases = (("opencode", (), "vercel"),
                  ("vercel", ("opencode",), "openrouter"),
-                 ("openrouter", ("opencode", "vercel"), "deepseek"),
-                 ("deepseek", ("opencode", "vercel", "openrouter"), "codex"),
-                 ("codex", ("opencode", "vercel", "openrouter", "deepseek"), "cursor"),
-                 ("cursor", ("opencode", "vercel", "openrouter", "deepseek", "codex"), None))
+                 ("openrouter", ("opencode", "vercel"), "codex"),
+                 ("codex", ("opencode", "vercel", "openrouter"), "cursor"),
+                 ("cursor", ("opencode", "vercel", "openrouter", "codex"), None))
         for vendor, earlier, expected in cases:
             with self.subTest(vendor=vendor):
                 out = self.plan_not_from(vendor, earlier)
@@ -865,7 +979,7 @@ class CommandTests(unittest.TestCase):
         pools.write_text("{}")
         env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
                "PLAN_PICK_PACING_DIR": str(self.pacing),
-               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+               "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
         out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools),
                               "--run", "--not-vendor", "vercel"], capture_output=True, text=True, env=env)
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -894,7 +1008,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("OpenCode Go Plus", out.stdout)
         self.assertIn("$40/month; $200 included allowance", out.stdout)
-        self.assertIn("Status: used up", out.stdout)
+        self.assertIn("Status: included allowance used up; extra usage OFF", out.stdout)
         self.assertIn("monthly 112.5%, weekly 0%, 5-hour 0%", out.stdout)
         self.assertNotIn("24.64", out.stdout)
 
@@ -926,6 +1040,9 @@ class CommandTests(unittest.TestCase):
             plan.pop("usage", None)
             plan.pop("status", None)
             plan.pop("note", None)
+            plan.pop("windows", None)
+            plan.pop("credits_usd", None)
+            plan.pop("resets_at", None)
         self.assertEqual(plans, pp.plans_from(pp.load_config()))
 
     def test_plans_prints_google_count_without_claiming_a_known_quota(self):
@@ -983,7 +1100,7 @@ class CommandTests(unittest.TestCase):
         out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--json"],
                              capture_output=True, text=True,
                              env={"HOME": tempfile.mkdtemp(), "PATH": "/usr/bin:/bin",
-                                  "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
+                                  "TOKEN_LADDER_LOCAL_CONFIG": self.local_config})
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(json.loads(out.stdout)["plan"], ("vercel", "deepseek", "opencode", "codex", "cursor", "openrouter", "none"))
 

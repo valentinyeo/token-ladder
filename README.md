@@ -55,8 +55,33 @@ Valentin has **OpenCode Go Plus**, $40/month with a $200 monthly DeepSeek allowa
 `config.json` `plans` holds the price and allowance. The reader converts the monthly percentage to dollars against that allowance.
 `plan-pick --plans` shows the monthly, weekly, and 5-hour readings separately.
 A monthly reading of 100% or more means used up, even when weekly and 5-hour readings are zero.
-Workers never fall back to OpenCode extra usage or prepaid credit. Missing or stale monthly readings also close the lane until a fresh reading arrives.
-The reader uses `~/.local/state/pacing/opencode-history.jsonl`; it does not estimate an extra-usage balance from token counts.
+Valentin's 2026-11-22 dashboard showed $24.64 available credit, monthly 100% used, weekly 0%, and 5-hour 0%.
+The monthly renewal was 30 November, about 8 days and 1 hour away. Weekly reset was 2 hours and 19 minutes away.
+Extra Usage is on. Enabled models are `beam-free`, `deepseek-v4.1-flash`, and `glm-5.3-flash`; workers still use DeepSeek Flash only.
+
+Prepaid credit already held gets used. Once the included allowance is gone, workers use OpenCode Extra Usage only while live available credit is above `opencode_credit_floor_usd`, which defaults to $2.
+At or below the floor, the lane is skipped until the monthly renewal. Worker selection records that renewal in the existing lane-limits file, so a later balance change cannot reopen it early.
+Auto top-up is OFF. The reader never purchases credit or changes billing settings.
+
+`opencode_reader_command` configures the installed read-only `opencode-read` command.
+Every pick without an injected OpenCode pool and every `--plans` call runs it with `--print` for current quota windows, then `--credits --print` for current console credit.
+The usage API has no dollar balance. The console credit command requires an open, signed-in Multiprompt browser pane.
+Each command has a 180-second timeout. Failed credit reads never reuse history or extrapolate token costs.
+Live usage must be no older than five minutes; live credit must be no older than one minute.
+Missing or stale live data closes the lane. Historical windows remain visible for diagnosis, labelled unavailable or stale, but cannot authorize a worker.
+The live monthly reset is authoritative; `opencode_monthly_renewal` is the fallback date confirmed by Valentin.
+
+## Rules
+
+| Rule | Enforced by |
+|---|---|
+| Use prepaid credit already held down to its floor; never top up automatically. OpenCode stops at $2 until monthly renewal. | `PrepaidCreditTests.test_prepaid_credit_floor_is_inclusive_and_configurable`, `test_floor_holds_lane_until_renewal_then_included_allowance_reopens`, `test_live_reader_executes_read_only_commands_and_keeps_zero_credit` in `tests/test_plan_pick.py` |
+| Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Only live credit can authorize Extra Usage. | `PrepaidCreditTests.test_live_prepaid_credit_overrides_stale_estimate_not_monthly_usage`, `test_missing_stale_future_or_invalid_credit_never_runs_prepaid` |
+| DeepSeek direct is retired; no more top-ups or worker/CI selection. | `PrepaidCreditTests.test_deepseek_direct_is_retired_from_workers_and_ci` |
+
+### Lane history
+
+2026-11-22: retired DeepSeek direct at a -$0.01 balance, with no more top-ups. It previously ran after OpenRouter in the worker order and was also a CI fallback.
 
 ## Monthly burn report
 
@@ -74,6 +99,9 @@ The report never reads or prints worker briefs, messages, or credentials.
 Recorded costs are not invoices or extra-usage charges. They do not distinguish included usage from paid usage.
 Missing costs remain unknown, with an unpriced-message count; the report never estimates dollars from token counts.
 Codex and Cursor launches without pi cost records show unknown spend rather than zero.
+
+The report also includes Valentin's separate DeepSeek direct account measurement as of 2026-11-22: **$59.93 for 8.11B tokens over 67,963 requests in 30 days**, about **$7.40 per 1B tokens**, approximately 98.7% cached.
+This is a measured account total, not a list-price estimate. It is shown separately and never added to the calendar-month pi cost totals.
 
 ## Loop interval
 
@@ -155,7 +183,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 |---|---|---|
 | Claude | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from `~/.claude/.credentials.json` | `five_hour`, `seven_day` (utilization %, `resets_at`) |
 | Codex | `rate_limits` in the newest `~/.codex/sessions/**/*.jsonl` token_count event (or `codex app-server` rate limit call) | `primary` weekly (`used_percent`, `resets_at`), credits balance |
-| OpenCode Go Plus ($40/month) | `~/.local/state/pacing/opencode-history.jsonl`; `plan-pick --plans` | $200 monthly DeepSeek allowance; monthly 100% means used up; weekly and 5-hour limits also apply; no paid extra usage for workers |
+| OpenCode Go Plus ($40/month) | `opencode-read --print` and `--credits --print`; `plan-pick --plans` | Separate monthly, weekly and 5-hour windows; $200 included allowance; live prepaid credit above $2 after included allowance is gone; never top up |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
 | Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
 | Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; chat-only |
@@ -329,7 +357,7 @@ Anthropic directly. Use the shared lane ladder in this repo instead.
 `max_tokens` and `response_format`) and `--purpose <label>`. It walks the lanes
 in `ci/lanes.json` when the matching key env var is set:
 `GEMINI_API_KEY`, `CURSOR_API_KEY`, `AI_GATEWAY_API_KEY`, `OPENCODE_API_KEY`,
-`DEEPSEEK_API_KEY`, `OPENROUTER_API_KEY`. The `cursor` lane runs
+`OPENROUTER_API_KEY`. DeepSeek direct is retired, so `DEEPSEEK_API_KEY` is not selected. The `cursor` lane runs
 `cursor-agent` headless; the composite action installs it on the runner when
 needed.
 On payment or quota errors, rate limits, missing models (`404`, `408`, `425`),
@@ -344,7 +372,6 @@ JSON goes on stdout, and exit `3` means every lane failed.
     CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
     AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
     OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-    DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
     OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
   with:
     request-file: request.json

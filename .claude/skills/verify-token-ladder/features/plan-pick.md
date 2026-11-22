@@ -10,6 +10,8 @@ plan-pick chooses a worker lane from pool state, prints human or JSON plans, gat
 - `loop-interval` prints sleep seconds from Claude pace state.
 - `claude-helper` allows or refuses Sonnet helper use from pool pace.
 - `run-stub` runs a stub lane command end to end without real spend.
+- `prepaid-credit` reads OpenCode windows and console credit live, uses held prepaid credit above $2, and waits until monthly renewal once the floor is reached.
+- `burn` reports current-month recorded pi costs and the separate measured 30-day DeepSeek direct account total.
 
 ## How to get to it (user POV)
 
@@ -31,6 +33,12 @@ Preconditions:
 - **Loop interval.** Run `bin/plan-pick --pools "$HOME/pools.json" --loop-interval --json` with pools `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.16}}`. Exit `0`. stdout JSON has `"seconds":10800` and `"reason":"claude pace 1.16x ahead"`.
 - **Claude helper refused.** Run `bin/plan-pick --pools "$HOME/pools.json" --claude-helper` with `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.8}}`. Exit `3`. stdout starts with `Claude helper: refused.`
 - **Stub run.** In a temp dir, copy `bin/plan-pick`, write `config.json` with lanes `a` (`echo '429'; exit 1`) then `b` (`echo worker-done`), empty pools file, run `bin/plan-pick --pools "$HOME/pools.json" --run`. Exit `0`. stdout contains `worker-done`. stderr mentions `lane a hit a rate or usage limit`.
+
+## Credit and retirement regression
+
+Run `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k PrepaidCreditTests`.
+These checks use an isolated command stub, never a real key or browser. They prove monthly 100% with weekly/5-hour 0% uses $24.64 live credit rather than an 8-hour-old $5.87 estimate.
+They cover the inclusive $2 floor, renewal hold, stale or missing live credit, read-only command flags, DeepSeek direct retirement from workers and CI, and the separate measured burn report.
 
 ## Gotchas
 
