@@ -406,6 +406,34 @@ remain in their original worktree; their contents and environment credentials
 are never copied into the record. This is a handoff snapshot, not a worktree
 backup or an ownership grant.
 
+## Gateway spend report
+
+Run `python3 tools/measure-burn.py --gateway` for the Vercel AI Gateway report without CPU sampling.
+The existing full burn report also includes this view.
+It reads `AI_GATEWAY_API_KEY`, falling back to `pi auth print-api-key --provider vercel-ai-gateway`.
+Keys stay in memory and are never printed.
+
+The report uses `/v1/credits` to derive the monthly Token Pass cycle from `token_pass.resets_at`.
+It queries `/v1/report` twice, grouped by model and tag, across the team rather than just the reporting key.
+Spend uses `total_cost`, not `market_cost`.
+Only `caller=` tags count toward caller totals; `untagged` is the remaining spend without a caller tag.
+Each request must carry at most one `caller=` tag.
+PR, brief and ticket tags overlap caller tags and are not added again.
+
+The API accepts inclusive UTC dates, not timestamps.
+The first date therefore includes spend before the cycle's reset hour.
+The report prints both the cycle timestamps and this date-only limitation.
+Reports can lag a few minutes.
+Malformed reports and unavailable credentials produce an explicit error, never a fabricated zero.
+The gateway-only command exits `1` when no report is available.
+
+[Vercel's reporting reference](https://vercel.com/docs/ai-gateway/observability-and-spend/custom-reporting)
+documents the API, tags, and pricing.
+Reporting requires Pro or Enterprise and a regular AI Gateway key.
+Token Pass-scoped keys return HTTP `403` for `/v1/report` even when `/v1/credits` works.
+Do not mint a key or upgrade a plan without the owner's approval.
+Vercel charges for tag writes and reporting queries.
+
 ## CI model calls
 
 GitHub checks that need a hosted chat completion should not call DeepSeek,
@@ -436,6 +464,19 @@ JSON goes on stdout, and exit `3` means every lane failed.
     request-file: request.json
     purpose: pr-verifier
 ```
+
+Every Vercel ladder call, including a verdict retry, sends the documented `ai-reporting-tags` header.
+The caller tag is `caller=<repo>-<job>`, using the repository name without its owner and `github.job`.
+Set the optional `caller` action input to override the job slug, for example `verifier` produces `caller=multiprompt-verifier`.
+The action adds `pr=<number>` on `pull_request` and `pull_request_target` events.
+Direct CLI calls outside Actions default to `caller=token-ladder-cli`.
+Slugs accept only letters, digits, underscores and hyphens; long caller tags use a hash suffix within Vercel's 64-character limit.
+Never put secrets, prompts, user IDs, branch names or other user data in `caller`.
+
+The plan-pick Vercel pi extension sends `providerOptions.gateway.tags` with `caller=plan-pick-worker`,
+`brief=<12-character SHA-256 prefix of the worker directory>` and, when the brief has a `Ticket VSTA-136` line, `ticket=VSTA-136`.
+Raw directory names and brief text are never tagged.
+Provider pins remain unchanged, and non-Vercel lanes receive no new reporting tags.
 
 `ci/lint-direct-model-calls` scans `.github/` and `tools/` for direct provider
 URLs, direct reads of model API key env vars in code, and repo-local model

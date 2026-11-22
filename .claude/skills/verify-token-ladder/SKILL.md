@@ -12,7 +12,7 @@ Surface: Python CLI (`bin/token-ladder`, `bin/plan-pick`) and CI helpers (`ci/la
 No server. From the repo root:
 
 ```
-python3 -m py_compile bin/token-ladder bin/plan-pick bin/check-tests-changed tests/*.py ci/ladder-call ci/model_families.py ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py && echo COMPILE_OK
+python3 -m py_compile bin/token-ladder bin/plan-pick bin/check-tests-changed bin/gateway_burn.py tests/*.py ci/ladder-call ci/model_families.py ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py && echo COMPILE_OK
 ```
 
 ## Doctor

@@ -1,0 +1,16 @@
+{
+  "credits": {"balance": "1.21", "token_pass": {"remaining": "56.44", "resets_at": "2026-12-05T08:00:00.000Z"}},
+  "models": {"results": [
+    {"model": "moonshotai/kimi-k3", "total_cost": 21.67, "market_cost": 25, "request_count": 1059},
+    {"model": "deepseek/deepseek-v4.1-flash", "total_cost": "1.25", "market_cost": 2, "request_count": 10},
+    {"model": "byok/model", "total_cost": 0, "market_cost": 5, "request_count": 2}
+  ]},
+  "tags": {"results": [
+    {"tag": "caller=multiprompt-verifier", "total_cost": "0.75", "request_count": 5},
+    {"tag": "caller=plan-pick-worker", "total_cost": 0.5, "request_count": 5},
+    {"tag": "pr=42", "total_cost": "0.75", "request_count": 5},
+    {"tag": "ticket=VSTA-136", "total_cost": 0.5, "request_count": 5},
+    {"tag": "brief=c1f543c2bce0", "total_cost": 0.5, "request_count": 5},
+    {"tag": null, "total_cost": 21.67, "request_count": 1059}
+  ]}
+}
