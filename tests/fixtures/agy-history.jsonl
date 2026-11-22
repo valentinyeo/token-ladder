@@ -1,0 +1,12 @@
+{"display":"previous day", "timestamp":1795305599000,"workspace":"/fixture"}
+{"display":"midnight prompt", "timestamp":1795305600000,"workspace":"/fixture"}
+{"display":"second prompt", "timestamp":1795348799000,"workspace":"/fixture"}
+{"display":"current prompt", "timestamp":1795348800000,"workspace":"/fixture"}
+{"display":"future prompt", "timestamp":1795348801000,"workspace":"/fixture"}
+{"timestamp":true}
+{"timestamp":"1795348799000"}
+{"timestamp":null}
+{"timestamp":-1}
+{"timestamp":NaN}
+[]
+{broken

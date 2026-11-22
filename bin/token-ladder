@@ -820,6 +820,32 @@ def read_grok(now, cfg=None):
         return {}
 
 
+def read_google(now):
+    pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
+            "pace_ratio": None, "chat_only": True, "used": None, "limit": None,
+            "unit": "local history entries today (UTC)", "estimated": True,
+            "source": "agy local history timestamps; Antigravity quota unavailable"}
+    start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    used, seen = 0, False
+    try:
+        with open(os.path.join(HOME, ".gemini/antigravity-cli/history.jsonl")) as f:
+            for line in f:
+                try:
+                    stamp = json.loads(line).get("timestamp")
+                except (ValueError, AttributeError):
+                    continue
+                if isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not 0 <= stamp <= now * 1000:
+                    continue
+                seen = True
+                if stamp >= start * 1000:
+                    used += 1
+    except (OSError, UnicodeError):
+        return pool
+    if seen:
+        pool["used"] = used
+    return pool
+
+
 def write_state(name, data):
     os.makedirs(STATE, exist_ok=True)
     path = None
@@ -867,6 +893,7 @@ def current_pools(s=None, now=None):
                               (s.get(name) or {}).get("five_hour"), cfg, now, 95 if name == "claude" else None)
              for name in ("claude", "codex")}
     pools["grok"] = pool_state(read_grok(now, cfg), None, cfg, now)
+    pools["google"] = read_google(now)
     balance = codex_credits_left(s, cfg)
     if balance is not None and pools["codex"]["state"] in ("WARN", "OFF"):
         pools["codex"].update(state="ON", credits=balance)

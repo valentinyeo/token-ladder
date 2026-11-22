@@ -590,6 +590,46 @@ class PlansTests(unittest.TestCase):
                 self.assertEqual(pp.plans_from(cfg), [])
 
 
+class GoogleWorkerExclusionTests(unittest.TestCase):
+    def test_google_pool_or_lane_is_never_picked_even_without_a_reading(self):
+        for lane in ({"lane": "google", "pool": None, "command": "echo forbidden"},
+                     {"lane": "renamed", "pool": "google", "command": "echo forbidden"}):
+            for reading in (None, {}, pool("ON", 0.1), pool("OFF"), pool("ON", 2.0)):
+                pools = {} if reading is None else {"google": reading}
+                with self.subTest(lane=lane, reading=reading):
+                    burn = {"lane": lane["lane"], "until": T + 60}
+                    got = pp.pick([lane], pools, now=T, burn=burn)
+                    self.assertEqual(got["plan"], "none")
+                    self.assertIsNone(got["command"])
+                    self.assertIn("chat-only", got["reason"])
+
+    def test_worker_fallback_and_least_ahead_selection_exclude_google(self):
+        google = {"lane": "google", "pool": "google", "command": "echo forbidden"}
+        worker = {"lane": "worker", "pool": "worker", "command": "echo allowed"}
+        for ratio in (0.1, 2.0):
+            with self.subTest(ratio=ratio):
+                got = pp.pick([google, worker], {"google": pool("ON", 0.0), "worker": pool("ON", ratio)}, now=T)
+                self.assertEqual(got["plan"], "worker")
+
+    def test_run_never_launches_google(self):
+        lane = {"lane": "google", "pool": "google", "command": "echo forbidden"}
+        runner = mock.Mock(side_effect=AssertionError("no Google worker"))
+        with tempfile.TemporaryDirectory() as home:
+            result = pp.run_lanes([lane], {}, {}, 1.1, runner=runner,
+                                  limits_path=os.path.join(home, "limits.json"), now=T, say=lambda text: None,
+                                  launches_path=os.path.join(home, "launches.jsonl"))
+        self.assertEqual(result, 4)
+        runner.assert_not_called()
+
+    def test_google_is_a_chat_only_plan_without_a_shipped_lane(self):
+        cfg = pp.load_config()
+        google = next(plan for plan in pp.plans_from(cfg) if plan["vendor"] == "google")
+        self.assertEqual(google["pool"], "google")
+        self.assertTrue(google["chat_only"])
+        self.assertFalse(any(lane.get("pool") == "google" or lane["lane"] == "google"
+                             for lane in pp.lanes_from(cfg)))
+
+
 class WorkerEnvTests(unittest.TestCase):
     def setUp(self):
         self.shims = str(Path(REPO).resolve() / "bin" / "worker-shims")
@@ -701,10 +741,32 @@ class CommandTests(unittest.TestCase):
         self.assertIn("Included means no extra cost: never quote API pricing or ask for a spend cap for these.",
                       out.stdout)
 
-    def test_plans_json_is_the_config_list(self):
+    def test_plans_json_includes_config_and_google_usage(self):
         out = self.cli("--plans", "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(json.loads(out.stdout), pp.plans_from(pp.load_config()))
+        plans = json.loads(out.stdout)
+        google = next(plan for plan in plans if plan["vendor"] == "google")
+        self.assertEqual(google["usage"]["state"], "unknown")
+        self.assertTrue(google["usage"]["chat_only"])
+        self.assertIsNone(google["usage"]["limit"])
+        for plan in plans:
+            plan.pop("usage", None)
+        self.assertEqual(plans, pp.plans_from(pp.load_config()))
+
+    def test_plans_prints_google_count_without_claiming_a_known_quota(self):
+        usage = {"state": "unknown", "used": 3, "limit": None, "pace_ratio": None,
+                 "unit": "local history entries today (UTC)", "chat_only": True}
+        out = self.run_cli({"google": usage}, "--plans")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Pool: google. Chat-only, never workers.", out.stdout)
+        self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown.", out.stdout)
+        plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
+        self.assertEqual(next(plan for plan in plans if plan.get("pool") == "google")["usage"], usage)
+
+    def test_plans_survives_unavailable_google_reading(self):
+        out = self.cli("--plans", "--pools", "/nonexistent")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Pool: google. Chat-only, never workers. Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
 
     def test_limited_unknown_lane_fails(self):
         out = self.cli("--limited", "baseten")

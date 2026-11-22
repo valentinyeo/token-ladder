@@ -1,6 +1,6 @@
 # token-ladder
 
-Token Ladder is the live usage reader for three subscription pools: Claude, Codex (including `hax`) and Grok.
+Token Ladder reads subscription usage for Claude, Codex (including `hax`), Grok and Google Antigravity. Google is a chat-only pool, never a worker lane.
 
 `collect` runs on a timer and writes the state. `pools --json` prints the current pool states for any caller. `grok-set` records a Grok reading. Nothing here chooses a plan, reserves a pool, launches a session or holds a lease: those rules live in `spawn-worker` code and in the valentin-mode skill.
 
@@ -33,6 +33,21 @@ The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lan
 `ci/ladder-call` sends them as `providerOptions.gateway` and `provider` in the request body.
 The two pi lanes on those providers load `tools/pi-lane-pins.mjs` with `-e`, and that extension writes the same two fields from the same file through pi's `before_provider_request` hook.
 Change the pin in `ci/lanes.json` and both paths follow.
+
+## Google Antigravity usage
+
+`plan-pick --plans` shows the `google` pool as chat-only with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. Worker selection rejects this pool even if a local config adds a lane or burn override for it.
+
+The read-only fallback counts `timestamp` metadata in `~/.gemini/antigravity-cli/history.jsonl` from midnight UTC through now. These timestamps are milliseconds since the Unix epoch. The count covers local history entries, which can include slash commands, not model requests, tokens or quota consumption. Other devices, retries, tool calls and unrecorded chats are not counted. The reader never opens credential or token files, calls a quota endpoint, signs in, buys overages or runs an agent.
+
+Missing, unreadable, empty or wholly invalid history produces unknown usage. Malformed records and future timestamps are ignored. An older valid history produces zero local entries today, not proof of zero account usage. Quota percentage, limit, reset and pace remain unknown even when a local count is available. A missing Google reading never stops `plan-pick`.
+
+### Quota source investigation, 2026-11-22
+
+- `agy --help` lists no status or usage subcommand. No prompt was run.
+- Local cache metadata, state field names and SQLite schemas expose conversation metadata, not a quota snapshot. CLI logs refer to `retrieveUserQuotaSummary` but contain no usable quota reading. Credential and token files were not opened.
+- [Google's Antigravity plans](https://antigravity.google/docs/plans.md) describes Pro and Ultra quotas refreshing every five hours, with weekly limits. Quota depends on work and available capacity. Google publishes **no numeric daily Antigravity limit** there. Account-specific quota is shown on the app's Settings page, which this reader does not access.
+- The [Gemini CLI quota table](https://geminicli.com/docs/resources/quota-and-pricing/) lists daily request caps of 1,000 for individuals, 1,500 for AI Pro and 2,000 for AI Ultra. These are Gemini CLI limits, not an Antigravity daily allowance. Applying 1,500 to this pool would invent a limit. The exact subscribed tier is also unconfirmed.
 
 ## OpenCode monthly allowance
 
@@ -122,6 +137,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 | Codex | `rate_limits` in the newest `~/.codex/sessions/**/*.jsonl` token_count event (or `codex app-server` rate limit call) | `primary` weekly (`used_percent`, `resets_at`), credits balance |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
 | Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
+| Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; chat-only |
 
 ## Core idea: pace, not percent
 
