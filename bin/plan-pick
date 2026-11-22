@@ -287,6 +287,8 @@ def plan_line(plan, credit=None):
             line += f" {usage['unit']}"
         line += f". Limit: {limit:g}" if limit is not None else ". Limit: unknown"
         line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
+        if usage.get("used_up") and usage.get("used_up_at"):
+            line += f" Used up at {usage['used_up_at']}."
     allowance = number(plan.get("usd_per_cycle"))
     left = number((credit or {}).get("usd"))
     if allowance is None or left is None:
