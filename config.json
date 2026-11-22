@@ -16,11 +16,24 @@
   },
   "lanes": [
     {
+      "lane": "opencode",
+      "vendor": "deepseek",
+      "pool": "opencode",
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
       "lane": "vercel",
       "credit": "vercel",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "openrouter",
+      "credit": "openrouter",
+      "vendor": "deepseek",
+      "pool": null,
+      "command": "~/.npm-global/bin/pi -p --thinking medium --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "deepseek",
@@ -28,12 +41,6 @@
       "vendor": "deepseek",
       "pool": null,
       "command": "~/.npm-global/bin/pi -p --thinking medium --provider deepseek --model deepseek-flash \"$(cat brief.txt)\" </dev/null"
-    },
-    {
-      "lane": "opencode",
-      "vendor": "deepseek",
-      "pool": "opencode",
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "codex",
@@ -46,13 +53,6 @@
       "vendor": "cursor",
       "pool": "grok",
       "command": "~/.local/bin/cursor-agent -p --force --output-format text --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
-    },
-    {
-      "lane": "openrouter",
-      "credit": "openrouter",
-      "vendor": "deepseek",
-      "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
     }
   ],
   "plans": [

@@ -156,10 +156,18 @@ def call_lane(lane, key, body):
         'Content-Type': 'application/json',
         'User-Agent': 'token-ladder-ladder-call/1',
     }
-    if lane['name'] == 'opencode-go' and os.environ.get('GITHUB_RUN_ID'):
-        headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+    if lane['name'] == 'opencode-go':
+        if os.environ.get('GITHUB_RUN_ID'):
+            headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+        else:
+            headers['x-opencode-session'] = 'token-ladder-ladder-call'
     payload = dict(body)
     payload['model'] = lane['model']
+    if lane['name'] == 'vercel-ai-gateway':
+        payload['providerOptions'] = {'gateway': {'only': ['token-pass']}}
+    provider = lane.get('provider')
+    if isinstance(provider, dict) and provider:
+        payload['provider'] = provider
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_seconds()) as response:
         raw = response.read()

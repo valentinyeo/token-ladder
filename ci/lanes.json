@@ -20,19 +20,23 @@
   {
     "name": "opencode-go",
     "key_env": "OPENCODE_API_KEY",
-    "url": "https://opencode.ai/zen/go/v1/chat/completions",
+    "url": "https://opencode.ai/inference/go/v1/chat/completions",
     "model": "deepseek-v4.1-flash"
   },
   {
     "name": "deepseek",
     "key_env": "DEEPSEEK_API_KEY",
     "url": "https://api.deepseek.com/chat/completions",
-    "model": "deepseek-v4.1-flash"
+    "model": "deepseek-flash"
   },
   {
     "name": "openrouter",
     "key_env": "OPENROUTER_API_KEY",
     "url": "https://openrouter.ai/api/v1/chat/completions",
-    "model": "deepseek/deepseek-v4.1-flash"
+    "model": "deepseek/deepseek-v4.1-flash-1017",
+    "provider": {
+      "only": ["StreamLake"],
+      "allow_fallbacks": false
+    }
   }
 ]
