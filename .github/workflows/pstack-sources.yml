@@ -51,6 +51,7 @@ jobs:
           BRIEF
           printf '\nPR number: %s\nPR base SHA: %s\n' '${{ github.event.pull_request.number }}' "$PR_BASE" >> /tmp/verify.md
           gh pr diff '${{ github.event.pull_request.number }}' >> /tmp/verify.md
+          printf '\nAnswer now. First line exactly PASS, PASS+NOTES, or FAIL, alone with no markdown and nothing before it. Do not propose or run commands. Then short notes.\n' >> /tmp/verify.md
       - name: Require model keys
         env:
           AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}

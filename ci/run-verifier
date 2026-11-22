@@ -54,7 +54,11 @@ def run(out, prompt_file, env):
             "or OPENROUTER_API_KEY\n"
         )
         return 1
-    prompt = Path(prompt_file).read_text(encoding="utf-8")
+    prompt = Path(prompt_file).read_text(encoding="utf-8").rstrip()
+    prompt += (
+        "\n\nAnswer now. First line exactly PASS, PASS+NOTES, or FAIL, alone with no markdown "
+        "and nothing before it. Do not propose or run commands. Then short notes.\n"
+    )
     request = {
         "messages": [
             {"role": "system", "content": SYSTEM},

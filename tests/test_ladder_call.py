@@ -375,7 +375,8 @@ class LadderCallTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('lane agent-lane skipped: no verdict', result.stderr)
-        self.assertIn('lane verdict-lane answered', result.stderr)
+        self.assertIn('lane agent-lane no-verdict answer tail:', result.stderr)
+        self.assertIn('verdict-lane answered', result.stderr)
 
     def test_require_verdict_env_var(self):
         server, port = run_server({

@@ -13,11 +13,17 @@ SYSTEM = (
 )
 
 
+TRAILER = (
+    "Answer now. First line exactly PASS, PASS+NOTES, or FAIL, alone with no markdown and "
+    "nothing before it. Do not propose or run commands. Then short notes."
+)
+
+
 def main():
     if len(sys.argv) != 3:
         print("usage: build-verifier-request.py PROMPT.md REQUEST.json", file=sys.stderr)
         raise SystemExit(2)
-    prompt = Path(sys.argv[1]).read_text(encoding="utf-8")
+    prompt = Path(sys.argv[1]).read_text(encoding="utf-8").rstrip() + "\n\n" + TRAILER + "\n"
     request = {
         "messages": [
             {"role": "system", "content": SYSTEM},
