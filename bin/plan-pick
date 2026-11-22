@@ -123,6 +123,9 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
     for lane in lanes:
         name = lane["lane"]
         pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+        if name == "google" or lane.get("pool") == "google" or (isinstance(pool, dict) and pool.get("chat_only")):
+            skipped[name] = "chat-only pool, never workers"
+            continue
         until = number(limits.get(name))
         if until is not None and until > now:
             skipped[name] = f"limited until {datetime.fromtimestamp(until, timezone.utc):%H:%M} UTC"
@@ -261,8 +264,20 @@ def plans_from(cfg):
 def plan_line(plan):
     models = ", ".join(str(model) for model in plan.get("included_models") or [])
     places = " and ".join(str(place) for place in plan.get("runs_on") or [])
-    return (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}. "
+    line = (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}. "
             f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.")
+    if plan.get("pool"):
+        usage = plan.get("usage") or {}
+        used, limit, pace = (number(usage.get(key)) for key in ("used", "limit", "pace_ratio"))
+        line += f" Pool: {plan['pool']}."
+        if plan.get("chat_only"):
+            line += " Chat-only, never workers."
+        line += f" Used: {used:g}" if used is not None else " Used: unknown"
+        if usage.get("unit"):
+            line += f" {usage['unit']}"
+        line += f". Limit: {limit:g}" if limit is not None else ". Limit: unknown"
+        line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
+    return line
 
 
 def read_limits(path=LIMITS):
@@ -656,6 +671,12 @@ def main(argv):
         return 0
     if args.plans:
         plans = plans_from(cfg)
+        try:
+            pools = read_pools(args.pools) if any(plan.get("pool") for plan in plans) else {}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pools = {}
+        pools = pools if isinstance(pools, dict) else {}
+        plans = [dict(plan, usage=pools.get(plan["pool"]) or {}) if plan.get("pool") else plan for plan in plans]
         if args.json:
             print(json.dumps(plans))
         else:
