@@ -14,8 +14,9 @@ Token Ladder reads how full each AI subscription is (Claude, Codex, Grok, OpenRo
 ## Layout
 
 - `bin/token-ladder`: the whole program, Python 3 standard library only. No dependencies.
-- `bin/plan-pick`: pool state in, one lane out (plan, launch command, reason). Reads `token-ladder pools --json`, the OpenCode history (a credit read under 2 hours old, else the last read minus the opencode-go spend in `~/.pi/agent/sessions`, marked estimated and used for at most 24 hours) and each credit lane's balance (cached in `~/.local/state/token-ladder/lane-credits.json`, refreshed in the background every 30 minutes); `config.json` keys `lanes`, `pace_warn_ratio`, `limited_hours`, `credit_limited_hours`, `credit_floor_usd`, `opencode_estimate_hours`, `opencode_estimate_usd_per_mtok`.
+- `bin/plan-pick`: pool state in, one lane out (plan, launch command, reason). Reads `token-ladder pools --json`, the OpenCode history (a credit read under 2 hours old, else the last read minus the opencode-go spend in `~/.pi/agent/sessions`, marked estimated and used for at most 24 hours) and each credit lane's balance (cached in `~/.local/state/token-ladder/lane-credits.json`, refreshed in the background every 30 minutes); `config.json` keys `lanes`, `pace_warn_ratio`, `limited_hours`, `credit_limited_hours`, `credit_floor_usd`, `opencode_estimate_hours`, `opencode_estimate_usd_per_mtok`, `opencode_monthly_slack_pct`.
 - `config.json`: floor, thresholds, Codex bonus reset dates.
+- `tools/`: `strip-comments.mjs` (the no-comments check) and `pi-lane-pins.mjs` (the pi extension that applies the `ci/lanes.json` gateway and provider pins to the pi worker lanes).
 - `tests/`: every test file imports the program from `tests/_load.py`, which sets an empty `HOME` first.
 - `systemd/`: the user timer that runs `collect`.
 

@@ -163,8 +163,9 @@ def call_lane(lane, key, body):
             headers['x-opencode-session'] = 'token-ladder-ladder-call'
     payload = dict(body)
     payload['model'] = lane['model']
-    if lane['name'] == 'vercel-ai-gateway':
-        payload['providerOptions'] = {'gateway': {'only': ['token-pass']}}
+    gateway = lane.get('gateway')
+    if isinstance(gateway, dict) and gateway:
+        payload['providerOptions'] = {'gateway': gateway}
     provider = lane.get('provider')
     if isinstance(provider, dict) and provider:
         payload['provider'] = provider

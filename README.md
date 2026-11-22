@@ -24,6 +24,22 @@ token-ladder grok-set --pct 42 --resets-at 2026-11-01T12:00:00Z
 Optional `burn` in `config.json` or `config.local.json`: `{"lane": "<lane or pool>", "until": "<ISO time with zone>"}`.
 While `until` is in the future, `plan-pick` runs that lane first and ignores its pace ratio; other skips still apply and `--claude-helper` is unchanged.
 
+## Worker lanes
+
+`plan-pick` runs a background worker on the first lane in `config.json` `lanes` that is free.
+
+The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lane uses one upstream provider, so neither can fall to Baseten when its credit runs low.
+`ci/lanes.json` holds both pins: `gateway` on the gateway lane, `provider` on the OpenRouter lane.
+`ci/ladder-call` sends them as `providerOptions.gateway` and `provider` in the request body.
+The two pi lanes on those providers load `tools/pi-lane-pins.mjs` with `-e`, and that extension writes the same two fields from the same file through pi's `before_provider_request` hook.
+Change the pin in `ci/lanes.json` and both paths follow.
+
+## OpenCode monthly allowance
+
+OpenCode can report its monthly meter at 100% while the 5-hour and weekly windows still have room.
+`plan-pick` keeps the OpenCode lane ON then, and moves to the prepaid credit pool only when the 5-hour or weekly window is full or at or above `opencode_monthly_slack_pct`, or when either reading is missing.
+That key lives in `config.json` and defaults to 25.
+
 ## Loop interval
 
 Chats that wake on a timer cost a turn every time they wake, so they ask how long to wait before the next tick:

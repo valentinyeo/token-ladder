@@ -22,5 +22,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22
+      - run: node --test tools/pi-lane-pins.test.js
       - run: node --test tools/strip-comments.test.js
       - run: node tools/strip-comments.mjs --check

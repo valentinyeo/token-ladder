@@ -135,6 +135,7 @@ def write_lanes(port, path):
         'key_env': 'AI_GATEWAY_API_KEY',
         'url': f'http://127.0.0.1:{port}{path}',
         'model': 'test-model',
+        'gateway': {'only': ['token-pass']},
     }]
     fh = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
     json.dump(lanes, fh)
@@ -623,6 +624,24 @@ class LadderCallTests(unittest.TestCase):
         self.assertEqual(models['vercel-ai-gateway'], 'deepseek/deepseek-v4.1-flash')
         self.assertEqual(models['openrouter'], 'deepseek/deepseek-v4.1-flash-1017')
         self.assertEqual(models['deepseek'], 'deepseek-flash')
+
+    def test_lane_without_gateway_key_sends_no_provider_options(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        lanes = json.loads(Path(lanes_path).read_text(encoding='utf-8'))
+        lanes[0].pop('gateway')
+        Path(lanes_path).write_text(json.dumps(lanes), encoding='utf-8')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        env = {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_LANES': lanes_path}
+        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('providerOptions', StubHandler.last_bodies[-1])
 
     def test_timeout_skipped_with_env(self):
         class SlowHandler(BaseHTTPRequestHandler):
