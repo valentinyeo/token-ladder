@@ -310,6 +310,72 @@ class CreditTests(unittest.TestCase):
         self.assertEqual(pp.credit_pool(entry, T, {"credit_floor_usd": 10})["state"], "OFF")
 
 
+class PassCreditTests(unittest.TestCase):
+    def setUp(self):
+        self.path = str(Path(tempfile.mkdtemp()) / "credits.json")
+
+    def api(self, url, key):
+        self.assertEqual((url, key), ("https://ai-gateway.vercel.sh/v1/credits", "k"))
+        return {"balance": "1.2850310396",
+                "token_pass": {"remaining": "56.522512198", "resets_at": "2026-12-05T08:00:00.000Z"},
+                "total_used": "632.1927432624"}
+
+    def vercel_plan(self):
+        return next(plan for plan in pp.plans_from(pp.load_config()) if plan["vendor"] == "vercel")
+
+    def test_the_balance_is_the_pass_remaining_not_the_top_up_credits(self):
+        data = pp.refresh_credits(["vercel"], T, self.path, self.api, lambda p: "k")
+        self.assertAlmostEqual(data["vercel"]["usd"], 56.56, delta=0.05)
+        self.assertEqual(data["vercel"]["resets_at"], "2026-12-05T08:00:00.000Z")
+        self.assertEqual(data["vercel"]["at"], T)
+
+    def test_the_plan_states_the_110_cycle_allowance(self):
+        plan = self.vercel_plan()
+        self.assertEqual(plan["usd_per_cycle"], 110)
+        self.assertEqual(plan["credit"], "vercel")
+        entry = {"usd": 56.52, "resets_at": "2026-12-05T08:00:00.000Z", "at": T}
+        line = pp.plan_line(plan, entry)
+        self.assertIn("$56.52 of $110 left this cycle, resets 2026-12-05T08:00:00.000Z.", line)
+        self.assertNotIn("150", line)
+
+    def test_a_plan_without_a_reading_or_a_cycle_shows_no_balance(self):
+        plan = self.vercel_plan()
+        self.assertNotIn("left this cycle", pp.plan_line(plan))
+        self.assertNotIn("left this cycle", pp.plan_line(dict(plan, usd_per_cycle=None), {"usd": 56.52, "at": T}))
+        self.assertIn("$56.52 of $110 left this cycle.", pp.plan_line(plan, {"usd": 56.52, "at": T}))
+
+    def test_only_a_fresh_reading_is_quoted(self):
+        plan = self.vercel_plan()
+        Path(self.path).write_text(json.dumps({"vercel": {"usd": 56.52, "at": T - 60}}))
+        self.assertEqual(pp.plan_credits([plan], {}, T, self.path, refresh=self.no_refresh)["vercel"]["usd"], 56.52)
+
+    def test_a_stale_reading_that_cannot_be_refreshed_is_dropped(self):
+        plan = self.vercel_plan()
+        Path(self.path).write_text(json.dumps({"vercel": {"usd": 56.52, "at": T - 7 * 3600}}))
+        self.assertEqual(pp.plan_credits([plan], {}, T, self.path,
+                                         refresh=lambda names, now, path: pp.read_credits(path)), {})
+
+    def no_refresh(self, names, now, path):
+        self.fail("refreshed a reading that was fresh: %s" % names)
+
+    def test_a_missing_reading_is_never_fetched_and_an_old_one_is(self):
+        plan = self.vercel_plan()
+        self.assertEqual(pp.plan_credits([plan], {}, T, self.path, refresh=self.no_refresh), {})
+        Path(self.path).write_text(json.dumps({"vercel": {"usd": 56.52, "at": T - 7 * 3600}}))
+        asked = []
+        got = pp.plan_credits([plan], {}, T, self.path, refresh=lambda names, now, path: asked.append(names) or
+                              {"vercel": {"usd": 56.6, "at": now}})
+        self.assertEqual(asked, [["vercel"]])
+        self.assertEqual(got["vercel"]["usd"], 56.6)
+
+    def test_every_plan_keeps_one_line(self):
+        plans = pp.plans_from(pp.load_config())
+        lines = pp.plan_lines(plans, {}, T, self.path)
+        self.assertEqual(len(lines), len(plans))
+        for line in lines:
+            self.assertNotIn("\n", line)
+
+
 class LimitTests(unittest.TestCase):
     def test_mark_limited_writes_and_drops_expired(self):
         path = str(Path(tempfile.mkdtemp()) / "sub" / "limits.json")

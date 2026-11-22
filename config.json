@@ -86,7 +86,9 @@
       "included_models": ["DeepSeek V4.1 Flash"],
       "runs_on": ["local"],
       "extra_cost": "none until the pass credit is used",
-      "source": "unknown"
+      "source": "unknown",
+      "credit": "vercel",
+      "usd_per_cycle": 110
     },
     {
       "name": "DeepSeek direct",
