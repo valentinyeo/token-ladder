@@ -317,7 +317,7 @@ class PassCreditTests(unittest.TestCase):
     def api(self, url, key):
         self.assertEqual((url, key), ("https://ai-gateway.vercel.sh/v1/credits", "k"))
         return {"balance": "1.2850310396",
-                "token_pass": {"remaining": "56.522512198", "resets_at": "2026-12-05T08:00:00.000Z"},
+                "token_pass": {"remaining": "56.559123456", "resets_at": "2026-12-05T08:00:00.000Z"},
                 "total_used": "632.1927432624"}
 
     def vercel_plan(self):
@@ -325,7 +325,7 @@ class PassCreditTests(unittest.TestCase):
 
     def test_the_balance_is_the_pass_remaining_not_the_top_up_credits(self):
         data = pp.refresh_credits(["vercel"], T, self.path, self.api, lambda p: "k")
-        self.assertAlmostEqual(data["vercel"]["usd"], 56.56, delta=0.05)
+        self.assertEqual(data["vercel"]["usd"], 56.56)
         self.assertEqual(data["vercel"]["resets_at"], "2026-12-05T08:00:00.000Z")
         self.assertEqual(data["vercel"]["at"], T)
 
@@ -358,9 +358,14 @@ class PassCreditTests(unittest.TestCase):
     def no_refresh(self, names, now, path):
         self.fail("refreshed a reading that was fresh: %s" % names)
 
-    def test_a_missing_reading_is_never_fetched_and_an_old_one_is(self):
+    def test_a_missing_reading_is_fetched_and_shown_against_the_cycle_allowance(self):
+        def refresh(names, now, path):
+            return pp.refresh_credits(names, now, path, self.api, lambda p: "k")
+        lines = pp.plan_lines([self.vercel_plan()], {}, T, self.path, refresh=refresh)
+        self.assertIn("$56.56 of $110 left this cycle, resets 2026-12-05T08:00:00.000Z.", lines[0])
+
+    def test_an_old_reading_is_refreshed(self):
         plan = self.vercel_plan()
-        self.assertEqual(pp.plan_credits([plan], {}, T, self.path, refresh=self.no_refresh), {})
         Path(self.path).write_text(json.dumps({"vercel": {"usd": 56.52, "at": T - 7 * 3600}}))
         asked = []
         got = pp.plan_credits([plan], {}, T, self.path, refresh=lambda names, now, path: asked.append(names) or
@@ -370,7 +375,7 @@ class PassCreditTests(unittest.TestCase):
 
     def test_every_plan_keeps_one_line(self):
         plans = pp.plans_from(pp.load_config())
-        lines = pp.plan_lines(plans, {}, T, self.path)
+        lines = pp.plan_lines(plans, {}, T, self.path, refresh=lambda names, now, path: {})
         self.assertEqual(len(lines), len(plans))
         for line in lines:
             self.assertNotIn("\n", line)

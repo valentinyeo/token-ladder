@@ -448,7 +448,8 @@ def plan_credits(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
     for plan in plans:
         name = plan.get("credit")
         entry = data.get(name) if isinstance(name, str) else None
-        if isinstance(entry, dict) and now - (number(entry.get("at")) or 0) > every:
+        if isinstance(name, str) and (not isinstance(entry, dict) or number(entry.get("usd")) is None
+                                      or now - (number(entry.get("at")) or 0) > every):
             due.append(name)
     if due:
         data = refresh(due, now, path)
