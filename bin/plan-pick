@@ -254,6 +254,37 @@ def lanes_from(cfg):
             and isinstance(lane.get("command"), str)]
 
 
+def with_repo_visibility(pools, lanes, brief="brief.txt", run=subprocess.run):
+    restricted = [lane for lane in lanes if lane.get("public_only")]
+    if not restricted:
+        return pools
+    try:
+        with open(brief) as fh:
+            text = fh.read()
+        repos = re.findall(r"(?im)^\s*repo(?:sitory)?\s*[:=]?\s*(?:https?://github\.com/)?([\w.-]+/[\w.-]+)", text)
+        if not repos:
+            repos = re.findall(r"https?://github\.com/([\w.-]+/[\w.-]+)", text)
+        repos = list(dict.fromkeys(repo.rstrip(".").removesuffix(".git") for repo in repos))
+    except OSError:
+        repos = [None]
+    public = bool(repos)
+    for repo in repos:
+        try:
+            args = ["gh", "repo", "view"] + ([repo] if repo else [])
+            out = run(args + ["--json", "visibility", "--jq", ".visibility"],
+                      capture_output=True, text=True, timeout=20)
+            public = public and out.returncode == 0 and out.stdout.strip() == "PUBLIC"
+        except (OSError, subprocess.SubprocessError):
+            public = False
+    if public:
+        return pools
+    pools = dict(pools)
+    for lane in restricted:
+        name = lane.get("pool") or f"credit:{lane['credit']}"
+        pools[name] = {"state": "OFF", "note": "public repos only; repository is private or visibility is unknown"}
+    return pools
+
+
 def lane_names(lane):
     names = (lane.get("lane"), lane.get("vendor"), lane.get("credit"))
     return {name.lower() for name in names if isinstance(name, str)}
@@ -289,6 +320,8 @@ def plan_line(plan, credit=None):
         line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
         if usage.get("used_up") and usage.get("used_up_at"):
             line += f" Used up at {usage['used_up_at']}."
+        if usage.get("note"):
+            line += f" {usage['note']}."
     allowance = number(plan.get("usd_per_cycle"))
     left = number((credit or {}).get("usd"))
     if allowance is None or left is None:
@@ -449,6 +482,12 @@ def http_json(url, key):
 
 
 def pi_key(provider):
+    if provider == "commandcode":
+        if os.environ.get("COMMANDCODE_API_KEY"):
+            return os.environ["COMMANDCODE_API_KEY"]
+        out = subprocess.run([os.path.expanduser("~/.local/bin/yeo-key"), "Commando Code API Key", "credential"],
+                             capture_output=True, text=True, timeout=60)
+        return out.stdout.strip() if out.returncode == 0 else ""
     out = subprocess.run([PI, "auth", "print-api-key", "--provider", provider],
                          capture_output=True, text=True, timeout=60)
     return out.stdout.strip() if out.returncode == 0 else ""
@@ -472,13 +511,62 @@ def balance_openrouter(get, key):
     return left if remaining is None else min(left, remaining)
 
 
-BALANCES = {"deepseek": balance_deepseek, "vercel": balance_vercel, "openrouter": balance_openrouter}
+def balance_commandcode(get, key):
+    k = key("commandcode")
+    data = get("https://api.commandcode.ai/alpha/billing/credits", k)
+    subscription = get("https://api.commandcode.ai/alpha/billing/subscriptions", k)["data"]
+    if subscription["planId"] != "individual-goat" or subscription["status"] != "active":
+        raise ValueError("CommandCode GOAT subscription is not active")
+    credits = data["credits"]["monthlyCredits"]
+    windows = data["windowLimits"]
+    if number(credits) is None or credits < 0:
+        raise ValueError("invalid CommandCode monthly credits")
+    for name in ("fiveHour", "weekly"):
+        window = windows[name]
+        if any(number(window[field]) is None for field in ("used", "cap", "resetAt")):
+            raise ValueError("invalid CommandCode window")
+        if window["used"] < 0 or window["cap"] <= 0 or window["resetAt"] <= 0:
+            raise ValueError("invalid CommandCode window")
+    return {"credits": credits, "windows": windows,
+            "period_start": datetime.fromisoformat(subscription["currentPeriodStart"].replace("Z", "+00:00")).timestamp(),
+            "period_end": datetime.fromisoformat(subscription["currentPeriodEnd"].replace("Z", "+00:00")).timestamp()}
+
+
+def commandcode_pool(entry, now, cfg):
+    try:
+        stale_s = (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+        if not entry or now - entry["at"] > stale_s or now >= entry["period_end"]:
+            return {"state": "OFF", "note": "CommandCode credit reading missing or stale"}
+        credits = entry["credits"]
+        start, end = entry["period_start"], entry["period_end"]
+        used = max(0, 70 - credits)
+        elapsed = max(0, min(1, (now - start) / (end - start))) if end > start else 0
+        pace = used / 70 / elapsed if elapsed > 0 else None
+        state = "ON" if credits > 0 else "OFF"
+        windows = []
+        for name, label in (("fiveHour", "5h"), ("weekly", "week")):
+            window = entry["windows"][name]
+            reset = window["resetAt"] / 1000
+            spent = window["used"] if now < reset else 0
+            if spent >= window["cap"] or (now < reset and window.get("exceeded")):
+                state = "OFF"
+            windows.append(f"{label} {spent:g}/{window['cap']:g} credits")
+        return {"state": state, "used": used, "limit": 70, "unit": "plan credits", "pace_ratio": pace,
+                "note": f"{credits:g}/70 monthly credits left (~${credits * 100 / 70:.2f} Flash usage); "
+                        + "; ".join(windows) + "; extra paid credits excluded"}
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return {"state": "OFF", "note": "CommandCode credit reading is invalid"}
+
+
+BALANCES = {"deepseek": balance_deepseek, "vercel": balance_vercel, "commandcode": balance_commandcode,
+            "openrouter": balance_openrouter}
 
 
 def reading(reader, get, key):
     got = reader(get, key)
     entry = dict(got) if isinstance(got, dict) else {"usd": got}
-    entry["usd"] = round(float(entry["usd"]), 2)
+    if "usd" in entry:
+        entry["usd"] = round(float(entry["usd"]), 2)
     return entry
 
 
@@ -578,7 +666,8 @@ def with_credits(pools, lanes, cfg, now=None, path=CREDITS, refresh=refresh_late
         data = refresh(due, now, path)
     pools = dict(pools) if isinstance(pools, dict) else {}
     for name in names:
-        state = credit_pool(data.get(name), now, cfg)
+        reader = commandcode_pool if name == "commandcode" else credit_pool
+        state = reader(data.get(name), now, cfg)
         if state and f"credit:{name}" not in pools:
             pools[f"credit:{name}"] = state
     return pools
@@ -943,6 +1032,8 @@ def main(argv):
         except (OSError, ValueError, subprocess.SubprocessError):
             pools = {}
         pools = pools if isinstance(pools, dict) else {}
+        if not args.pools:
+            pools = with_credits(pools, [lane for lane in lanes_from(cfg) if lane.get("credit") == "commandcode"], cfg)
         plans = [dict(plan, usage=pools.get(plan["pool"]) or {}) if plan.get("pool") else plan for plan in plans]
         state = opencode_pool(None, cfg)
         plans = [dict(plan, status=("included allowance used up; extra usage " + state["state"])
@@ -974,7 +1065,8 @@ def main(argv):
             data = refresh_credits(names, time.time())
         finally:
             os.unlink(lock)
-        print(", ".join(f"{n} ${data[n]['usd']:.2f}" for n in names if n in data))
+        print(", ".join(f"{n} " + (commandcode_pool(data[n], time.time(), cfg)["note"] if n == "commandcode"
+                                     else f"${data[n]['usd']:.2f}") for n in names if n in data))
         return 0
     if args.limited:
         if args.limited not in {lane["lane"] for lane in lanes}:
@@ -1001,6 +1093,9 @@ def main(argv):
     if args.not_vendor:
         excluded = args.not_vendor.lower()
         lanes = [lane for lane in lanes if excluded not in lane_names(lane)]
+    pools = with_repo_visibility(pools, lanes)
+    if any(lane.get("credit") == "commandcode" for lane in lanes) and "credit:commandcode" not in pools:
+        pools = dict(pools, **{"credit:commandcode": commandcode_pool(None, time.time(), cfg)})
     burn = parse_burn(cfg, lanes)
     lanes = lanes_with_burn(lanes, burn)
     if args.run:

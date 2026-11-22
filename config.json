@@ -35,6 +35,14 @@
       "command": "~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
+      "lane": "commandcode",
+      "credit": "commandcode",
+      "vendor": "deepseek",
+      "pool": null,
+      "public_only": true,
+      "command": "COMMANDCODE_API_KEY=\"${COMMANDCODE_API_KEY:-$(~/.local/bin/yeo-key 'Commando Code API Key' credential)}\" ~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-commandcode.mjs --provider commandcode --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
       "lane": "openrouter",
       "credit": "openrouter",
       "vendor": "deepseek",
@@ -116,6 +124,19 @@
       "runs_on": ["local"],
       "extra_cost": "none within the plan quota; never buys overages",
       "source": "Valentin, 2026-11-22; https://antigravity.google/docs/plans.md"
+    },
+    {
+      "name": "CommandCode GOAT",
+      "vendor": "commandcode",
+      "pool": "credit:commandcode",
+      "included_models": [
+        "DeepSeek V4.1 Flash"
+      ],
+      "runs_on": [
+        "local"
+      ],
+      "extra_cost": "$10/month; up to $100 Flash usage/month, $20/5h, $50/week; public repos only",
+      "source": "https://commandcode.ai/docs/plans/goat; https://commandcode.ai/docs/resources/usage-limits"
     },
     {
       "name": "OpenRouter",

@@ -1,0 +1,25 @@
+{
+  "credits": {
+    "belowThreshold": false,
+    "creditThreshold": 0,
+    "monthlyCredits": 69.999995275,
+    "purchasedCredits": 0,
+    "freeCredits": 0
+  },
+  "windowLimits": {
+    "limited": true,
+    "exceeded": null,
+    "fiveHour": {
+      "used": 4.725e-06,
+      "cap": 14,
+      "exceeded": false,
+      "resetAt": 1795403313512
+    },
+    "weekly": {
+      "used": 4.725e-06,
+      "cap": 35,
+      "exceeded": false,
+      "resetAt": 1795990113512
+    }
+  }
+}

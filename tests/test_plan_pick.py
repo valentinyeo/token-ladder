@@ -952,7 +952,7 @@ class ConfigTests(unittest.TestCase):
         cfg = pp.load_config()
         lanes = pp.lanes_from(cfg)
         self.assertEqual([lane["lane"] for lane in lanes],
-                         ["opencode", "vercel", "openrouter", "codex", "cursor"])
+                         ["opencode", "vercel", "commandcode", "openrouter", "codex", "cursor"])
         self.assertEqual(cfg["pace_warn_ratio"], pp.DEFAULT_PACE_WARN)
 
     def test_shipped_commands_obey_the_model_rules(self):

@@ -28,6 +28,28 @@ While `until` is in the future, `plan-pick` runs that lane first and ignores its
 
 `plan-pick` runs a background worker on the first lane in `config.json` `lanes` that is free.
 
+| Order | Lane | Included usage / credit |
+|---|---|---|
+| 1 | OpenCode Go | Plan windows, then prepaid credit |
+| 2 | Vercel Token Pass | Token Pass balance only |
+| 3 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week; public repos only |
+| 4 | OpenRouter | Prepaid credit |
+| 5 | DeepSeek direct | Prepaid credit |
+| 6 | Codex | Subscription pool |
+| 7 | Cursor | Subscription pool |
+
+### CommandCode GOAT
+
+The [GOAT allowance](https://commandcode.ai/docs/plans/goat) is a weighted 70-credit monthly pool. Flash currently gets up to $100 of usage. The live caps are 14 credits per five hours and 35 per week, equivalent to about $20 and $50 of Flash usage. These are shared across models, not separate model balances. [Usage limits](https://commandcode.ai/docs/resources/usage-limits) describes the weighting and first-request window resets. Promotional multipliers can change under the [terms](https://commandcode.ai/terms).
+
+The reader calls `https://api.commandcode.ai/alpha/billing/credits` and `/alpha/billing/subscriptions` with the same API key. It caches monthly credit, window caps and resets, and billing dates without storing the key or account identifiers. `plan-pick --read-credits commandcode` refreshes it; `--plans` shows the cached balance and monthly pace. Missing, stale or exhausted readings disable the lane. Purchased extra credits are excluded from selection, although the provider itself can spend existing extra credits after a plan limit.
+
+The pi lane loads `tools/pi-commandcode.mjs` and uses the [OpenAI-compatible Provider API](https://commandcode.ai/docs/provider). Set `COMMANDCODE_API_KEY` in the environment, or the launch command reads the `credential` field of 1Password item `Commando Code API Key` with `yeo-key`. No key belongs in `config.json` or a PR.
+
+The Provider API docs explicitly support agent clients and coding plans. However, the [terms](https://commandcode.ai/terms) prohibit automated website requests, and the [privacy policy](https://commandcode.ai/privacy) allows up to 30 days of prompt retention and does not guarantee upstream no-training without [ZDR](https://commandcode.ai/docs/resources/zdr). This lane conservatively allows **public repos only**. `gh repo view --json visibility` checks the brief's declared repository, or its GitHub URLs, before selection and launch. Private, internal and unknown visibility are refused, including burn overrides. With no brief, it checks the current repository; an existing brief with no identifiable repository is refused.
+
+A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and `deepseek/deepseek-v4.1-flash` on 2026-11-22. It supports chat judging technically, but is not in `ci/lanes.json`: that caller has no repository-visibility guard. A future guarded judge lane would need `COMMANDCODE_API_KEY`; no GitHub secret is set by this change.
+
 The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lane uses one upstream provider, so neither can fall to Baseten when its credit runs low.
 `ci/lanes.json` holds both pins: `gateway` on the gateway lane, `provider` on the OpenRouter lane.
 `ci/ladder-call` sends them as `providerOptions.gateway` and `provider` in the request body.

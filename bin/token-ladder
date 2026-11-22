@@ -1413,7 +1413,7 @@ def launches_hax(cmd):
     return any(os.path.basename(words[0]) == "hax" for words, env in shell_commands(cmd))
 
 
-PI_LANE_PROVIDERS = ("vercel-ai-gateway", "deepseek", "opencode-go", "openrouter-credit")
+PI_LANE_PROVIDERS = ("vercel-ai-gateway", "deepseek", "opencode-go", "commandcode", "openrouter-credit")
 DEEPSEEK_FLASH_MODELS = ("deepseek/deepseek-v4.1-flash", "deepseek-v4.1-flash", "deepseek-flash")
 
 

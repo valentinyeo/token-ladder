@@ -12,6 +12,7 @@ plan-pick chooses a worker lane from pool state, prints human or JSON plans, gat
 - `run-stub` runs a stub lane command end to end without real spend.
 - `prepaid-credit` uses live OpenCode credit or a balance anchor less recorded run costs for at most seven days, stops at $2, and waits until monthly renewal once the floor is reached.
 - `burn` reports current-month recorded pi costs and the separate measured 30-day DeepSeek direct account total.
+- `commandcode` reports weighted GOAT credit and refuses private or unknown repositories before launching pi.
 
 ## How to get to it (user POV)
 
@@ -29,7 +30,9 @@ Preconditions:
 - **JSON pick.** Run `bin/plan-pick --pools "$HOME/pools.json" --json`. Exit `0`. stdout parses as JSON with keys `command`, `plan`, `reason` and `"plan":"vercel"`.
 - **Plans table.** Run `bin/plan-pick --plans`. Exit `0`. stdout contains `Included means no extra cost` and a `Cursor` plan line.
 - **Plans JSON.** Run `bin/plan-pick --plans --json`. Exit `0`. stdout is a JSON array of plan objects from config. The `google` plan has `chat_only: true` and a `usage` object with unknown quota, limit and pace.
-- **Google history fallback.** Create `$HOME/.gemini/antigravity-cli/`, copy `tests/fixtures/agy-history.jsonl` there as `history.jsonl`, then run `bin/plan-pick --plans`. Exit `0`. The Google line includes `Pool: google. Chat-only, never workers.`, a local daily count, `Limit: unknown` and `Pace: unknown`. The count depends on the current UTC day. No state files appear.
+- **Google history fallback.** Create `$HOME/.gemini/antigravity-cli/`, copy `tests/fixtures/agy-history.jsonl` there as `history.jsonl`, then run `bin/plan-pick --plans`. Exit `0`. The Google line includes `Pool: google. Chat-only, never workers.`, a local daily count, `Limit: unknown` and `Pace: unknown`. The count depends on the current UTC day. Google writes no state; the CommandCode credit reader can populate its own cache.
+- **CommandCode allowance.** Run `bin/plan-pick --plans --pools "$HOME/pools.json"`. Exit `0`. The CommandCode line includes `$10/month`, `$100 Flash usage/month`, `$20/5h`, `$50/week` and `public repos only`. An injected `credit:commandcode` pool's `note`, `used`, `limit` and `pace_ratio` appear without a network read.
+- **CommandCode fixture and refusal.** Run `timeout 180 python3 -m unittest discover -s tests -p test_commandcode.py -v`. Exit `0`. The fixture reader preserves 70 monthly credits and 14/35 window caps. A stub `gh` marks the brief's target PRIVATE, and `--run` uses the next lane even with CommandCode burn enabled; PUBLIC runs the CommandCode stub. No production model call occurs.
 - **Loop interval.** Run `bin/plan-pick --pools "$HOME/pools.json" --loop-interval --json` with pools `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.16}}`. Exit `0`. stdout JSON has `"seconds":10800` and `"reason":"claude pace 1.16x ahead"`.
 - **Claude helper refused.** Run `bin/plan-pick --pools "$HOME/pools.json" --claude-helper` with `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.8}}`. Exit `3`. stdout starts with `Claude helper: refused.`
 - **Stub run.** In a temp dir, copy `bin/plan-pick`, write `config.json` with lanes `a` (`echo '429'; exit 1`) then `b` (`echo worker-done`), empty pools file, run `bin/plan-pick --pools "$HOME/pools.json" --run`. Exit `0`. stdout contains `worker-done`. stderr mentions `lane a hit a rate or usage limit`.
