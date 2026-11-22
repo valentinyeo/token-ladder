@@ -303,3 +303,9 @@ allowed. It fails with
 `<path>:<reason>:<until YYYY-MM-DD>` entry for that file; expired allow lines fail.
 The reusable action is
 `valentinyeo/token-ladder/.github/actions/lint-direct-model-calls@main`.
+
+`ci/scan-repos` shallow-clones non-archived repos for a GitHub owner, runs
+`ci/lint-direct-model-calls`, also flags `generativelanguage.googleapis.com` and
+`CLAUDE_CODE_OAUTH_TOKEN` / `CODEX_AUTH_JSON` reads under `.github/` and `tools/`,
+lists GitHub secret names per repo, and prints a tab-separated table including
+whether each repo already references `ladder-call`.
