@@ -344,7 +344,7 @@ class PassCreditTests(unittest.TestCase):
     def api(self, url, key):
         self.assertEqual((url, key), ("https://ai-gateway.vercel.sh/v1/credits", "k"))
         return {"balance": "1.2850310396",
-                "token_pass": {"remaining": "56.559123456", "resets_at": "2026-12-05T08:00:00.000Z"},
+                "token_pass": {"remaining": "56.56", "resets_at": "2026-12-05T08:00:00.000Z"},
                 "total_used": "632.1927432624"}
 
     def vercel_plan(self):
@@ -355,6 +355,14 @@ class PassCreditTests(unittest.TestCase):
         self.assertEqual(data["vercel"]["usd"], 56.56)
         self.assertEqual(data["vercel"]["resets_at"], "2026-12-05T08:00:00.000Z")
         self.assertEqual(data["vercel"]["at"], T)
+
+    def test_new_spend_is_rounded_without_pinning_the_dashboard_snapshot(self):
+        def api(url, key):
+            response = self.api(url, key)
+            response["token_pass"]["remaining"] = "56.486768176"
+            return response
+        data = pp.refresh_credits(["vercel"], T, self.path, api, lambda p: "k")
+        self.assertEqual(data["vercel"]["usd"], 56.49)
 
     def test_the_plan_states_the_110_cycle_allowance(self):
         plan = self.vercel_plan()
