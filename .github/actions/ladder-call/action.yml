@@ -7,6 +7,10 @@ inputs:
   purpose:
     description: Short label for logs.
     required: true
+  require-verdict:
+    description: Skip a lane whose answer holds no PASS, PASS+NOTES or FAIL verdict.
+    required: false
+    default: 'false'
 outputs:
   answer-file:
     description: Path to the provider response JSON.
@@ -46,7 +50,11 @@ runs:
         tag="$(printf '%s' "${{ inputs.purpose }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-$$-${RANDOM}" | sha256sum | cut -c1-12)"
         answer="${RUNNER_TEMP}/ladder-call-answer-${tag}.json"
         log="${RUNNER_TEMP}/ladder-call-${tag}.log"
-        if ! "${{ github.action_path }}/run" --purpose "${{ inputs.purpose }}" \
+        args=(--purpose "${{ inputs.purpose }}")
+        if [ "${{ inputs.require-verdict }}" = "true" ]; then
+          args+=(--require-verdict)
+        fi
+        if ! "${{ github.action_path }}/run" "${args[@]}" \
           < "${{ inputs.request-file }}" > "$answer" 2> "$log"; then
           cat "$log" >&2
           exit 1

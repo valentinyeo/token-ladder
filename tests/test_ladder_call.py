@@ -46,6 +46,7 @@ def action_run_script():
     replacements = {
         '${{ inputs.purpose }}': 'test-purpose',
         '${{ inputs.request-file }}': '${REQUEST_FILE}',
+        '${{ inputs.require-verdict }}': 'false',
         '${{ github.action_path }}': str(ACTION_LADDER),
         '${{ github.run_id }}': '123',
         '${{ github.run_attempt }}': '1',
@@ -115,12 +116,12 @@ def fake_cursor_agent(tmp_dir, mode='ok', answer='cursor-ok'):
     return str(script)
 
 
-def ladder_call(env, stdin_obj, lanes_file=None):
+def ladder_call(env, stdin_obj, lanes_file=None, args=()):
     env = {**os.environ, **env}
     if lanes_file:
         env['LADDER_CALL_LANES'] = str(lanes_file)
     return subprocess.run(
-        [str(LADDER), '--purpose', 'test'],
+        [str(LADDER), '--purpose', 'test', *args],
         input=json.dumps(stdin_obj),
         text=True,
         capture_output=True,
@@ -314,6 +315,132 @@ class LadderCallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload['choices'][0]['message']['content'][0]['text'], 'hello ')
+
+    def test_reasoning_only_answer_counts_as_answer(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {
+                    'content': '',
+                    'reasoning': 'The diff matches the feature map.\n\nPASS\n',
+                    'tool_calls': [{'type': 'function', 'function': {'name': 'bash'}}],
+                }}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'k'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway answered', result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['choices'][0]['message']['content'], '')
+
+    def test_require_verdict_skips_agent_style_answer(self):
+        server, port = run_server({
+            '/agent': (200, {'choices': [{'message': {
+                'content': "I'll start by inspecting the repo state and the supplied merge base.\n\n"
+                           "**Shell**\n```\npwd; git status --short\n```\n",
+            }}]}, None),
+            '/verdict': (200, {'choices': [{'message': {
+                'content': '**PASS**\n\nTests are green and the diff matches the map.',
+            }}]}, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes = [
+            {
+                'name': 'agent-lane',
+                'key_env': 'AI_GATEWAY_API_KEY',
+                'url': f'http://127.0.0.1:{port}/agent',
+                'model': 'm',
+            },
+            {
+                'name': 'verdict-lane',
+                'key_env': 'OPENCODE_API_KEY',
+                'url': f'http://127.0.0.1:{port}/verdict',
+                'model': 'm',
+            },
+        ]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key', 'OPENCODE_API_KEY': 'oc-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+            args=('--require-verdict',),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane agent-lane skipped: no verdict', result.stderr)
+        self.assertIn('lane agent-lane no-verdict answer tail:', result.stderr)
+        self.assertIn('verdict-lane answered', result.stderr)
+
+    def test_require_verdict_decides_from_a_long_analysis(self):
+        seen = []
+
+        class DecideHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or 0)
+                seen.append(json.loads(self.rfile.read(length) or b'{}'))
+                if len(seen) == 1:
+                    text = ("I'll start by inspecting the repo state.\n\n**Shell**\n```\npwd\n```")
+                else:
+                    text = 'PASS+NOTES\nReview was cut short; tests and lint passed.'
+                payload = json.dumps({'choices': [{'message': {'content': text}}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), DecideHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        lanes = [{
+            'name': 'agent-lane',
+            'key_env': 'AI_GATEWAY_API_KEY',
+            'url': f'http://127.0.0.1:{server.server_address[1]}/agent',
+            'model': 'm',
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+            args=('--require-verdict',),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane agent-lane answered', result.stderr)
+        self.assertEqual(len(seen), 2)
+        self.assertIn('possibly cut short', seen[1]['messages'][1]['content'])
+        self.assertIn('Decide now', seen[1]['messages'][1]['content'])
+        self.assertLessEqual(seen[1]['max_tokens'], 2048)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload['choices'][0]['message']['content'].startswith('PASS+NOTES'))
+
+    def test_require_verdict_env_var(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {'choices': [{'message': {'content': 'no answer here'}}]}, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_REQUIRE_VERDICT': '1'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('skipped: no verdict', result.stderr)
 
     def test_401_skipped(self):
         server, port = run_server({

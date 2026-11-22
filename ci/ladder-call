@@ -21,6 +21,9 @@ CURSOR_RATE_MARKERS = (
     'resource exhausted',
 )
 
+sys.path.insert(0, str(REPO))
+from verdict import answer_text, find_verdict
+
 
 def timeout_seconds():
     raw = os.environ.get('LADDER_CALL_TIMEOUT', '').strip()
@@ -192,14 +195,70 @@ def skip_reason(lane, exc=None, status=None, empty=False):
     return str(status)
 
 
+DECIDE_SYSTEM = (
+    'You are the verdict line of an independent pull request verifier. '
+    'You did not write the change. Decide from the verifier notes you are given, which may '
+    'be cut short. '
+    'Your first line must be exactly PASS, PASS+NOTES, or FAIL, alone, with no markdown. '
+    'Then at most three short lines.'
+)
+DECIDE_TAIL = 4000
+DECIDE_TOKENS = 2048
+
+
 def log_skip(name, reason):
     print(f'ladder-call: lane {name} skipped: {reason}', file=sys.stderr)
+
+
+def flatten(text, limit=300):
+    flat = ' '.join((text or '').split())
+    return flat[-limit:]
+
+
+def decide_request(answer):
+    notes = (answer or '').strip()[-DECIDE_TAIL:]
+    return {
+        'messages': [
+            {'role': 'system', 'content': DECIDE_SYSTEM},
+            {
+                'role': 'user',
+                'content': (
+                    'A PR verifier reviewed a diff and wrote these notes, possibly cut short:\n\n'
+                    + notes
+                    + '\n\nDecide now from these notes. First line exactly PASS, PASS+NOTES, '
+                    'or FAIL, alone. Then at most three short lines.'
+                ),
+            },
+        ],
+        'max_tokens': DECIDE_TOKENS,
+    }
+
+
+def attempt_lane(lane, key, body):
+    try:
+        if lane.get('kind') == 'cursor':
+            return call_cursor_lane(lane, key, body)
+        return call_lane(lane, key, body), None
+    except urllib.error.HTTPError as exc:
+        if exc.code in SKIP_HTTP or exc.code >= 500:
+            return None, skip_reason(lane, exc=exc)
+        print(
+            f'ladder-call: lane {lane["name"]} failed: HTTP {exc.code}',
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        if isinstance(getattr(exc, 'reason', None), TimeoutError):
+            return None, 'timeout'
+        return None, skip_reason(lane, exc=exc)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--purpose', required=True)
+    parser.add_argument('--require-verdict', action='store_true')
     args = parser.parse_args()
+    require_verdict = args.require_verdict or os.environ.get('LADDER_CALL_REQUIRE_VERDICT') == '1'
     try:
         body = json.load(sys.stdin)
     except json.JSONDecodeError:
@@ -211,38 +270,31 @@ def main():
         if not key:
             log_skip(lane['name'], 'no key')
             continue
-        try:
-            if lane.get('kind') == 'cursor':
-                result, cursor_skip = call_cursor_lane(lane, key, body)
-                if cursor_skip:
-                    log_skip(lane['name'], cursor_skip)
-                    continue
-            else:
-                result = call_lane(lane, key, body)
-        except urllib.error.HTTPError as exc:
-            if exc.code in SKIP_HTTP:
-                log_skip(lane['name'], skip_reason(lane, exc=exc))
-                continue
-            if exc.code >= 500:
-                log_skip(lane['name'], skip_reason(lane, exc=exc))
-                continue
-            print(
-                f'ladder-call: lane {lane["name"]} failed: HTTP {exc.code}',
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            if isinstance(getattr(exc, 'reason', None), TimeoutError):
-                log_skip(lane['name'], 'timeout')
-            else:
-                log_skip(lane['name'], skip_reason(lane, exc=exc))
+        result, reason = attempt_lane(lane, key, body)
+        if reason:
+            log_skip(lane['name'], reason)
             continue
         if result is None:
             log_skip(lane['name'], 'invalid response')
             continue
-        if not message_content(result):
+        answer = answer_text(result)
+        if not answer:
             log_skip(lane['name'], 'empty answer')
             continue
+        if require_verdict and not find_verdict(answer)[0]:
+            print(
+                f'ladder-call: lane {lane["name"]} no-verdict answer tail: {flatten(answer, 600)}',
+                file=sys.stderr,
+            )
+            result, reason = attempt_lane(lane, key, decide_request(answer))
+            if reason:
+                log_skip(lane['name'], reason)
+                continue
+            decision = answer_text(result) if result else ''
+            if not find_verdict(decision)[0]:
+                log_skip(lane['name'], 'no verdict')
+                continue
+            answer = decision
         print(f'ladder-call: lane {lane["name"]} answered ({args.purpose})', file=sys.stderr)
         json.dump(result, sys.stdout)
         print()
