@@ -5,9 +5,13 @@
   verdict --self-test
 
 A verifier may answer in any of three forms, and the last one in its text wins:
-  a bare line       PASS
-  a prefixed line   VERDICT: PASS
+  a bare line       PASS, **PASS**, ## PASS
+  a prefixed line   VERDICT: PASS, Verdict: PASS, ### Verdict: PASS
   a JSON field      {"verdict": "PASS"}
+
+A gateway puts the answer in message.content, or in message.reasoning when a reasoning
+model returns no content (VSTA-88: vercel-ai-gateway answered with content "" and the
+bash tool call only in reasoning). answer_text reads both.
 
 A bare line inside a fenced code block is quoted evidence, never an answer. A verifier
 that answers only inside a fence reads as no verdict, and run-verifier tries the next model.
@@ -28,11 +32,45 @@ import tempfile
 VERDICTS = ('PASS+NOTES', 'PASS', 'FAIL')
 PASSING = ('PASS', 'PASS+NOTES')
 TOKEN = r'(PASS\+NOTES|PASS|FAIL)(?![\w+-])'
-PREFIXED = re.compile(r'^[ \t]*VERDICT:[ \t]*' + TOKEN, re.M)
+DECOR = r'(?:#{1,6}[ \t]*)?(?:[*_]{1,2})?[ \t]*'
+PREFIXED = re.compile(r'^[ \t]*' + DECOR + r'VERDICT[ \t]*:?[ \t]*(?:[*_]{1,2})?[ \t]*' + TOKEN, re.M | re.I)
+BARE = re.compile(r'^[ \t]*' + DECOR + TOKEN + r'(?:[*_]{1,2})?[ \t]*[.!]?[ \t]*$', re.I)
 JSON_FIELD = re.compile(r'^[ \t]*"verdict"[ \t]*:[ \t]*"(PASS\+NOTES|PASS|FAIL)"[ \t]*,?[ \t]*\}?[ \t]*$', re.M)
 FENCE = re.compile(r'^ {0,3}(`{3,}|~{3,})')
+TEXT_KEYS = ('content', 'reasoning', 'reasoning_content')
 MISSING = ('no verdict found: expected a bare PASS, PASS+NOTES or FAIL line, '
            'a VERDICT: <x> line, or JSON "verdict": "<x>"')
+
+
+def part_text(value):
+    """Text of a content value: a string, or a list of text parts."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = []
+        for part in value:
+            if isinstance(part, dict) and isinstance(part.get('text'), str):
+                parts.append(part['text'])
+            elif isinstance(part, str):
+                parts.append(part)
+        return ''.join(parts).strip()
+    return ''
+
+
+def answer_text(payload):
+    """The answer a gateway returned: message content, else reasoning when content is empty."""
+    try:
+        choices = payload.get('choices') or []
+        if not choices:
+            return ''
+        message = choices[0].get('message') or {}
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ''
+    for key in TEXT_KEYS:
+        text = part_text(message.get(key))
+        if text:
+            return text
+    return ''
 
 
 def json_verdicts(text):
@@ -63,15 +101,17 @@ def json_verdicts(text):
 
 def occurrences(text):
     """(offset, verdict) for every accepted form, in text order."""
-    found = [(match.start(), match.group(1)) for match in PREFIXED.finditer(text)]
+    found = [(match.start(), match.group(1).upper()) for match in PREFIXED.finditer(text)]
     found += json_verdicts(text)
     offset, fenced = 0, False
     for line in text.splitlines(keepends=True):
         stripped = line.strip()
         if FENCE.match(stripped):
             fenced = not fenced
-        elif not fenced and stripped in VERDICTS:
-            found.append((offset, stripped))
+        elif not fenced:
+            bare = BARE.match(line)
+            if bare:
+                found.append((offset, bare.group(1).upper()))
         offset += len(line)
     return sorted(found)
 

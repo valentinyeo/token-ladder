@@ -11,6 +11,9 @@ REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
 SKIP_HTTP = {401, 402, 403, 404, 408, 425, 429}
 
+sys.path.insert(0, str(REPO))
+from verdict import answer_text, find_verdict
+
 
 def timeout_seconds():
     raw = os.environ.get('LADDER_CALL_TIMEOUT', '').strip()
@@ -35,33 +38,6 @@ def lane_url(lane):
 def load_lanes():
     with open(lanes_path(), encoding='utf-8') as fh:
         return json.load(fh)
-
-
-def message_content(result):
-    try:
-        choices = result.get('choices') or []
-        if not choices:
-            return ''
-        msg = choices[0].get('message') or {}
-        content = msg.get('content')
-        if content is None:
-            return ''
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if isinstance(part, dict):
-                    if part.get('type') == 'text':
-                        parts.append(part.get('text') or '')
-                    elif 'text' in part:
-                        parts.append(part.get('text') or '')
-                elif isinstance(part, str):
-                    parts.append(part)
-            return ''.join(parts).strip()
-        return ''
-    except (AttributeError, IndexError, KeyError, TypeError):
-        return ''
 
 
 def call_lane(lane, key, body):
@@ -105,7 +81,9 @@ def log_skip(name, reason):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--purpose', required=True)
+    parser.add_argument('--require-verdict', action='store_true')
     args = parser.parse_args()
+    require_verdict = args.require_verdict or os.environ.get('LADDER_CALL_REQUIRE_VERDICT') == '1'
     try:
         body = json.load(sys.stdin)
     except json.JSONDecodeError:
@@ -140,8 +118,12 @@ def main():
         if result is None:
             log_skip(lane['name'], 'invalid response')
             continue
-        if not message_content(result):
+        answer = answer_text(result)
+        if not answer:
             log_skip(lane['name'], 'empty answer')
+            continue
+        if require_verdict and not find_verdict(answer)[0]:
+            log_skip(lane['name'], 'no verdict')
             continue
         print(f'ladder-call: lane {lane["name"]} answered ({args.purpose})', file=sys.stderr)
         json.dump(result, sys.stdout)

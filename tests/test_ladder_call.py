@@ -35,6 +35,7 @@ def action_run_script():
     replacements = {
         '${{ inputs.purpose }}': 'test-purpose',
         '${{ inputs.request-file }}': '${REQUEST_FILE}',
+        '${{ inputs.require-verdict }}': 'false',
         '${{ github.action_path }}': str(ACTION_LADDER),
         '${{ github.run_id }}': '123',
         '${{ github.run_attempt }}': '1',
@@ -80,12 +81,12 @@ def run_server(routes, delay=0):
     return server, server.server_address[1]
 
 
-def ladder_call(env, stdin_obj, lanes_file=None):
+def ladder_call(env, stdin_obj, lanes_file=None, args=()):
     env = {**os.environ, **env}
     if lanes_file:
         env['LADDER_CALL_LANES'] = str(lanes_file)
     return subprocess.run(
-        [str(LADDER), '--purpose', 'test'],
+        [str(LADDER), '--purpose', 'test', *args],
         input=json.dumps(stdin_obj),
         text=True,
         capture_output=True,
@@ -245,6 +246,73 @@ class LadderCallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload['choices'][0]['message']['content'][0]['text'], 'hello ')
+
+    def test_reasoning_only_answer_counts_as_answer(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {
+                    'content': '',
+                    'reasoning': 'The diff matches the feature map.\n\nPASS\n',
+                    'tool_calls': [{'type': 'function', 'function': {'name': 'bash'}}],
+                }}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'k'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway answered', result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['choices'][0]['message']['content'], '')
+
+    def test_require_verdict_skips_agent_style_answer(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {
+                    'content': "I'll start by inspecting the repo state and the supplied merge base.\n\n"
+                               "**Shell**\n```\npwd; git status --short\n```\n",
+                }}],
+            }, None),
+            '/zen/go/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': '**PASS**\n\nTests are green and the diff matches the map.'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        base = f'http://127.0.0.1:{port}'
+        env = {
+            'AI_GATEWAY_API_KEY': 'gw-key',
+            'OPENCODE_API_KEY': 'oc-key',
+            'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
+            'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
+        }
+        result = ladder_call(
+            env,
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            args=('--require-verdict',),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: no verdict', result.stderr)
+        self.assertIn('lane opencode-go answered', result.stderr)
+
+    def test_require_verdict_env_var(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {'choices': [{'message': {'content': 'no answer here'}}]}, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_REQUIRE_VERDICT': '1'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('skipped: no verdict', result.stderr)
 
     def test_401_skipped(self):
         server, port = run_server({
