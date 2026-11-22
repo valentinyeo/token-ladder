@@ -22,6 +22,7 @@ CURSOR_RATE_MARKERS = (
 )
 
 sys.path.insert(0, str(REPO))
+from model_families import filter_lanes, model_family
 from verdict import answer_text, find_verdict
 
 
@@ -257,6 +258,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--purpose', required=True)
     parser.add_argument('--require-verdict', action='store_true')
+    parser.add_argument('--exclude-families', default='', help='Comma-separated model families to skip')
     args = parser.parse_args()
     require_verdict = args.require_verdict or os.environ.get('LADDER_CALL_REQUIRE_VERDICT') == '1'
     try:
@@ -265,7 +267,19 @@ def main():
         print('ladder-call: invalid JSON on stdin', file=sys.stderr)
         raise SystemExit(2)
     lanes = load_lanes()
+    try:
+        excluded = {model_family(family) for family in args.exclude_families.split(',') if family.strip()}
+        eligible = filter_lanes(lanes, excluded)
+    except ValueError as exc:
+        print(f'ladder-call: cannot enforce family exclusions: {exc}', file=sys.stderr)
+        raise SystemExit(2)
     for lane in lanes:
+        if lane not in eligible:
+            log_skip(lane['name'], f'excluded family {model_family(lane["model"])}')
+    if excluded and not eligible:
+        print('ladder-call: all lanes excluded by author model families', file=sys.stderr)
+        raise SystemExit(3)
+    for lane in eligible:
         key = os.environ.get(lane['key_env'], '').strip()
         if not key:
             log_skip(lane['name'], 'no key')

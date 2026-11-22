@@ -64,10 +64,14 @@ The read-only fallback counts `timestamp` metadata in `~/.gemini/antigravity-cli
 
 Missing, unreadable, empty or wholly invalid history produces unknown usage. Malformed records and future timestamps are ignored. An older valid history produces zero local entries today, not proof of zero account usage. Quota percentage, limit, reset and pace remain unknown even when a local count is available. A missing Google reading never stops `plan-pick`.
 
+### Used up from the agy log
+
+The newest quota-related line in `~/.gemini/antigravity-cli/cli.log` for the current day decides one extra thing. When that line is a `RESOURCE_EXHAUSTED`, rate-limit or quota-exceeded error, `token-ladder pools` prints the pool as OFF and used up at the time of the line, and `plan-pick --plans` adds `Used up at <ISO time>.` with `used_up` and `used_up_at` in `--plans --json`. A later successful quota refresh, or no error, leaves today's behaviour alone. agy writes log times in local time; the reader shows them in UTC. Only `cli.log` is opened, never `antigravity-oauth-token` or any other file in that folder, and the reader still never runs `agy`.
+
 ### Quota source investigation, 2026-11-22
 
 - `agy --help` lists no status or usage subcommand. No prompt was run.
-- Local cache metadata, state field names and SQLite schemas expose conversation metadata, not a quota snapshot. CLI logs refer to `retrieveUserQuotaSummary` but contain no usable quota reading. Credential and token files were not opened.
+- Local cache metadata, state field names and SQLite schemas expose conversation metadata, not a quota snapshot. CLI logs refer to `retrieveUserQuotaSummary` and log quota refresh errors, but hold no numeric quota reading. Credential and token files were not opened.
 - [Google's Antigravity plans](https://antigravity.google/docs/plans.md) describes Pro and Ultra quotas refreshing every five hours, with weekly limits. Quota depends on work and available capacity. Google publishes **no numeric daily Antigravity limit** there. Account-specific quota is shown on the app's Settings page, which this reader does not access.
 - The [Gemini CLI quota table](https://geminicli.com/docs/resources/quota-and-pricing/) lists daily request caps of 1,000 for individuals, 1,500 for AI Pro and 2,000 for AI Ultra. These are Gemini CLI limits, not an Antigravity daily allowance. Applying 1,500 to this pool would invent a limit. The exact subscribed tier is also unconfirmed.
 
