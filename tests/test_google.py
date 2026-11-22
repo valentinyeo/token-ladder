@@ -123,6 +123,23 @@ class GooglePoolTests(unittest.TestCase):
         self.assertNotIn("used_up", got)
         self.assertEqual(got["used"], 3)
 
+    def test_quota_manager_recovery_without_function_name_clears_exhaustion(self):
+        self.write_log(EXHAUSTED,
+                       "I1122 09:20:00.000000  47 quota_manager.go:61] quota refresh complete")
+        self.assertNotIn("used_up", tl.read_google(NOW))
+
+    def test_newest_timestamp_wins_over_file_order(self):
+        self.write_log(RECOVERED, EXHAUSTED)
+        self.assertNotIn("used_up", tl.read_google(NOW))
+        self.write_log(EXHAUSTED.replace("09:05", "10:05"), RECOVERED)
+        self.assertEqual(tl.read_google(NOW)["used_up_at"], "2026-11-22T10:05:00Z")
+
+    def test_future_or_invalid_quota_lines_do_not_clear_exhaustion(self):
+        for hour in ("13", "25"):
+            with self.subTest(hour=hour):
+                self.write_log(EXHAUSTED, RECOVERED.replace("09:20", f"{hour}:20"))
+                self.assertEqual(tl.read_google(NOW)["used_up_at"], "2026-11-22T09:05:00Z")
+
     def test_no_errors_keeps_todays_behaviour(self):
         self.history.write_text(FIXTURE.read_text())
         self.write_log(REFRESH, "I1122 09:30:00.000000      47 quota_manager.go:41] doRefreshQuota: skipped (throttled)")

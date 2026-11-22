@@ -822,7 +822,7 @@ def read_grok(now, cfg=None):
 
 GOOGLE_LOG = ".gemini/antigravity-cli/cli.log"
 GOOGLE_LOG_LINE = re.compile(r"^[IWEF](\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?")
-GOOGLE_QUOTA_LINE = re.compile(r"dorefreshquota|retrieveuserquotasummary|quota[ _-]?summary", re.I)
+GOOGLE_QUOTA_LINE = re.compile(r"quota_manager\.go|dorefreshquota|retrieveuserquotasummary|quota[ _-]?summary", re.I)
 GOOGLE_QUOTA_ERROR = re.compile(
     r"resource[ _-]?exhausted|rate[ _-]?limit|too many requests|\b429\b|quota[ _-]?(?:exceeded|exhausted)",
     re.I)
@@ -839,19 +839,19 @@ def google_quota_used_up(now):
                     continue
                 if not (GOOGLE_QUOTA_LINE.search(line) or GOOGLE_QUOTA_ERROR.search(line)):
                     continue
-                newest = match, line
+                micro = int((match.group(6) or "0")[:6].ljust(6, "0"))
+                try:
+                    stamp = datetime(local.year, local.month, local.day, int(match.group(3)), int(match.group(4)),
+                                     int(match.group(5)), micro).astimezone(timezone.utc)
+                except (ValueError, OverflowError, OSError):
+                    continue
+                if stamp.timestamp() <= now and (newest is None or stamp >= newest[0]):
+                    newest = stamp, line
     except OSError:
         return None
     if newest is None or not GOOGLE_QUOTA_ERROR.search(newest[1]):
         return None
-    match = newest[0]
-    micro = int((match.group(6) or "0")[:6].ljust(6, "0"))
-    try:
-        stamp = datetime(local.year, local.month, local.day, int(match.group(3)), int(match.group(4)),
-                         int(match.group(5)), micro, tzinfo=local.tzinfo).astimezone(timezone.utc)
-    except (ValueError, OverflowError):
-        return None
-    return {"used_up_at": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"), "state": "OFF", "used_up": True}
+    return {"used_up_at": newest[0].strftime("%Y-%m-%dT%H:%M:%SZ"), "state": "OFF", "used_up": True}
 
 
 def read_google(now):
