@@ -21,16 +21,32 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Install cursor-agent
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v cursor-agent >/dev/null 2>&1; then
+          exit 0
+        fi
+        if [ -x "$HOME/.local/bin/cursor-agent" ]; then
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          exit 0
+        fi
+        curl -fsSL https://cursor.com/install | bash
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
     - name: ladder-call
       id: run
       shell: bash
       env:
+        GEMINI_API_KEY: ${{ env.GEMINI_API_KEY }}
+        CURSOR_API_KEY: ${{ env.CURSOR_API_KEY }}
         AI_GATEWAY_API_KEY: ${{ env.AI_GATEWAY_API_KEY }}
         OPENCODE_API_KEY: ${{ env.OPENCODE_API_KEY }}
         DEEPSEEK_API_KEY: ${{ env.DEEPSEEK_API_KEY }}
         OPENROUTER_API_KEY: ${{ env.OPENROUTER_API_KEY }}
       run: |
         set -euo pipefail
+        export PATH="$HOME/.local/bin:${PATH}"
         tag="$(printf '%s' "${{ inputs.purpose }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-$$-${RANDOM}" | sha256sum | cut -c1-12)"
         answer="${RUNNER_TEMP}/ladder-call-answer-${tag}.json"
         log="${RUNNER_TEMP}/ladder-call-${tag}.log"

@@ -2,6 +2,8 @@
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -10,6 +12,14 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
 SKIP_HTTP = {401, 402, 403, 404, 408, 425, 429}
+CURSOR_RATE_MARKERS = (
+    'rate limit',
+    'rate_limit',
+    'rate-limit',
+    'too many requests',
+    'quota exceeded',
+    'resource exhausted',
+)
 
 sys.path.insert(0, str(REPO))
 from verdict import answer_text, find_verdict
@@ -40,6 +50,108 @@ def load_lanes():
         return json.load(fh)
 
 
+def message_content(result):
+    try:
+        choices = result.get('choices') or []
+        if not choices:
+            return ''
+        msg = choices[0].get('message') or {}
+        content = msg.get('content')
+        if content is None:
+            return ''
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get('type') == 'text':
+                        parts.append(part.get('text') or '')
+                    elif 'text' in part:
+                        parts.append(part.get('text') or '')
+                elif isinstance(part, str):
+                    parts.append(part)
+            return ''.join(parts).strip()
+        return ''
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ''
+
+
+def messages_prompt(body):
+    messages = body.get('messages')
+    if not isinstance(messages, list):
+        return ''
+    parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get('role') or 'user'
+        content = message.get('content')
+        if content is None:
+            continue
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = message_content({'choices': [{'message': {'content': content}}]})
+        else:
+            text = str(content).strip()
+        if text:
+            parts.append(f'{role}: {text}')
+    return '\n'.join(parts)
+
+
+def cursor_agent_bin():
+    override = os.environ.get('LADDER_CALL_CURSOR_AGENT', '').strip()
+    if override:
+        return override
+    found = shutil.which('cursor-agent')
+    if found:
+        return found
+    candidate = Path.home() / '.local' / 'bin' / 'cursor-agent'
+    if candidate.is_file():
+        return str(candidate)
+    return ''
+
+
+def cursor_rate_limited(text):
+    lower = text.lower()
+    return any(marker in lower for marker in CURSOR_RATE_MARKERS)
+
+
+def call_cursor_lane(lane, key, body):
+    prompt = messages_prompt(body)
+    if not prompt:
+        return None, 'empty answer'
+    bin_path = cursor_agent_bin()
+    if not bin_path:
+        return None, 'no cursor-agent'
+    model = lane.get('model') or 'composer-2.5'
+    env = os.environ.copy()
+    env['CURSOR_API_KEY'] = key
+    cmd = [bin_path, '-p', '--output-format', 'text', '--model', model, prompt]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds(),
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except OSError as exc:
+        return None, type(exc).__name__
+    if proc.returncode != 0:
+        return None, f'exit {proc.returncode}'
+    text = (proc.stdout or '').strip()
+    if not text:
+        return None, 'empty answer'
+    if cursor_rate_limited(text):
+        return None, 'rate limit'
+    return {'choices': [{'message': {'content': text}}]}, None
+
+
 def call_lane(lane, key, body):
     url = lane_url(lane)
     headers = {
@@ -47,10 +159,18 @@ def call_lane(lane, key, body):
         'Content-Type': 'application/json',
         'User-Agent': 'token-ladder-ladder-call/1',
     }
-    if lane['name'] == 'opencode-go' and os.environ.get('GITHUB_RUN_ID'):
-        headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+    if lane['name'] == 'opencode-go':
+        if os.environ.get('GITHUB_RUN_ID'):
+            headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+        else:
+            headers['x-opencode-session'] = 'token-ladder-ladder-call'
     payload = dict(body)
     payload['model'] = lane['model']
+    if lane['name'] == 'vercel-ai-gateway':
+        payload['providerOptions'] = {'gateway': {'only': ['token-pass']}}
+    provider = lane.get('provider')
+    if isinstance(provider, dict) and provider:
+        payload['provider'] = provider
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_seconds()) as response:
         raw = response.read()
@@ -96,7 +216,13 @@ def main():
             log_skip(lane['name'], 'no key')
             continue
         try:
-            result = call_lane(lane, key, body)
+            if lane.get('kind') == 'cursor':
+                result, cursor_skip = call_cursor_lane(lane, key, body)
+                if cursor_skip:
+                    log_skip(lane['name'], cursor_skip)
+                    continue
+            else:
+                result = call_lane(lane, key, body)
         except urllib.error.HTTPError as exc:
             if exc.code in SKIP_HTTP:
                 log_skip(lane['name'], skip_reason(lane, exc=exc))
