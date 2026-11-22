@@ -1,5 +1,17 @@
 [
   {
+    "name": "google",
+    "key_env": "GEMINI_API_KEY",
+    "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+    "model": "gemini-2.5-flash"
+  },
+  {
+    "name": "cursor",
+    "key_env": "CURSOR_API_KEY",
+    "kind": "cursor",
+    "model": "composer-2.5"
+  },
+  {
     "name": "vercel-ai-gateway",
     "key_env": "AI_GATEWAY_API_KEY",
     "url": "https://ai-gateway.vercel.sh/v1/chat/completions",
