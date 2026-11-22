@@ -19,12 +19,12 @@ def pool(state="ON", ratio=0.5):
     return {"state": state, "used_pct": 40.0, "pace_ratio": ratio}
 
 
-LANES = [{"lane": "vercel", "pool": None, "command": "run vercel"},
+LANES = [{"lane": "opencode", "pool": "opencode", "command": "run opencode"},
+         {"lane": "vercel", "pool": None, "command": "run vercel"},
+         {"lane": "openrouter", "pool": None, "command": "run openrouter"},
          {"lane": "deepseek", "pool": None, "command": "run deepseek"},
-         {"lane": "opencode", "pool": "opencode", "command": "run opencode"},
          {"lane": "codex", "pool": "codex", "command": "run codex"},
-         {"lane": "cursor", "pool": "grok", "command": "run cursor"},
-         {"lane": "openrouter", "pool": None, "command": "run openrouter"}]
+         {"lane": "cursor", "pool": "grok", "command": "run cursor"}]
 T = 1_800_000_000
 
 
@@ -58,17 +58,17 @@ class BurnTests(unittest.TestCase):
     def test_used_up_burn_lane_falls_through(self):
         limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
         got = pick_with_burn({"grok": pool("OFF", 3.0), "codex": pool()}, {"lane": "cursor", "until": burn_until()},
-                             limits=limits)
+                             limits={**limits, "openrouter": T + 60})
         self.assertEqual(got["plan"], "codex")
         self.assertIn("cursor (used up", got["reason"])
 
     def test_expired_burn_restores_pace_skip(self):
         limits = {lane["lane"]: T + 60 for lane in LANES
-                  if lane["lane"] not in ("cursor", "openrouter", "codex")}
+                  if lane["lane"] not in ("cursor", "codex")}
         expired = datetime.fromtimestamp(T - 60, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
         got = pick_with_burn({"grok": pool("ON", 3.0), "codex": pool("ON", 3.0)}, {"lane": "cursor", "until": expired},
                              limits=limits)
-        self.assertEqual(got["plan"], "openrouter")
+        self.assertEqual(got["plan"], "codex")
         self.assertIn("cursor (pace 3.00x", got["reason"])
 
     def test_malformed_burn_is_ignored(self):
@@ -93,21 +93,21 @@ class BurnTests(unittest.TestCase):
 class PickTests(unittest.TestCase):
     def test_first_lane_wins_when_nothing_reads_it(self):
         got = pick({"codex": pool(), "grok": pool()})
-        self.assertEqual((got["plan"], got["command"]), ("vercel", "run vercel"))
+        self.assertEqual((got["plan"], got["command"]), ("opencode", "run opencode"))
         self.assertIn("no usage reader", got["reason"])
 
     def test_limited_lane_is_skipped_until_its_time(self):
-        got = pick({}, {"vercel": T + 600})
-        self.assertEqual(got["plan"], "deepseek")
+        got = pick({}, {"vercel": T + 600, "opencode": T + 600})
+        self.assertEqual(got["plan"], "openrouter")
         self.assertIn("vercel (limited until", got["reason"])
-        self.assertEqual(pick({}, {"vercel": T - 1})["plan"], "vercel")
+        self.assertEqual(pick({}, {"vercel": T - 1, "opencode": T + 600})["plan"], "vercel")
 
     def test_every_limited_deepseek_lane_falls_to_codex(self):
-        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
+        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60, "openrouter": T + 60}
         self.assertEqual(pick({"codex": pool()}, limits)["plan"], "codex")
 
     def test_used_up_pool_is_skipped(self):
-        limits = {"vercel": T + 60, "deepseek": T + 60}
+        limits = {"vercel": T + 60, "deepseek": T + 60, "openrouter": T + 60}
         got = pick({"opencode": {"state": "OFF", "note": "credit gone"}, "codex": pool()}, limits)
         self.assertEqual(got["plan"], "codex")
         self.assertIn("opencode (used up: credit gone)", got["reason"])
@@ -116,10 +116,10 @@ class PickTests(unittest.TestCase):
         limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
         got = pick({"codex": pool("OFF", 1.9), "grok": pool("WARN", 1.27)}, limits)
         self.assertEqual(got["plan"], "openrouter")
-        self.assertIn("cursor (pace 1.27x is above 1.1x)", got["reason"])
+        self.assertIn("skipped", got["reason"])
 
     def test_pace_exactly_on_the_line_is_allowed(self):
-        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
+        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60, "openrouter": T + 60}
         self.assertEqual(pick({"codex": pool("ON", 1.1)}, limits)["plan"], "codex")
 
     def test_unknown_state_is_not_skipped(self):
@@ -140,10 +140,10 @@ class PickTests(unittest.TestCase):
     def test_empty_and_garbage_input_do_not_crash(self):
         for bad in ({}, None, [], {"codex": "x", "grok": None}):
             with self.subTest(bad=bad):
-                self.assertEqual(pp.pick(LANES, bad, None, T)["plan"], "vercel")
+                self.assertEqual(pp.pick(LANES, bad, None, T)["plan"], "opencode")
 
     def test_warn_line_comes_from_argument(self):
-        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60}
+        limits = {"vercel": T + 60, "deepseek": T + 60, "opencode": T + 60, "openrouter": T + 60}
         self.assertEqual(pick({"codex": pool("ON", 1.5)}, limits, warn=2.0)["plan"], "codex")
         self.assertEqual(pick({"codex": pool("ON", 1.5)}, limits, warn=1.0)["plan"], "cursor")
 
@@ -178,9 +178,9 @@ class RunTests(unittest.TestCase):
 
     def test_each_attempt_logs_its_lane_and_session(self):
         with mock.patch.dict(os.environ, {"CLAUDE_CODE_SESSION_ID": "sid-1"}):
-            self.go({"run vercel": (1, "429 Too Many Requests"), "run deepseek": (0, "done")})
+            self.go({"run opencode": (1, "429 Too Many Requests"), "run vercel": (0, "done")})
         self.assertEqual([(e["lane"], e["session"], e["at"]) for e in self.logged()],
-                         [("vercel", "sid-1", T), ("deepseek", "sid-1", T)])
+                         [("opencode", "sid-1", T), ("vercel", "sid-1", T)])
 
     def test_no_lane_left_logs_a_null_lane(self):
         limits = {lane["lane"]: T + 60 for lane in LANES}
@@ -198,42 +198,43 @@ class RunTests(unittest.TestCase):
         self.assertNotIn("top", said.lower())
 
     def test_success_runs_one_lane(self):
-        self.assertEqual(self.go({"run vercel": (0, "done")}), 0)
-        self.assertEqual(self.ran, ["run vercel"])
+        self.assertEqual(self.go({"run opencode": (0, "done")}), 0)
+        self.assertEqual(self.ran, ["run opencode"])
         self.assertEqual(pp.read_limits(self.limits), {})
 
     def test_429_marks_the_lane_and_runs_the_next(self):
-        code = self.go({"run vercel": (1, '429: {"error":"Too Many Requests"}'), "run deepseek": (0, "done")})
+        code = self.go({"run opencode": (1, '429: {"error":"Too Many Requests"}'), "run vercel": (0, "done")})
         self.assertEqual(code, 0)
-        self.assertEqual(self.ran, ["run vercel", "run deepseek"])
-        self.assertEqual(pp.read_limits(self.limits), {"vercel": T + 3600})
-        self.assertTrue(any("vercel hit a rate or usage limit" in line for line in self.said), self.said)
+        self.assertEqual(self.ran, ["run opencode", "run vercel"])
+        self.assertEqual(pp.read_limits(self.limits), {"opencode": T + 3600})
+        self.assertTrue(any("opencode hit a rate or usage limit" in line for line in self.said), self.said)
 
     def test_empty_credit_is_skipped_longer(self):
+        Path(self.limits).write_text(json.dumps({"opencode": T + 3600, "openrouter": T + 3600}))
         self.go({"run vercel": (1, '402: {"error":{"message":"Insufficient Balance"}}'), "run deepseek": (0, "ok")})
         self.assertEqual(pp.read_limits(self.limits)["vercel"], T + 12 * 3600)
 
     def test_clean_exit_with_no_output_is_done_not_retried(self):
-        self.assertEqual(self.go({"run vercel": (0, "  \n")}), 0)
-        self.assertEqual(self.ran, ["run vercel"])
+        self.assertEqual(self.go({"run opencode": (0, "  \n")}), 0)
+        self.assertEqual(self.ran, ["run opencode"])
         self.assertEqual(pp.read_limits(self.limits), {})
 
     def test_clean_exit_that_mentions_429_is_done_not_retried(self):
-        self.assertEqual(self.go({"run vercel": (0, "fixed the 429 handler")}), 0)
-        self.assertEqual(self.ran, ["run vercel"])
+        self.assertEqual(self.go({"run opencode": (0, "fixed the 429 handler")}), 0)
+        self.assertEqual(self.ran, ["run opencode"])
 
     def test_failed_exit_with_no_output_counts_as_limited(self):
-        self.go({"run vercel": (1, "  \n"), "run deepseek": (0, "ok")})
-        self.assertIn("vercel", pp.read_limits(self.limits))
+        self.go({"run opencode": (1, "  \n"), "run vercel": (0, "ok")})
+        self.assertIn("opencode", pp.read_limits(self.limits))
         self.assertTrue(any("exited with no output" in line for line in self.said), self.said)
 
     def test_ordinary_failure_is_returned_not_retried(self):
-        self.assertEqual(self.go({"run vercel": (2, "SyntaxError in your code")}), 2)
-        self.assertEqual(self.ran, ["run vercel"])
+        self.assertEqual(self.go({"run opencode": (2, "SyntaxError in your code")}), 2)
+        self.assertEqual(self.ran, ["run opencode"])
         self.assertEqual(pp.read_limits(self.limits), {})
 
     def test_success_that_mentions_a_rate_limit_is_kept(self):
-        self.assertEqual(self.go({"run vercel": (0, "added a rate limit, 429 on overflow")}), 0)
+        self.assertEqual(self.go({"run opencode": (0, "added a rate limit, 429 on overflow")}), 0)
         self.assertEqual(pp.read_limits(self.limits), {})
 
     def test_every_lane_limited_stops_loudly(self):
@@ -243,8 +244,8 @@ class RunTests(unittest.TestCase):
         self.assertIn("no lane left, nothing ran", self.said[-1])
 
     def test_hours_come_from_config(self):
-        self.go({"run vercel": (1, "429"), "run deepseek": (0, "ok")}, cfg={"limited_hours": 3})
-        self.assertEqual(pp.read_limits(self.limits)["vercel"], T + 3 * 3600)
+        self.go({"run opencode": (1, "429"), "run vercel": (0, "ok")}, cfg={"limited_hours": 3})
+        self.assertEqual(pp.read_limits(self.limits)["opencode"], T + 3 * 3600)
 
     def test_limit_kind_reads_real_error_texts(self):
         cases = {"Error: You've hit your usage limit. Try again later": "rate",
@@ -286,9 +287,10 @@ class CreditTests(unittest.TestCase):
     def test_under_floor_is_off_and_the_next_lane_runs(self):
         Path(self.path).write_text(json.dumps({"vercel": {"usd": 1.2, "at": T - 60}, "deepseek": {"usd": 11.3, "at": T - 60}}))
         lanes = [dict(lane, credit=lane["lane"]) if lane["lane"] in ("vercel", "deepseek") else lane for lane in LANES]
-        pools = pp.with_credits({}, lanes, {}, T, self.path, refresh=lambda *a: self.fail("refreshed"))
+        pools = pp.with_credits({"opencode": pool("OFF")}, lanes, {}, T, self.path,
+                                refresh=lambda *a: self.fail("refreshed"))
         self.assertEqual(pools["credit:vercel"]["state"], "OFF")
-        got = pp.pick(lanes, pools, {}, T)
+        got = pp.pick(lanes, pools, {"opencode": T + 60, "openrouter": T + 60}, T)
         self.assertEqual(got["plan"], "deepseek")
         self.assertIn("vercel (used up: $1.20 credit left, under $2)", got["reason"])
         self.assertIn("$11.30 credit left", got["reason"])
@@ -388,16 +390,28 @@ def lane_use(at, provider="opencode-go", tokens=0, cost=None):
 
 REAL_AT = 1795174461.7206776
 REAL_USD = 20.57
-REAL_HISTORY = [{"at": REAL_AT, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+REAL_OPENCODE_USAGE = {
+    "usage": {
+        "rolling": {"status": "ok", "percent": 0, "resetsAt": "2026-11-22T22:55:58.061Z"},
+        "weekly": {"status": "ok", "percent": 0, "resetsAt": "2026-11-23T00:00:00.000Z"},
+        "monthly": {"status": "rate-limited", "percent": 100, "resetsAt": "2026-11-30T23:01:10.000Z"},
+    }
+}
+
+def month_full_windows():
+    return {"5-hour": 50.0, "weekly": 50.0, "monthly": 100.0}
+
+
+REAL_HISTORY = [{"at": REAL_AT, "windows": month_full_windows(),
                  "credits_usd": REAL_USD, "today_usd": 2.36, "source": "credits"},
-                {"at": REAL_AT + 1800, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+                {"at": REAL_AT + 1800, "windows": month_full_windows(),
                  "credits_usd": None, "today_usd": None, "source": "api"},
-                {"at": REAL_AT + 3600, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+                {"at": REAL_AT + 3600, "windows": month_full_windows(),
                  "credits_usd": None, "today_usd": None, "source": "api"}]
 
 
 def api_at(at):
-    return {"at": at, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+    return {"at": at, "windows": month_full_windows(),
             "credits_usd": None, "today_usd": None, "source": "api"}
 
 
@@ -410,19 +424,20 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertEqual(got["state"], "unknown")
 
     def test_full_month_runs_on_fresh_credit_above_the_floor(self):
-        rows = [{"at": NOW - 600, "windows": {"monthly": 100}}, {"at": NOW - 300, "windows": {}, "credits_usd": 23.12}]
+        rows = [{"at": NOW - 600, "windows": month_full_windows()}, {"at": NOW - 300, "windows": {}, "credits_usd": 23.12}]
         got = self.state(rows)
         self.assertEqual(got["state"], "ON")
         self.assertIn("$23.12", got["note"])
 
     def test_full_month_with_credit_under_the_floor_is_off(self):
-        rows = [{"at": NOW - 600, "windows": {"monthly": 100}}, {"at": NOW - 300, "windows": {}, "credits_usd": 5.9}]
+        rows = [{"at": NOW - 600, "windows": month_full_windows()}, {"at": NOW - 300, "windows": {}, "credits_usd": 5.9}]
         got = self.state(rows)
         self.assertEqual(got["state"], "OFF")
-        self.assertEqual(pick({"opencode": got, "codex": pool()}, {"vercel": T + 60, "deepseek": T + 60})["plan"], "codex")
+        lanes = {"vercel": T + 60, "deepseek": T + 60, "openrouter": T + 60}
+        self.assertEqual(pick({"opencode": got, "codex": pool()}, lanes)["plan"], "codex")
 
     def test_full_month_with_no_credit_reading_at_all_is_off(self):
-        self.assertEqual(self.state([{"at": NOW - 600, "windows": {"monthly": 100}}])["state"], "OFF")
+        self.assertEqual(self.state([{"at": NOW - 600, "windows": month_full_windows()}])["state"], "OFF")
 
     def test_pc_off_estimates_from_the_api_history_and_the_lane_spend(self):
         now = REAL_AT + 3 * 3600
@@ -439,7 +454,7 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertEqual(got["state"], "OFF")
         self.assertIn("estimated credit $5.57", got["note"])
         self.assertIn("under $6", got["note"])
-        lanes = {"vercel": T + 60, "deepseek": T + 60}
+        lanes = {"vercel": T + 60, "deepseek": T + 60, "openrouter": T + 60}
         self.assertEqual(pick({"opencode": got, "codex": pool()}, lanes)["plan"], "codex")
 
     def test_estimate_older_than_24_hours_is_refused(self):
@@ -484,7 +499,7 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertEqual(self.state(rows)["state"], "ON")
 
     def test_stale_reading_is_unknown(self):
-        got = self.state([{"at": NOW - 13 * 3600, "windows": {"monthly": 100}, "credits_usd": 0.5}])
+        got = self.state([{"at": NOW - 13 * 3600, "windows": month_full_windows(), "credits_usd": 0.5}])
         self.assertEqual(got["state"], "unknown")
 
     def test_windows_with_room_are_on(self):
@@ -508,12 +523,26 @@ class OpencodePoolTests(unittest.TestCase):
         self.assertEqual(pp.with_opencode(pools, {}, NOW), pools)
         self.assertIn("opencode", pp.with_opencode({"codex": pool()}, {}, NOW))
 
+    def test_monthly_meter_full_with_short_windows_still_on(self):
+        rows = [{"at": NOW - 60, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0},
+                 "statuses": {"monthly": "rate-limited"}}]
+        got = self.state(rows)
+        self.assertEqual(got["state"], "ON")
+        self.assertIn("shorter windows still have room", got["note"])
+
+    def test_opencode_usage_api_shape(self):
+        used, statuses = pp.opencode_usage_from_api(REAL_OPENCODE_USAGE)
+        self.assertEqual(used, {"5-hour": 0.0, "weekly": 0.0, "monthly": 100.0})
+        self.assertEqual(statuses["monthly"], "rate-limited")
+        self.assertFalse(pp.monthly_allowance_exhausted(used, statuses, {}))
+
 
 class ConfigTests(unittest.TestCase):
     def test_shipped_lanes_follow_valentins_order(self):
         cfg = pp.load_config()
         lanes = pp.lanes_from(cfg)
-        self.assertEqual([lane["lane"] for lane in lanes], ["vercel", "deepseek", "opencode", "codex", "cursor", "openrouter"])
+        self.assertEqual([lane["lane"] for lane in lanes],
+                         ["opencode", "vercel", "openrouter", "deepseek", "codex", "cursor"])
         self.assertEqual(cfg["pace_warn_ratio"], pp.DEFAULT_PACE_WARN)
 
     def test_shipped_commands_obey_the_model_rules(self):
@@ -601,11 +630,16 @@ class WorkerEnvTests(unittest.TestCase):
 class CommandTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
+        self.pacing = Path(self.home) / ".local/state/pacing"
+        self.pacing.mkdir(parents=True)
+        (self.pacing / "opencode-history.jsonl").write_text(
+            json.dumps({"at": T, "windows": {"5-hour": 0.0, "weekly": 0.0, "monthly": 0.0}}) + "\n")
 
     def cli(self, *args):
         return subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), *args],
                               capture_output=True, text=True,
                               env={"HOME": self.home, "PATH": "/usr/bin:/bin",
+                                   "PLAN_PICK_PACING_DIR": str(self.pacing),
                                    "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
 
     def run_cli(self, pools, *args):
@@ -618,15 +652,16 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         got = json.loads(out.stdout)
         self.assertEqual(sorted(got), ["command", "plan", "reason"])
-        self.assertEqual(got["plan"], "vercel")
+        self.assertEqual(got["plan"], "opencode")
 
     def test_limited_after_a_429_moves_the_pick_to_the_next_lane(self):
-        self.assertEqual(json.loads(self.run_cli({}, "--json").stdout)["plan"], "vercel")
+        self.assertEqual(json.loads(self.run_cli({}, "--json").stdout)["plan"], "opencode")
         out = self.cli("--limited", "vercel")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(out.stdout.startswith("Lane vercel is skipped until"), out.stdout)
+        self.cli("--limited", "opencode")
         got = json.loads(self.run_cli({}, "--json").stdout)
-        self.assertEqual(got["plan"], "deepseek")
+        self.assertEqual(got["plan"], "openrouter")
         self.assertIn("vercel (limited until", got["reason"])
 
     def test_run_skips_a_429_lane_end_to_end(self):
@@ -639,6 +674,7 @@ class CommandTests(unittest.TestCase):
         pools = Path(self.home) / "pools.json"
         pools.write_text("{}")
         env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
                "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
         out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
                              capture_output=True, text=True, env=env)
@@ -678,7 +714,7 @@ class CommandTests(unittest.TestCase):
 
     def test_text_line_names_plan_and_launch(self):
         out = self.run_cli({"codex": pool("ON", 2.3)})
-        self.assertTrue(out.stdout.startswith("Worker plan: vercel. Launch: ~/.local/bin/plan-pick --run (reads brief.txt, runs ~/.npm-global/bin/pi -p"), out.stdout)
+        self.assertTrue(out.stdout.startswith("Worker plan: opencode. Launch: ~/.local/bin/plan-pick --run (reads brief.txt, runs ~/.npm-global/bin/pi -p"), out.stdout)
 
     def test_none_line_has_no_launch(self):
         for lane in ("vercel", "deepseek", "openrouter"):

@@ -59,10 +59,17 @@ def action_run_script():
 class StubHandler(BaseHTTPRequestHandler):
     routes = {}
     delay = 0
+    last_bodies = []
 
     def do_POST(self):
         if self.delay:
             time.sleep(self.delay)
+        length = int(self.headers.get('Content-Length') or 0)
+        raw = self.rfile.read(length) if length else b''
+        try:
+            StubHandler.last_bodies.append(json.loads(raw))
+        except json.JSONDecodeError:
+            StubHandler.last_bodies.append(None)
         route = self.routes.get(self.path)
         if not route:
             self.send_response(404)
@@ -135,6 +142,27 @@ def write_lanes(port, path):
     return fh.name
 
 
+def write_vercel_then_opencode(port):
+    lanes = [
+        {
+            'name': 'vercel-ai-gateway',
+            'key_env': 'AI_GATEWAY_API_KEY',
+            'url': f'http://127.0.0.1:{port}/v1/chat/completions',
+            'model': 'test-model',
+        },
+        {
+            'name': 'opencode-go',
+            'key_env': 'OPENCODE_API_KEY',
+            'url': f'http://127.0.0.1:{port}/zen/go/v1/chat/completions',
+            'model': 'test-model',
+        },
+    ]
+    fh = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+    json.dump(lanes, fh)
+    fh.close()
+    return fh.name
+
+
 class LadderCallTests(unittest.TestCase):
     def test_gateway_402_falls_to_opencode(self):
         server, port = run_server({
@@ -151,7 +179,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('402', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
@@ -173,7 +204,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('lane vercel-ai-gateway skipped: 429', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
@@ -219,7 +253,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0)
         self.assertIn('skipped: empty answer', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
@@ -239,7 +276,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertNotIn('Traceback', result.stderr + result.stdout)
         self.assertIn('invalid response', result.stderr)
@@ -289,7 +329,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('skipped: 401', result.stderr)
 
@@ -336,7 +379,14 @@ class LadderCallTests(unittest.TestCase):
                     'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
                     'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
                 }
-                result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+                lanes_path = write_vercel_then_opencode(port)
+                try:
+                    result = ladder_call(
+                        env, {'messages': [{'role': 'user', 'content': 'hi'}]},
+                        lanes_file=lanes_path,
+                    )
+                finally:
+                    os.unlink(lanes_path)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'skipped: {status}', result.stderr)
                 self.assertIn('lane opencode-go answered', result.stderr)
@@ -525,6 +575,54 @@ class LadderCallTests(unittest.TestCase):
             self.assertIn('lane vercel-ai-gateway answered', result.stderr)
             payload = json.loads(result.stdout)
             self.assertEqual(payload['choices'][0]['message']['content'], 'from-vercel')
+
+    def test_vercel_payload_pins_token_pass(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        env = {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_LANES': lanes_path}
+        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = StubHandler.last_bodies[-1]
+        self.assertEqual(body['providerOptions'], {'gateway': {'only': ['token-pass']}})
+
+    def test_openrouter_payload_pins_streamlake(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/api/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes = [{
+            'name': 'openrouter',
+            'key_env': 'OPENROUTER_API_KEY',
+            'url': f'http://127.0.0.1:{port}/api/v1/chat/completions',
+            'model': 'deepseek/deepseek-v4.1-flash-1017',
+            'provider': {'only': ['StreamLake'], 'allow_fallbacks': False},
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        env = {'OPENROUTER_API_KEY': 'k', 'LADDER_CALL_LANES': lanes_path}
+        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = StubHandler.last_bodies[-1]
+        self.assertEqual(body['provider'], {'only': ['StreamLake'], 'allow_fallbacks': False})
+
+    def test_ci_lanes_model_ids(self):
+        lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text(encoding='utf-8'))
+        models = {lane['name']: lane['model'] for lane in lanes}
+        self.assertEqual(models['vercel-ai-gateway'], 'deepseek/deepseek-v4.1-flash')
+        self.assertEqual(models['openrouter'], 'deepseek/deepseek-v4.1-flash-1017')
+        self.assertEqual(models['deepseek'], 'deepseek-flash')
 
     def test_timeout_skipped_with_env(self):
         class SlowHandler(BaseHTTPRequestHandler):

@@ -100,7 +100,7 @@ class BashRulesTests(unittest.TestCase):
         self.assertIsNone(tl.bash_refusal("python3 - <<'EOF'\ns='ccr start'\nEOF", {}))
 
     def test_pi_lanes_allowed_for_deepseek_flash_only(self):
-        for ok in ("pi -p --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash-1017 --thinking medium",
+        for ok in ("pi -p --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash --thinking medium",
                    "pi --provider=vercel-ai-gateway --model=deepseek/deepseek-v4.1-flash",
                    "pi -p --provider deepseek --model deepseek-flash",
                    "pi -p --provider opencode-go --model deepseek-v4.1-flash",
