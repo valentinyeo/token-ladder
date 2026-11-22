@@ -1,7 +1,5 @@
 {
   "grok_stale_hours": 3,
-  "opencode_estimate_hours": 24,
-  "opencode_estimate_usd_per_mtok": 2.0,
   "unknown_assumed_pct": 70,
   "pool_warn_pct": 80,
   "pace_warn_ratio": 1.1,
@@ -97,12 +95,14 @@
       "source": "unknown"
     },
     {
-      "name": "OpenCode Go",
+      "name": "OpenCode Go Plus",
+      "monthly_price_usd": 40,
+      "included_allowance_usd": 200,
       "vendor": "opencode",
       "included_models": ["DeepSeek V4.1 Flash"],
       "runs_on": ["local"],
-      "extra_cost": "none until the monthly window is full, then prepaid credit with auto-recharge",
-      "source": "unknown"
+      "extra_cost": "paid extra usage is never allowed for workers",
+      "source": "Valentin, 2026-11-22"
     },
     {
       "name": "OpenRouter",

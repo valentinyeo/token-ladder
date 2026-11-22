@@ -36,9 +36,29 @@ Change the pin in `ci/lanes.json` and both paths follow.
 
 ## OpenCode monthly allowance
 
-OpenCode can report its monthly meter at 100% while the 5-hour and weekly windows still have room.
-`plan-pick` keeps the OpenCode lane ON then, and moves to the prepaid credit pool only when the 5-hour or weekly window is full or at or above `opencode_monthly_slack_pct`, or when either reading is missing.
-That key lives in `config.json` and defaults to 25.
+Valentin has **OpenCode Go Plus**, $40/month with a $200 monthly DeepSeek allowance.
+`config.json` `plans` holds the price and allowance. The reader converts the monthly percentage to dollars against that allowance.
+`plan-pick --plans` shows the monthly, weekly, and 5-hour readings separately.
+A monthly reading of 100% or more means used up, even when weekly and 5-hour readings are zero.
+Workers never fall back to OpenCode extra usage or prepaid credit. Missing or stale monthly readings also close the lane until a fresh reading arrives.
+The reader uses `~/.local/state/pacing/opencode-history.jsonl`; it does not estimate an extra-usage balance from token counts.
+
+## Monthly burn report
+
+```sh
+plan-pick --burn
+plan-pick --burn --json
+```
+
+The report totals this UTC calendar month's recorded pi message costs per lane and per caller directory from `~/.pi/agent/sessions/*/*.jsonl`.
+It also counts launches from `~/.local/state/token-ladder/launches.jsonl`.
+Each new `--run` attempt records `caller` as `MULTIBOT_SESSION`, or cwd when the name is absent.
+Older launches use their recorded cwd. Chat names and directories remain separate when the logs cannot link them.
+The report never reads or prints worker briefs, messages, or credentials.
+
+Recorded costs are not invoices or extra-usage charges. They do not distinguish included usage from paid usage.
+Missing costs remain unknown, with an unpriced-message count; the report never estimates dollars from token counts.
+Codex and Cursor launches without pi cost records show unknown spend rather than zero.
 
 ## Loop interval
 
@@ -120,6 +140,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 |---|---|---|
 | Claude | `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from `~/.claude/.credentials.json` | `five_hour`, `seven_day` (utilization %, `resets_at`) |
 | Codex | `rate_limits` in the newest `~/.codex/sessions/**/*.jsonl` token_count event (or `codex app-server` rate limit call) | `primary` weekly (`used_percent`, `resets_at`), credits balance |
+| OpenCode Go Plus ($40/month) | `~/.local/state/pacing/opencode-history.jsonl`; `plan-pick --plans` | $200 monthly DeepSeek allowance; monthly 100% means used up; weekly and 5-hour limits also apply; no paid extra usage for workers |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
 | Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
 
