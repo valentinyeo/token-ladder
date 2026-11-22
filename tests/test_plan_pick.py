@@ -673,6 +673,18 @@ class CommandTests(unittest.TestCase):
         path.write_text(json.dumps(pools))
         return self.cli("--pools", str(path), *args)
 
+    def plan_not_from(self, vendor, earlier=(), *args):
+        home = tempfile.mkdtemp()
+        pools = Path(home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        cmd = [sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--pools", str(pools)]
+        for lane in earlier:
+            subprocess.run(cmd + ["--limited", lane], capture_output=True, text=True, env=env)
+        return subprocess.run(cmd + ["--not-vendor", vendor, *args], capture_output=True, text=True, env=env)
+
     def test_json_output_has_three_fields(self):
         out = self.run_cli({"codex": pool()}, "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -738,6 +750,44 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(got["plan"], "cursor")
         line = self.run_cli({"codex": pool()}, "--not-vendor", "deepseek").stdout
         self.assertTrue(line.startswith("Worker plan: codex. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
+
+    def test_not_vendor_excludes_each_lane_by_its_own_vendor(self):
+        cases = (("opencode", (), "vercel"),
+                 ("vercel", ("opencode",), "openrouter"),
+                 ("openrouter", ("opencode", "vercel"), "deepseek"),
+                 ("deepseek", ("opencode", "vercel", "openrouter"), "codex"),
+                 ("codex", ("opencode", "vercel", "openrouter", "deepseek"), "cursor"),
+                 ("cursor", ("opencode", "vercel", "openrouter", "deepseek", "codex"), None))
+        for vendor, earlier, expected in cases:
+            with self.subTest(vendor=vendor):
+                out = self.plan_not_from(vendor, earlier)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                start = f"Worker plan: {expected}." if expected else "Worker plan: none."
+                self.assertTrue(out.stdout.startswith(start), out.stdout)
+
+    def test_not_vendor_also_applies_to_json(self):
+        out = self.plan_not_from("vercel", ("opencode",), "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["plan"], "openrouter")
+
+    def test_run_skips_a_lane_excluded_by_its_own_name(self):
+        cfg = {"lanes": [{"lane": "vercel", "credit": "vercel", "vendor": "deepseek",
+                          "command": "echo vercel-ran"},
+                         {"lane": "openrouter", "vendor": "deepseek", "command": "echo worker-done"}]}
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (repo / "config.json").write_text(json.dumps(cfg))
+        pools = Path(self.home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools),
+                              "--run", "--not-vendor", "vercel"], capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("worker-done", out.stdout)
+        self.assertNotIn("vercel-ran", out.stdout)
 
     def test_plans_prints_each_plan_and_the_no_extra_cost_rule(self):
         out = self.cli("--plans")

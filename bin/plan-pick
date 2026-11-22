@@ -256,6 +256,11 @@ def lanes_from(cfg):
             and isinstance(lane.get("command"), str)]
 
 
+def lane_names(lane):
+    names = (lane.get("lane"), lane.get("vendor"), lane.get("credit"))
+    return {name.lower() for name in names if isinstance(name, str)}
+
+
 def plans_from(cfg):
     plans = cfg.get("plans")
     if not isinstance(plans, list):
@@ -751,7 +756,8 @@ def main(argv):
             print(f"Claude helper: {'allowed' if answer['allowed'] else 'refused'}. Why: {answer['reason']}.")
         return 0 if answer["allowed"] else 3
     if args.not_vendor:
-        lanes = [lane for lane in lanes if lane.get("vendor") != args.not_vendor.lower()]
+        excluded = args.not_vendor.lower()
+        lanes = [lane for lane in lanes if excluded not in lane_names(lane)]
     burn = parse_burn(cfg, lanes)
     lanes = lanes_with_burn(lanes, burn)
     if args.run:
