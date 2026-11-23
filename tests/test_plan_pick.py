@@ -790,6 +790,115 @@ class ClaudeHelperTests(unittest.TestCase):
         self.assertFalse(pp.claude_helper(pools)["allowed"])
         self.assertTrue(pp.claude_helper(pools, warn=2.0)["allowed"])
 
+    def test_cached_status_fresh_and_stale_readings(self):
+        tmp = Path(tempfile.mkdtemp())
+        status = tmp / "status.json"
+        status.write_text(json.dumps({"ts": T - 120, "pools": {"claude": pool("ON", 0.6), "codex": pool("OFF", 3.0)}}))
+        pools, age = pp.read_cached_claude_pool(str(status), now=T)
+        self.assertEqual(sorted(pools), ["claude"])
+        self.assertEqual(age, 120.0)
+        got = pp.claude_helper(pools, now=T, path=str(tmp / "emergency.json"), reading_age=age)
+        self.assertTrue(got["allowed"])
+        self.assertNotIn("stale reading", got["reason"])
+
+        status.write_text(json.dumps({"ts": T - 900, "pools": {"claude": pool("ON", 0.6)}}))
+        pools, age = pp.read_cached_claude_pool(str(status), now=T)
+        got = pp.claude_helper(pools, now=T, path=str(tmp / "emergency.json"), reading_age=age)
+        self.assertNotIn("stale reading", got["reason"])
+
+        status.write_text(json.dumps({"ts": T - 1200, "pools": {"claude": pool("ON", 0.6)}}))
+        pools, age = pp.read_cached_claude_pool(str(status), now=T)
+        got = pp.claude_helper(pools, now=T, path=str(tmp / "emergency.json"), reading_age=age)
+        self.assertTrue(got["allowed"])
+        self.assertIn("stale reading 20m", got["reason"])
+
+        status.write_text(json.dumps({"ts": T - 5400, "pools": {"claude": pool("ON", 1.5)}}))
+        pools, age = pp.read_cached_claude_pool(str(status), now=T)
+        got = pp.claude_helper(pools, now=T, path=str(tmp / "emergency.json"), reading_age=age)
+        self.assertFalse(got["allowed"])
+        self.assertIn("stale reading 1h30m", got["reason"])
+
+        status.write_text(json.dumps({"ts": T - 7200, "pools": {"claude": pool("OFF", 0.2)}}))
+        pools, age = pp.read_cached_claude_pool(str(status), now=T)
+        got = pp.claude_helper(pools, now=T, path=str(tmp / "emergency.json"), reading_age=age)
+        self.assertFalse(got["allowed"])
+        self.assertIn("used up", got["reason"])
+        self.assertIn("stale reading 2h", got["reason"])
+
+    def test_cached_status_missing_or_corrupt_assumes_under_pace(self):
+        tmp = Path(tempfile.mkdtemp())
+        for path in (tmp / "missing.json", tmp / "bad.json", tmp / "empty.json"):
+            if path.name == "bad.json":
+                path.write_text("{broken")
+            elif path.name == "empty.json":
+                path.write_text(json.dumps({"ts": T - 3600, "pools": {"codex": pool("ON", 2.0)}}))
+            with self.subTest(path=path.name):
+                pools, age = pp.read_cached_claude_pool(str(path), now=T)
+                self.assertEqual(pools, {})
+                self.assertIsNone(age)
+                got = pp.claude_helper(pools, now=T, path=str(tmp / "emergency.json"), reading_age=age)
+                self.assertTrue(got["allowed"])
+                self.assertIn("no Claude reading, assumed under pace", got["reason"])
+                self.assertNotIn("stale reading", got["reason"])
+
+    def test_main_claude_helper_never_calls_live_readers(self):
+        tmp = Path(tempfile.mkdtemp())
+        status = tmp / "status.json"
+        emergency = tmp / "claude-emergency.json"
+        boom = AssertionError("live reader must not be called by --claude-helper")
+
+        def run_main(argv, now):
+            out = io.StringIO()
+            with (
+                mock.patch.object(pp, "STATUS", str(status)),
+                mock.patch.object(pp, "EMERGENCY", str(emergency)),
+                mock.patch.object(pp.time, "time", return_value=now),
+                mock.patch.object(pp, "read_pools", side_effect=boom),
+                mock.patch.object(pp, "with_opencode", side_effect=boom),
+                mock.patch.object(pp, "opencode_pool", side_effect=boom),
+                mock.patch.object(pp, "read_opencode", side_effect=boom),
+                mock.patch.object(pp, "with_credits", side_effect=boom),
+                mock.patch.object(pp, "refresh_credits", side_effect=boom),
+                mock.patch.object(pp, "with_antigravity_reserve", side_effect=boom),
+                mock.patch.object(pp.subprocess, "run", side_effect=boom),
+                mock.patch.object(pp.subprocess, "Popen", side_effect=boom),
+                mock.patch.object(pp.urllib.request, "urlopen", side_effect=boom),
+                redirect_stdout(out),
+            ):
+                rc = pp.main(argv)
+            return rc, out.getvalue()
+
+        status.write_text(json.dumps({"ts": T - 60, "pools": {"claude": pool("ON", 0.7)}}))
+        rc, text = run_main(["--claude-helper", "--json"], T)
+        self.assertEqual(rc, 0)
+        got = json.loads(text)
+        self.assertTrue(got["allowed"])
+        self.assertNotIn("stale reading", got["reason"])
+
+        status.write_text(json.dumps({"ts": T - 1500, "pools": {"claude": pool("ON", 1.4)}}))
+        rc, text = run_main(["--claude-helper", "--json"], T)
+        self.assertEqual(rc, 3)
+        got = json.loads(text)
+        self.assertFalse(got["allowed"])
+        self.assertIn("stale reading 25m", got["reason"])
+
+        until = datetime.fromtimestamp(T + 3600, timezone.utc).isoformat()
+        emergency.write_text(json.dumps({"until": until, "reason": "urgent fix", "set_at": "x"}))
+        rc, text = run_main(["--claude-helper", "--json"], T)
+        self.assertEqual(rc, 0)
+        got = json.loads(text)
+        self.assertTrue(got["allowed"])
+        self.assertIn("emergency allowance", got["reason"])
+        self.assertIn("stale reading 25m", got["reason"])
+        emergency.unlink()
+
+        status.unlink()
+        rc, text = run_main(["--claude-helper", "--json"], T)
+        self.assertEqual(rc, 0)
+        got = json.loads(text)
+        self.assertTrue(got["allowed"])
+        self.assertIn("no Claude reading, assumed under pace", got["reason"])
+
 
 NOW = 1_800_000_000
 
@@ -1693,6 +1802,30 @@ class CommandTests(unittest.TestCase):
     def test_claude_emergency_needs_reason_and_zone(self):
         self.assertEqual(self.cli("--claude-emergency-until", self.emergency_until(2)).returncode, 2)
         self.assertEqual(self.cli("--claude-emergency-until", "2030-01-01T00:00:00", "--reason", "x").returncode, 2)
+
+    def test_claude_helper_reads_cached_status_json_without_pools_flag(self):
+        poison_cfg = Path(self.home, "poison.json")
+        poison_cfg.write_text(json.dumps({"opencode_reader_command": [sys.executable, "-c", "raise SystemExit(99)"]}))
+        status = Path(self.home) / ".local" / "state" / "token-ladder" / "status.json"
+        status.parent.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+
+        status.write_text(json.dumps({"ts": now - 60, "pools": {"claude": pool("ON", 0.5)}}))
+        out = self.cli("--claude-helper", config=str(poison_cfg))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("pace 0.50x, within 1.1x", out.stdout)
+        self.assertNotIn("stale reading", out.stdout)
+
+        status.write_text(json.dumps({"ts": now - 1200, "pools": {"claude": pool("ON", 1.8)}}))
+        out = self.cli("--claude-helper", config=str(poison_cfg))
+        self.assertEqual(out.returncode, 3, out.stderr)
+        self.assertIn("pace 1.80x is above 1.1x", out.stdout)
+        self.assertIn("stale reading 20m", out.stdout)
+
+        status.unlink()
+        out = self.cli("--claude-helper", config=str(poison_cfg))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("no Claude reading, assumed under pace", out.stdout)
 
     def test_unreadable_pools_fail_loud(self):
         out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--pools", "/nonexistent"],
