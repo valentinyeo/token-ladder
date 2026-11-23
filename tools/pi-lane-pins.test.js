@@ -10,6 +10,8 @@ test('vercel payload is pinned to the token-pass gateway only', async () => {
   assert.deepEqual(got.providerOptions, { gateway: { only: ['token-pass'] } });
   assert.deepEqual(got.messages, []);
   assert.equal(payload.providerOptions, undefined);
+  const judge = pinned({ model: 'zai/glm-5.3-flash' }, pinnedLanes());
+  assert.deepEqual(judge.providerOptions, { gateway: { only: ['token-pass'] } });
 });
 
 test('openrouter payload keeps one provider and no fallbacks', async () => {
@@ -36,5 +38,5 @@ test('the extension registers the provider request hook', async () => {
   const got = handlers.before_provider_request({ payload: { model: 'deepseek/deepseek-v4.1-flash' } });
   assert.deepEqual(got.providerOptions, { gateway: { only: ['token-pass'] } });
   assert.equal(handlers.before_provider_request({ payload: { model: 'gemini-2.5-flash' } }), undefined);
-  assert.equal(pinnedLanes().length, 2);
+  assert.equal(pinnedLanes().length, 3);
 });

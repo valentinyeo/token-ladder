@@ -51,7 +51,8 @@ The Provider API docs explicitly support agent clients and coding plans. However
 A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and `deepseek/deepseek-v4.1-flash` on 2026-11-22. It supports chat judging technically, but is not in `ci/lanes.json`: that caller has no repository-visibility guard. A future guarded judge lane would need `COMMANDCODE_API_KEY`; no GitHub secret is set by this change.
 
 The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lane uses one upstream provider, so neither can fall to Baseten when its credit runs low.
-`ci/lanes.json` holds both pins: `gateway` on the gateway lane, `provider` on the OpenRouter lane.
+The gateway carries two lanes, both pinned to Token Pass: the DeepSeek lane and, right after it, a `zai/glm-5.3-flash` judge lane. The Token Pass already covers that model, so the judge adds no cost, and a DeepSeek-authored PR still has a judge from another family.
+`ci/lanes.json` holds both pins: `gateway` on the gateway lanes, `provider` on the OpenRouter lane.
 `ci/ladder-call` sends them as `providerOptions.gateway` and `provider` in the request body.
 The two pi lanes on those providers load `tools/pi-lane-pins.mjs` with `-e`, and that extension writes the same two fields from the same file through pi's `before_provider_request` hook.
 Change the pin in `ci/lanes.json` and both paths follow.

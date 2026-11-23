@@ -58,6 +58,7 @@ def texts():
 LANE_ORDER = [
     "opencode-go",
     "vercel-ai-gateway",
+    "vercel-ai-gateway-zai",
     "openrouter",
     "google",
     "cursor",

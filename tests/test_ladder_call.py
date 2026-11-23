@@ -193,7 +193,7 @@ class LadderCallTests(unittest.TestCase):
 
     def test_all_families_excluded_fails_before_checking_keys(self):
         result = ladder_call({}, {'messages': []},
-                             args=('--exclude-families', 'deepseek,google,cursor'))
+                             args=('--exclude-families', 'deepseek,zai,google,cursor'))
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn('all lanes excluded by author model families', result.stderr)
         self.assertNotIn('no key', result.stderr)
@@ -782,6 +782,7 @@ class LadderCallTests(unittest.TestCase):
         lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text(encoding='utf-8'))
         models = {lane['name']: lane['model'] for lane in lanes}
         self.assertEqual(models['vercel-ai-gateway'], 'deepseek/deepseek-v4.1-flash')
+        self.assertEqual(models['vercel-ai-gateway-zai'], 'zai/glm-5.3-flash')
         self.assertEqual(models['openrouter'], 'deepseek/deepseek-v4.1-flash-1017')
         self.assertNotIn('deepseek', models)
 
@@ -968,7 +969,7 @@ class LintDirectModelCallsTests(unittest.TestCase):
             env = {k: v for k, v in os.environ.items() if not k.endswith('_API_KEY')}
             env['RUNNER_TEMP'] = tmp
             env['GITHUB_OUTPUT'] = os.path.join(tmp, 'output')
-            env['EXCLUDE_FAMILIES'] = 'deepseek,google,cursor'
+            env['EXCLUDE_FAMILIES'] = 'deepseek,zai,google,cursor'
             request = Path(tmp) / 'request.json'
             request.write_text('{"messages": []}', encoding='utf-8')
             env['REQUEST_FILE'] = str(request)

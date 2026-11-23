@@ -7,7 +7,7 @@ CI chat completions go through `ci/ladder-call`; workflows must not call model A
 - `ladder-stub` answers through the local stub server on the opencode-go path.
 - `answer-text` reads `message.content`, and falls back to `message.reasoning` when a reasoning model returns empty content.
 - `require-verdict` asks a lane once more for a verdict from the tail of its own answer when the answer holds none, then skips to the next lane.
-- `exclude-families` skips every lane whose model belongs to a comma-separated excluded family, including models routed through other providers. It fails when all lanes are excluded or a lane's family is unknown.
+- `exclude-families` skips every lane whose model belongs to a comma-separated excluded family, including models routed through other providers. It fails when all lanes are excluded or a lane's family is unknown. The gateway runs a DeepSeek lane and a `zai/glm-5.3-flash` judge lane, so a DeepSeek author still gets a judge.
 - The PR verifier reads every `Author model: <family>/<model>` line. It warns and fails on missing author metadata, and fails on unknown families. Other ladder-call users keep the default lane order when exclusions are empty.
 - `lint-clean` reports no violations on this repository tree.
 
