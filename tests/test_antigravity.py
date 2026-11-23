@@ -217,7 +217,7 @@ class QuotaFallthroughTests(unittest.TestCase):
         runner = mock.Mock(side_effect=AssertionError("nothing to run"))
         code = pp.run_lanes([lane for lane in lanes() if lane["pool"] == "google"], gate, {}, 1.1, runner=runner,
                             limits_path=self.limits, now=NOW, say=self.said.append, launches_path=self.launches)
-        self.assertEqual(code, 4)
+        self.assertEqual(code, 75)
         self.assertIn("no lane left", self.said[-1])
         self.assertIn("antigravity (used up", self.said[-1])
         runner.assert_not_called()

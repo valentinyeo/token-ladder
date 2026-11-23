@@ -25,7 +25,7 @@ TAIL_CHARS = 20000
 ERROR_CHARS = 4000
 CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|credits?|funds|quota)|"
                           r"out of credits?|credit balance|exceeded your current quota|no credits? (left|remaining)", re.I)
-RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _]exhausted|"
+RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _-]?exhausted|"
                         r"limit (reached|exceeded)|hit your limit", re.I)
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
 PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
@@ -565,51 +565,224 @@ def clear_floor_lock(lane, now, path=LIMITS):
     write_limits(limits, path)
 
 
-def provider_error(tail):
-    lines = tail.splitlines()
-    for line in reversed(lines):
-        try:
-            if line.startswith("AGY_ERROR: "):
-                error = json.loads(line[len("AGY_ERROR: "):])
-            elif line.startswith("{"):
+PI_EVENT_TYPES = {
+    "session", "agent_start", "turn_start", "message_start", "message_update",
+    "message_end", "turn_end", "agent_end", "auto_retry_start", "auto_retry_end",
+    "agent_settled", "tool_execution_start", "tool_execution_end", "entry_appended",
+}
+
+
+def error_text(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        if "short_error" in value:
+            message = "print_timeout" if value.get("reason") == "print_timeout" else value["short_error"]
+            return str(value.get("status", "")) + ": " + str(message)
+        return json.dumps(value, separators=(",", ":"))
+    return ""
+
+
+def message_text(message):
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content
+                         if isinstance(part, dict) and isinstance(part.get("text"), str)).strip()
+    return ""
+
+
+def inspect_record(data):
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("type") or data.get("kind")
+    if data.get("status") == "ERROR":
+        return "error", error_text(data.get("error")) or "ERROR", False
+    if kind == "auto_retry_end":
+        if data.get("success") is False:
+            return "error", error_text(data.get("finalError") or data.get("error")
+                                       or data.get("errorMessage")) or "auto_retry_end failed", False
+        if data.get("success") is True:
+            return "ok", None, False
+        return "harness", None, False
+    if kind == "agent_end":
+        messages = data.get("messages")
+        if isinstance(messages, list):
+            assistants = [m for m in messages if isinstance(m, dict) and m.get("role") == "assistant"]
+            if assistants:
+                last = assistants[-1]
+                if last.get("stopReason") == "error":
+                    return "error", error_text(last.get("errorMessage") or last.get("error")) or 'stopReason":"error"', False
+                answered = last.get("stopReason") != "toolUse" and bool(message_text(last))
+                return "ok", None, answered
+        return "harness", None, False
+    if kind in ("message_end", "turn_end"):
+        msg = data.get("message")
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            if msg.get("stopReason") == "error":
+                return "error", error_text(msg.get("errorMessage") or msg.get("error")) or 'stopReason":"error"', False
+            if msg.get("stopReason") is not None or message_text(msg):
+                answered = msg.get("stopReason") != "toolUse" and bool(message_text(msg))
+                return "ok", None, answered
+        return "harness", None, False
+    if kind == "agent_settled":
+        if data.get("aborted") is True:
+            return "aborted", "agent aborted", False
+        return "harness", None, False
+    if kind == "result":
+        if data.get("is_error") is True or data.get("subtype") == "error" or data.get("status") == "error":
+            return "error", error_text(data.get("error") or data.get("errorMessage") or data.get("result")
+                                       or data.get("text") or data.get("message")) or "result error", False
+        text = data.get("text") if isinstance(data.get("text"), str) else data.get("result") if isinstance(data.get("result"), str) else ""
+        return "ok", None, bool(text.strip())
+    if kind == "error":
+        return "error", error_text(data.get("error") or data.get("errorMessage") or data.get("message") or data) or "error", False
+    if kind in PI_EVENT_TYPES:
+        return "harness", None, False
+    if "response" in data and ("status" in data or "stats" in data):
+        resp = data.get("response")
+        return "ok", None, bool(isinstance(resp, str) and resp.strip())
+    if data.get("error") and kind is None and data.get("status") in (None, "ERROR", "error") and data.get("is_error") is not False:
+        return "error", error_text(data.get("error")), False
+    return None
+
+
+def analyze_lines(lines, full_reader=None):
+    last_error = None
+    saw_harness = False
+    has_answer = False
+    last_nonempty = ""
+    fallback_error = ""
+    saw_json_record = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        last_nonempty = line
+        if line.startswith("AGY_ERROR: "):
+            try:
+                err = json.loads(line[len("AGY_ERROR: "):])
+                text = error_text(err)
+                if text:
+                    last_error = text
+                    saw_harness = True
+                    saw_json_record = True
+                    continue
+            except (ValueError, AttributeError):
+                pass
+        if line.startswith("{"):
+            try:
                 data = json.loads(line)
-                error = data.get("error") if data.get("status") == "ERROR" else None
-            else:
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                saw_json_record = True
+                verdict = inspect_record(data)
+                if verdict is not None:
+                    state, text, answered = verdict
+                    saw_harness = True
+                    if state == "error":
+                        last_error = text
+                        has_answer = False
+                    elif state == "aborted":
+                        if last_error is None:
+                            last_error = text
+                        has_answer = False
+                    elif state == "ok":
+                        last_error = None
+                        if answered:
+                            has_answer = True
                 continue
-            if isinstance(error, dict) and "short_error" in error:
-                message = "print_timeout" if error.get("reason") == "print_timeout" else error["short_error"]
-                return str(error.get("status", "")) + ": " + str(message)
-        except (ValueError, AttributeError):
-            pass
-    return next((line.strip() for line in reversed(lines) if line.strip()), "")[-ERROR_CHARS:]
+        if (CREDIT_ERROR.search(line) or BLOCKED_ERROR.search(line) or RATE_ERROR.search(line)
+                or MODEL_REJECTED.search(line) or PROVIDER_AUTH.search(line) or PROVIDER_HTTP.search(line)):
+            fallback_error = line
+    if not saw_json_record and full_reader is not None:
+        data = full_reader()
+        if isinstance(data, dict):
+            verdict = inspect_record(data)
+            if verdict is not None:
+                state, text, answered = verdict
+                saw_harness = True
+                if state == "error":
+                    last_error = text
+                    has_answer = False
+                elif state == "ok":
+                    last_error = None
+                    has_answer = answered
+    empty = (not last_nonempty) or (saw_harness and last_error is None and not has_answer)
+    if last_error is not None:
+        line = last_error[-ERROR_CHARS:]
+    elif fallback_error and (not saw_harness or empty):
+        line = fallback_error[-ERROR_CHARS:]
+    else:
+        line = last_nonempty[-ERROR_CHARS:]
+    return {"error": last_error[-ERROR_CHARS:] if last_error is not None else None,
+            "empty": empty, "error_line": line}
+
+
+def analyze_stream(fh):
+    def read_full():
+        fh.seek(0)
+        try:
+            return json.load(fh)
+        except ValueError:
+            return None
+
+    fh.seek(0)
+    return analyze_lines(fh, full_reader=read_full)
+
+
+def analyze_output(tail):
+    cached = getattr(tail, "analysis", None)
+    if cached is not None:
+        return cached
+
+    def read_full():
+        stripped = tail.strip()
+        if not stripped.startswith("{"):
+            return None
+        try:
+            return json.loads(stripped)
+        except ValueError:
+            return None
+
+    return analyze_lines(tail.splitlines(), full_reader=read_full)
+
+
+def provider_error(tail):
+    return analyze_output(tail)["error_line"]
 
 
 def limit_kind(code, tail):
-    if code == 0:
-        return None
-    tail = provider_error(tail)
-    if CREDIT_ERROR.search(tail):
-        return "credit"
-    if BLOCKED_ERROR.search(tail):
-        return "blocked"
-    if RATE_ERROR.search(tail):
-        return "rate"
-    if not tail.strip():
-        return "silent"
+    info = analyze_output(tail)
+    text = info["error"] if info["error"] is not None else info["error_line"]
+    if info["error"] is not None or code != 0 or info["empty"]:
+        if CREDIT_ERROR.search(text):
+            return "credit"
+        if BLOCKED_ERROR.search(text):
+            return "blocked"
+        if RATE_ERROR.search(text):
+            return "rate"
+        if info["empty"]:
+            return "silent"
     return None
 
 
 def fast_fail_kind(code, tail, elapsed, work):
-    if code == 0 or work or elapsed >= FAST_FAIL_BEFORE_WORK_S:
+    info = analyze_output(tail)
+    if (code == 0 and info["error"] is None) or work or elapsed >= FAST_FAIL_BEFORE_WORK_S:
         return None
-    tail = tail[-ERROR_CHARS:]
-    if MODEL_REJECTED.search(tail):
+    text = (info["error"] if info["error"] is not None else info["error_line"])[-ERROR_CHARS:]
+    if MODEL_REJECTED.search(text):
         return "model request was rejected"
-    if PROVIDER_AUTH.search(tail):
+    if PROVIDER_AUTH.search(text):
         return "provider auth error"
-    if PROVIDER_HTTP.search(tail):
+    if PROVIDER_HTTP.search(text):
         return "provider HTTP error"
-    if PI_AGENT_FAST.search(tail):
+    if PI_AGENT_FAST.search(text) or info["error"] is not None:
         return "agent error before work"
     return None
 
@@ -696,7 +869,7 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         if not result["command"]:
             log_launch(launches_path, None, now, not_vendor)
             say(f"no lane left, nothing ran. {result['reason']}")
-            return 75 if rung else 4
+            return 75
         say(f"lane {result['plan']}: {result['reason']}")
         launch_id = uuid.uuid4().hex
         metadata = None
@@ -707,18 +880,22 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
                         "model": lane["model"], "effort": lane["effort"]}
         log_launch(launches_path, result["plan"], now, not_vendor, metadata)
         code, tail, elapsed, work = unpack_run(runner(result["command"]))
-        if rung:
-            launch_finish(launches_path, launch_id, rung, lane, code, tail, cfg, now)
-        error_line = provider_error(tail)
-        fast = fast_fail_kind(code, error_line, elapsed, work)
-        kind = limit_kind(code, error_line)
+        info = analyze_output(tail)
+        error_line = info["error_line"]
+        fast = fast_fail_kind(code, tail, elapsed, work)
+        kind = limit_kind(code, tail)
+        if kind == "silent" and work and code == 0:
+            kind = None
         status = re.search(r"(?:^\s*|HTTP\s+|statusCode[\"':\s]+)(4\d{2})\b", error_line, re.I)
         nonquota_http = status and status[1] not in ("402", "429")
         if fast and nonquota_http and kind != "blocked":
             kind = None
+        effective_code = 1 if code == 0 and (kind is not None or fast is not None or info["error"] is not None) else code
+        if rung:
+            launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now)
         if kind is None:
             if fast is None:
-                return code
+                return effective_code
             tried.add(result["plan"])
             source = "fast-fail 4xx" if nonquota_http else "fast-fail"
             mark_limited(result["plan"], (number(cfg.get("fast_fail_minutes")) or 5) / 60,
@@ -972,6 +1149,7 @@ def measured_output(fh, tail):
     output.tokens = totals if found and not incomplete else None
     prs = PR_URL.findall(final if isinstance(final, str) else "")
     output.pr_url = f"https://github.com/{prs[-1][0]}/pull/{prs[-1][1]}" if prs else None
+    output.analysis = analyze_stream(fh)
     return output
 
 
