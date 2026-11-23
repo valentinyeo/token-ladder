@@ -1286,7 +1286,8 @@ class CommandTests(unittest.TestCase):
                "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
         base = [sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools)]
         for flags in (("--not-vendor", "alpha", "--not-vendor", "beta"),
-                      ("--not-vendor", "alpha,beta")):
+                      ("--not-vendor", "alpha,beta"),
+                      ("--not-vendor", "alpha, beta")):
             with self.subTest(flags=flags):
                 out = subprocess.run(base + ["--json", *flags], capture_output=True, text=True, env=env)
                 self.assertEqual(out.returncode, 0, out.stderr)
