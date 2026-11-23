@@ -43,6 +43,102 @@ def pick_with_burn(pools, burn_cfg, limits=None, **kw):
     return pp.pick(lanes, pools, limits if limits is not None else {}, T, burn=burn, **kw)
 
 
+class LaneOkTests(unittest.TestCase):
+    def check_lane(self, spec, pools=None, limits=None, cloud=False, cfg=None):
+        cfg = pp.load_config() if cfg is None else cfg
+        out = io.StringIO()
+        with mock.patch.object(pp, "load_config", return_value=cfg), \
+                mock.patch.object(pp, "read_pools", return_value=pools or {}), \
+                mock.patch.object(pp, "with_opencode", side_effect=lambda pools, cfg: pools), \
+                mock.patch.object(pp, "with_credits", side_effect=lambda pools, lanes, cfg: pools), \
+                mock.patch.object(pp, "with_antigravity_reserve", side_effect=lambda pools, cfg: pools), \
+                mock.patch.object(pp, "with_repo_visibility", side_effect=lambda pools, lanes: pools), \
+                mock.patch.object(pp, "read_limits", return_value=limits or {}), \
+                mock.patch.object(pp.time, "time", return_value=T), redirect_stdout(out):
+            code = pp.main(["--lane-ok", spec] + (["--cloud"] if cloud else []))
+        return code, out.getvalue().strip()
+
+    def test_skipped_cursor_refuses_cloud_launch_with_one_reason_line(self):
+        code, reason = self.check_lane("cursor", limits={"cursor": T + 86400}, cloud=True)
+        self.assertEqual(code, 3)
+        self.assertIn("cursor", reason)
+        self.assertIn("limited until", reason)
+        self.assertEqual(len(reason.splitlines()), 1)
+
+    def test_structured_skips_refuse_until_expired(self):
+        for until in (T + 3600, burn_until()):
+            with self.subTest(until=until):
+                code, reason = self.check_lane("cursor", {"grok": pool()},
+                                               {"cursor": {"until": until, "reason": "manual skip"}})
+                self.assertEqual(code, 3)
+                self.assertIn("limited until", reason)
+        self.assertEqual(self.check_lane("cursor", {"grok": pool()},
+                                         {"cursor": {"until": T, "reason": "expired"}})[0], 0)
+
+    def test_lane_and_vendor_names_use_their_own_pool_not_the_first_usable_lane(self):
+        for name, pool_name in (("cursor", "grok"), ("codex", "codex"), ("openai", "codex"),
+                                ("claude", "claude"), ("anthropic", "claude"),
+                                ("antigravity", "google"), ("google", "google"),
+                                ("opencode", "opencode"), ("vercel", "credit:vercel"),
+                                ("commandcode", "credit:commandcode"), ("openrouter", "credit:openrouter")):
+            with self.subTest(name=name):
+                self.assertEqual(self.check_lane(name, {pool_name: pool()})[0], 0)
+                code, reason = self.check_lane(name, {pool_name: pool("OFF")})
+                self.assertEqual(code, 3)
+                self.assertIn("used up", reason)
+
+    def test_ahead_of_pace_never_uses_the_picker_fallback_or_burn_override(self):
+        cfg = dict(pp.load_config(), burn={"lane": "cursor", "until": burn_until()})
+        for cloud in (False, True):
+            code, reason = self.check_lane("cursor", {"grok": pool(ratio=1.5)}, cloud=cloud, cfg=cfg)
+            self.assertEqual(code, 3)
+            self.assertIn("pace 1.50x", reason)
+
+    def test_expired_skip_and_pace_boundary_allow_the_lane(self):
+        self.assertEqual(self.check_lane("cursor", {"grok": pool(ratio=1.1)}, {"cursor": T})[0], 0)
+
+    def test_exhausted_percent_and_credit_unknown_refuse(self):
+        for state in (dict(pool(), used_pct=100), dict(pool(), credit_unknown=True)):
+            self.assertEqual(self.check_lane("codex", {"codex": state})[0], 3)
+
+    def test_credit_missing_or_at_floor_refuses_but_above_floor_allows(self):
+        for name in ("vercel", "openrouter"):
+            self.assertEqual(self.check_lane(name)[0], 3)
+            for balance, code in ((1.99, 3), (2, 3), (2.01, 0)):
+                state = pp.credit_pool({"at": T, "usd": balance}, T, {})
+                self.assertEqual(self.check_lane(name, {f"credit:{name}": state})[0], code)
+
+    def test_unknown_lane_refuses_with_one_line(self):
+        code, reason = self.check_lane("not-a-plan")
+        self.assertEqual(code, 3)
+        self.assertIn("unknown lane", reason)
+        self.assertEqual(len(reason.splitlines()), 1)
+
+    def test_unreadable_pool_state_refuses_without_leaking_the_exception(self):
+        out = io.StringIO()
+        with mock.patch.object(pp, "read_pools", side_effect=OSError("private detail")), redirect_stdout(out):
+            code = pp.main(["--lane-ok", "cursor", "--cloud"])
+        self.assertEqual(code, 3)
+        self.assertEqual(out.getvalue(), "cursor: cannot read pool state\n")
+
+    def test_reason_stays_on_one_line(self):
+        code, reason = self.check_lane("cursor", {"grok": dict(pool("OFF"), note="used\nup")})
+        self.assertEqual(code, 3)
+        self.assertEqual(reason, "cursor: used up: used up")
+
+    def test_opencode_prepaid_can_run_after_included_allowance_is_exhausted(self):
+        state = dict(pool(), used_pct=100, funding="prepaid", credits_usd=2.01, credit_floor_usd=2)
+        self.assertEqual(self.check_lane("opencode", {"opencode": state})[0], 0)
+        state["credits_usd"] = 2
+        self.assertEqual(self.check_lane("opencode", {"opencode": state})[0], 3)
+
+    def test_chat_only_pool_without_opt_in_refuses(self):
+        cfg = {"lanes": [{"lane": "custom", "pool": "custom", "command": "unused"}]}
+        code, reason = self.check_lane("custom", {"custom": dict(pool(), chat_only=True)}, cfg=cfg)
+        self.assertEqual(code, 3)
+        self.assertIn("chat-only", reason)
+
+
 class PrepaidCreditTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
