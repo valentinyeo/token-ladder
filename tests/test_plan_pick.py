@@ -500,13 +500,13 @@ class RunTests(unittest.TestCase):
     def test_no_lane_left_logs_a_null_lane(self):
         limits = {lane["lane"]: T + 60 for lane in LANES}
         Path(self.limits).write_text(json.dumps(limits))
-        self.assertEqual(self.go({}), 4)
+        self.assertEqual(self.go({}), 75)
         self.assertEqual([e["lane"] for e in self.logged()], [None])
 
     def test_no_lane_left_says_when_the_next_lane_frees(self):
         limits = {lane["lane"]: T + 60 * (i + 1) for i, lane in enumerate(LANES)}
         Path(self.limits).write_text(json.dumps(limits))
-        self.assertEqual(self.go({}), 4)
+        self.assertEqual(self.go({}), 75)
         said = " ".join(self.said)
         self.assertIn("frees at", said)
         self.assertIn("wait", said)
@@ -531,10 +531,12 @@ class RunTests(unittest.TestCase):
         self.go({"run vercel": (1, '402: {"error":{"message":"Insufficient Balance"}}'), "run deepseek": (0, "ok")})
         self.assertEqual(pp.read_limits(self.limits)["vercel"]["until"], T + 12 * 3600)
 
-    def test_clean_exit_with_no_output_is_done_not_retried(self):
-        self.assertEqual(self.go({"run opencode": (0, "  \n")}), 0)
-        self.assertEqual(self.ran, ["run opencode"])
-        self.assertEqual(pp.read_limits(self.limits), {})
+    def test_clean_exit_with_no_output_marks_limited_and_runs_next(self):
+        code = self.go({"run opencode": (0, "  \n"), "run vercel": (0, "done")})
+        self.assertEqual(code, 0)
+        self.assertEqual(self.ran, ["run opencode", "run vercel"])
+        self.assertIn("opencode", pp.read_limits(self.limits))
+        self.assertTrue(any("exited with no output" in line for line in self.said), self.said)
 
     def test_clean_exit_that_mentions_429_is_done_not_retried(self):
         self.assertEqual(self.go({"run opencode": (0, "fixed the 429 handler")}), 0)
@@ -571,7 +573,7 @@ class RunTests(unittest.TestCase):
 
     def test_every_lane_limited_stops_loudly(self):
         outcomes = {lane["command"]: (1, "429 Too Many Requests") for lane in LANES}
-        self.assertEqual(self.go(outcomes), 4)
+        self.assertEqual(self.go(outcomes), 75)
         self.assertEqual(len(self.ran), len(LANES))
         self.assertIn("no lane left, nothing ran", self.said[-1])
 
@@ -1247,7 +1249,7 @@ class ChatOnlyPoolTests(unittest.TestCase):
             result = pp.run_lanes([lane], {"google": {"state": "ON", "chat_only": True}}, {}, 1.1, runner=runner,
                                   limits_path=os.path.join(home, "limits.json"), now=T, say=lambda text: None,
                                   launches_path=os.path.join(home, "launches.jsonl"))
-        self.assertEqual(result, 4)
+        self.assertEqual(result, 75)
         runner.assert_not_called()
 
     def test_the_shipped_antigravity_lane_is_the_google_plan_lane(self):

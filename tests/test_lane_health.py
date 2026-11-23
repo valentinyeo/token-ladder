@@ -1,11 +1,13 @@
+import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from _load import REPO, load_bin, tl
+from _load import ISOLATED_LOCAL_CONFIG, REPO, load_bin, tl
 
 pp = load_bin("plan-pick")
 NOW = 1795470000
@@ -96,7 +98,7 @@ class LaneHealthTests(unittest.TestCase):
         result = pp.run_lanes(LANES, {"codex": {"state": "ON", "pace_ratio": 1.6}}, {}, 1.1,
                               runner=runner, limits_path=self.path, now=NOW, say=lambda text: None,
                               launches_path=str(Path(self.tmp.name) / "launches.jsonl"))
-        self.assertEqual(result, 4)
+        self.assertEqual(result, 75)
         runner.assert_not_called()
 
     def test_commandcode_idle_window_is_valid(self):
@@ -140,6 +142,167 @@ class LaneHealthTests(unittest.TestCase):
         self.assertIn("&lt;script&gt;", page)
         self.assertNotIn('<script>alert("unsafe")</script>', page)
         self.assertIn("429", page)
+
+    def test_pi_json_429_fixture_exiting_zero_marks_opencode_limited_and_runs_next_lane(self):
+        stream = (Path(REPO) / "tests" / "fixtures" / "pi-opencode-429.jsonl").read_text()
+        pools = {"opencode": {"state": "ON", "used_pct": 100.0, "funding": "prepaid",
+                              "included_exhausted": True, "credits_usd": 23.28, "credit_floor_usd": 2,
+                              "note": "monthly 100%, weekly 0%, 5-hour 0%; included allowance used up; using held prepaid credit"}}
+        ran, said = [], []
+        def runner(command):
+            ran.append(command)
+            return (0, stream, 52.0, False) if command == "opencode" else (0, "done", 3.0, False)
+        code = pp.run_lanes(LANES, pools, {}, 1.1, runner=runner, limits_path=self.path, now=NOW,
+                            say=said.append, launches_path=str(Path(self.tmp.name) / "launches.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertEqual(ran, ["opencode", "vercel"])
+        entry = pp.read_limits(self.path)["opencode"]
+        self.assertEqual(entry["until"], NOW + 300)
+        self.assertEqual(entry["source"], "429")
+        self.assertEqual(entry["reason"], "hit a rate or usage limit")
+        self.assertIn("429", entry["error_line"])
+        self.assertIn("rate_limit_error", entry["error_line"])
+        self.assertTrue(any("opencode hit a rate or usage limit" in line for line in said), said)
+
+    def test_pi_json_429_fixture_end_to_end_cli_falls_through_and_exits_75_when_none_left(self):
+        fixture = Path(REPO) / "tests" / "fixtures" / "pi-opencode-429.jsonl"
+        home = Path(self.tmp.name) / "home"
+        home.mkdir()
+        pools = home / "pools.json"
+        pools.write_text(json.dumps({"opencode": {"state": "ON", "used_pct": 100.0, "funding": "prepaid",
+                                                  "credits_usd": 23.28, "credit_floor_usd": 2}}))
+        repo = Path(self.tmp.name) / "repo"
+        (repo / "bin").mkdir(parents=True)
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        cfg = {"lanes": [{"lane": "opencode", "pool": "opencode", "command": f"cat {fixture}"},
+                         {"lane": "vercel", "pool": None, "command": "echo vercel-done"}]}
+        (repo / "config.json").write_text(json.dumps(cfg))
+        env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG}
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("vercel-done", out.stdout)
+        self.assertIn("lane opencode hit a rate or usage limit", out.stderr)
+        limits = json.loads((home / ".local/state/token-ladder/lane-limits.json").read_text())
+        self.assertEqual(limits["opencode"]["source"], "429")
+        cfg_only = {"lanes": [{"lane": "opencode", "pool": "opencode", "command": f"cat {fixture}"}]}
+        (repo / "config.json").write_text(json.dumps(cfg_only))
+        home2 = Path(self.tmp.name) / "home2"
+        home2.mkdir()
+        out2 = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools), "--run"],
+                              capture_output=True, text=True,
+                              env={"HOME": str(home2), "PATH": "/usr/bin:/bin",
+                                   "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG})
+        self.assertEqual(out2.returncode, 75, out2.stderr)
+        self.assertIn("no lane left, nothing ran", out2.stderr)
+
+    def test_pi_json_402_and_empty_streams_fall_through_on_exit_zero(self):
+        pi_402 = "\n".join([
+            json.dumps({"type": "session", "version": 3}),
+            json.dumps({"type": "message_end", "message": {
+                "role": "assistant", "content": [], "stopReason": "error",
+                "errorMessage": '402: {"error":{"message":"Insufficient Balance"}}'}}),
+            json.dumps({"type": "agent_end", "messages": [{
+                "role": "assistant", "content": [], "stopReason": "error",
+                "errorMessage": '402: {"error":{"message":"Insufficient Balance"}}'}], "willRetry": False}),
+            json.dumps({"type": "agent_settled", "aborted": False}),
+        ])
+        pi_empty = "\n".join([
+            json.dumps({"type": "session", "version": 3}),
+            json.dumps({"type": "agent_start"}),
+            json.dumps({"type": "agent_settled", "aborted": False}),
+        ])
+        ran = []
+        def runner(command):
+            ran.append(command)
+            if command == "opencode":
+                return (0, pi_402, 5.0, False)
+            if command == "vercel":
+                return (0, pi_empty, 2.0, False)
+            return (0, "  \n", 1.0, False)
+        code = pp.run_lanes(LANES, {}, {}, 1.1, runner=runner, limits_path=self.path, now=NOW,
+                            say=lambda text: None, launches_path=str(Path(self.tmp.name) / "launches.jsonl"))
+        self.assertEqual(code, 75)
+        self.assertEqual(ran, ["opencode", "vercel", "codex"])
+        limits = pp.read_limits(self.path)
+        self.assertEqual(limits["opencode"]["until"], NOW + 12 * 3600)
+        self.assertEqual(limits["opencode"]["reason"], "is out of credit")
+        self.assertEqual(limits["vercel"]["reason"], "exited with no output")
+        self.assertEqual(limits["vercel"]["source"], "silent exit")
+        self.assertEqual(limits["codex"]["reason"], "exited with no output")
+
+    def test_other_lane_json_formats_detect_rate_credit_quota_and_empty(self):
+        agy_multiline = json.dumps({
+            "status": "ERROR",
+            "error": {"short_error": "quota exceeded", "status": "RESOURCE_EXHAUSTED"},
+        }, indent=2)
+        agy_empty = json.dumps({"status": "OK", "response": "   "}, indent=2)
+        cursor_429 = json.dumps({"type": "result", "subtype": "error", "is_error": True,
+                                 "result": "429 Too Many Requests"})
+        cursor_empty = json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": ""})
+        hax_402 = json.dumps({"kind": "error", "error": "402 Payment Required"})
+        hax_empty = "\n".join([
+            json.dumps({"kind": "turn_usage", "usage": {"in_tokens": 10, "cached": 0, "output": 0}}),
+            json.dumps({"type": "result", "text": ""}),
+        ])
+        cases = [(agy_multiline, "rate"), (agy_empty, "silent"), (cursor_429, "rate"),
+                 (cursor_empty, "silent"), (hax_402, "credit"), (hax_empty, "silent")]
+        for text, expected in cases:
+            with self.subTest(expected=expected, sample=text[:40]):
+                self.assertEqual(pp.limit_kind(0, text), expected)
+
+    def test_recovered_pi_retry_and_answers_mentioning_429_stay_successful(self):
+        recovered = "\n".join([
+            json.dumps({"type": "turn_end", "message": {
+                "role": "assistant", "content": [], "stopReason": "error",
+                "errorMessage": "429: Rate limit exceeded"}}),
+            json.dumps({"type": "auto_retry_start", "attempt": 1, "maxAttempts": 3}),
+            json.dumps({"type": "message_end", "message": {
+                "role": "assistant", "stopReason": "stop",
+                "content": [{"type": "text", "text": "Fixed the 429 handler."}]}}),
+            json.dumps({"type": "agent_end", "messages": [{
+                "role": "assistant", "stopReason": "stop",
+                "content": [{"type": "text", "text": "Fixed the 429 handler."}]}]}),
+            json.dumps({"type": "auto_retry_end", "success": True, "attempt": 1}),
+            json.dumps({"type": "agent_settled", "aborted": False}),
+        ])
+        cursor_ok = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                                "result": "Fixed 429 and quota handling"})
+        self.assertIsNone(pp.limit_kind(0, recovered))
+        self.assertIsNone(pp.limit_kind(0, cursor_ok))
+        code = pp.run_lanes(LANES, {}, {}, 1.1, runner=mock.Mock(return_value=(0, recovered, 15.0, False)),
+                            limits_path=self.path, now=NOW, say=lambda text: None,
+                            launches_path=str(Path(self.tmp.name) / "launches.jsonl"))
+        self.assertEqual(code, 0)
+        self.assertEqual(pp.read_limits(self.path), {})
+
+    def test_rung_light_pi_429_records_nonzero_finish_and_falls_through(self):
+        cfg = pp.load_config()
+        lanes = pp.lanes_from(cfg)
+        brief = Path(self.tmp.name) / "brief.txt"
+        brief.write_text("Rung: light\n")
+        launches = str(Path(self.tmp.name) / "launches.jsonl")
+        ctx = pp.rung_context(str(brief), launches)
+        stream = (Path(REPO) / "tests" / "fixtures" / "pi-opencode-429.jsonl").read_text()
+        pi_429_out = pp.measured_output(io.StringIO(stream), stream)
+        ok_stream = json.dumps({"type": "message_end", "message": {
+            "role": "assistant", "stopReason": "stop",
+            "content": [{"type": "text", "text": "https://github.com/a/b/pull/42"}]}})
+        ok_out = pp.measured_output(io.StringIO(ok_stream), ok_stream)
+        ran = []
+        def runner(command):
+            ran.append(command)
+            return (0, pi_429_out, 52.0, False) if len(ran) == 1 else (0, ok_out, 10.0, False)
+        code = pp.run_lanes(lanes, {}, cfg, 1.1, runner=runner, limits_path=self.path, now=NOW,
+                            say=lambda text: None, launches_path=launches, rung=ctx)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(ran), 2)
+        self.assertIn("opencode-go", ran[0])
+        self.assertIn("vercel-ai-gateway", ran[1])
+        rows = [json.loads(line) for line in Path(launches).read_text().splitlines()]
+        finishes = [row for row in rows if row.get("event") == "finish"]
+        self.assertEqual([row["exit_code"] for row in finishes], [1, 0])
+        self.assertEqual(pp.read_limits(self.path)["opencode"]["source"], "429")
 
 
 if __name__ == "__main__":
