@@ -80,6 +80,29 @@ class PoolTests(unittest.TestCase):
             self.assertEqual(os.listdir(state), [])
 
 
+class PaceAfterResetTests(unittest.TestCase):
+    def test_week_pace_exists_in_the_first_hours_after_a_reset(self):
+        state = tl.pool_state(tl.window(8, NOW + 162 * 3600, 10080, NOW), None, CFG, NOW)
+        elapsed = 100 * 6 / 168
+        self.assertEqual(state["window_minutes"], 10080)
+        self.assertAlmostEqual(state["elapsed_pct"], elapsed, places=4)
+        self.assertAlmostEqual(state["pace_ratio"], round(8 / elapsed, 4), places=4)
+
+    def test_used_share_is_measured_against_a_two_percent_floor(self):
+        state = tl.pool_state(tl.window(3, NOW + 168 * 3600 - 600, 10080, NOW), None, CFG, NOW)
+        self.assertLess(state["elapsed_pct"], 2)
+        self.assertAlmostEqual(state["pace_ratio"], 1.5)
+        state = tl.pool_state(tl.window(0, NOW + 168 * 3600 - 600, 10080, NOW), None, CFG, NOW)
+        self.assertEqual(state["pace_ratio"], 0.0)
+
+    def test_short_window_still_waits_for_ten_percent_elapsed(self):
+        state = tl.pool_state(tl.window(0, NOW + 160 * 3600, 10080, NOW),
+                              tl.window(20, NOW + 290 * 60, 300, NOW), CFG, NOW)
+        self.assertEqual(state["window_minutes"], 300)
+        self.assertAlmostEqual(state["elapsed_pct"], 100 * 10 / 300, places=4)
+        self.assertEqual(state["pace_ratio"], 0.0)
+
+
 class BashRulesTests(unittest.TestCase):
     def test_fast_model_ids_refused_without_launching_models(self):
         for exe in ("hax", "codex", "cursor", "cursor-agent", "grok"):

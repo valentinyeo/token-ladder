@@ -148,6 +148,20 @@ Codex and Cursor launches without pi cost records show unknown spend rather than
 The report also includes Valentin's separate DeepSeek direct account measurement as of 2026-11-22: **$59.93 for 8.11B tokens over 67,963 requests in 30 days**, about **$7.40 per 1B tokens**, approximately 98.7% cached.
 This is a measured account total, not a list-price estimate. It is shown separately and never added to the calendar-month pi cost totals.
 
+## Pace log
+
+```sh
+plan-pick --pace-log
+plan-pick --pace-log --json
+```
+
+One line per lane: how many plan-pick launches happened since that plan's own window started, beside the plan's own counter (used share, share of the window gone, and pace).
+Launches come from `~/.local/state/token-ladder/launches.jsonl`, one line per `--run` lane attempt.
+Counters come from the same pools that `plan-pick` reads, so the two numbers always describe the same plan.
+A window that has just reset still shows a pace: the weekly used share is measured against at least 2% of the week, so the first hours after a reset are not blank.
+Codex is looked up on `PATH` and in the usual install folders, so a timer or worker shell without `~/.npm-global/bin` still gets the live reading instead of a stale session log.
+No tokens are read or printed. Pass a path to `--pace-log` to read a saved launch log instead of the live one.
+
 ## Loop interval
 
 Chats that wake on a timer cost a turn every time they wake, so they ask how long to wait before the next tick:

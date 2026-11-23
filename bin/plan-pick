@@ -928,6 +928,68 @@ def opencode_spend(since, now, sessions, launches_path):
     return sum(run["usd"] for run in runs.values()) + unknown * 0.50, unknown
 
 
+PACE_LOG_NOTE = ("Launches come from the plan-pick launch log; counters come from token-ladder pools. "
+                 "The counter is the plan's own used share and the pace is used share over elapsed share. "
+                 "No tokens are read or printed.")
+
+
+def period_start(now):
+    return datetime.fromtimestamp(now, timezone.utc).replace(day=1, hour=0, minute=0, second=0,
+                                                             microsecond=0).timestamp()
+
+
+def pace_log(pools, cfg, now=None, launches_path=LAUNCHES, lanes=None):
+    now = time.time() if now is None else now
+    lanes = lanes_from(cfg) if lanes is None else lanes
+    launches = [(number(row.get("at")), row.get("lane")) for row in jsonl_rows(launches_path)]
+    rows = {}
+    for lane in lanes:
+        name = lane["lane"]
+        pool = pools.get(lane.get("pool")) if lane.get("pool") else None
+        if not isinstance(pool, dict) and lane.get("credit"):
+            pool = pools.get(f"credit:{lane['credit']}")
+        pool = pool if isinstance(pool, dict) else {}
+        reset = number(pool.get("resets_at"))
+        used = number(pool.get("used_pct"))
+        if used is None:
+            used = number(pool.get("used"))
+        span = (number(pool.get("window_minutes")) or 0) * 60
+        start = reset - span if reset is not None and span else reset
+        since = start if start is not None else period_start(now)
+        count = sum(1 for at, lane_name in launches if lane_name == name and at is not None and at >= since)
+        rows[name] = {"lane": name, "since": since, "since_reset": start is not None, "launches": count,
+                      "used_pct": used, "limit": number(pool.get("limit")), "unit": pool.get("unit"),
+                      "elapsed_pct": number(pool.get("elapsed_pct")),
+                      "window_minutes": number(pool.get("window_minutes")),
+                      "pace_ratio": number(pool.get("pace_ratio")), "state": pool.get("state"),
+                      "credit": bool(lane.get("credit")), "note": pool.get("note"),
+                      "chat_only": bool(pool.get("chat_only"))}
+    return {"now": now, "launch_log": launches_path, "note": PACE_LOG_NOTE, "lanes": rows}
+
+
+def pace_log_lines(report):
+    yield "Pace log: plan-pick launches since each plan reset, beside the plan's own counter"
+    yield report["note"]
+    for name, row in report["lanes"].items():
+        since = datetime.fromtimestamp(row["since"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        launch = f"{row['launches']} launch{'es' if row['launches'] != 1 else ''} since {since}" + \
+            ("" if row["since_reset"] else " (month start)")
+        if row["chat_only"]:
+            yield f"{name}: {launch}; chat-only pool, no worker counter"
+            continue
+        if row["used_pct"] is None:
+            yield f"{name}: {launch}; " + ("credit lane, no plan counter in this reading"
+                                           if row["credit"] else "counter unknown")
+            continue
+        counter = f"{row['used_pct']:g}% used" if row["limit"] is None else \
+            f"{row['used_pct']:g} of {row['limit']:g} {row['unit'] or 'credits'} used"
+        if row["elapsed_pct"] is not None:
+            window = f" of {row['window_minutes'] / 60:g} h" if row["window_minutes"] else ""
+            counter += f" with {row['elapsed_pct']:.1f}%{window} gone"
+        counter += f"; pace {row['pace_ratio']:.2f}x" if row["pace_ratio"] is not None else "; pace unknown"
+        yield f"{name}: {launch}; {counter}"
+
+
 def burn_report(cfg, now=None, sessions=PI_SESSIONS, launches_path=LAUNCHES):
     now = time.time() if now is None else now
     month = datetime.fromtimestamp(now, timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -1027,6 +1089,8 @@ def main(argv):
     parser = argparse.ArgumentParser(prog="plan-pick", description="Pick the lane for the next background worker.")
     parser.add_argument("--json", action="store_true", help="print plan, command and reason as JSON")
     parser.add_argument("--burn", action="store_true", help="report this month's recorded spend per lane and caller")
+    parser.add_argument("--pace-log", nargs="?", const=LAUNCHES, metavar="FILE",
+                        help="compare plan-pick launches since each plan's reset with the plan's own counter")
     parser.add_argument("--plans", action="store_true",
                         help="print what each subscription includes, where it runs and whether it costs extra")
     parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
@@ -1073,6 +1137,14 @@ def main(argv):
             print(json.dumps(answer))
         else:
             print(f"{answer['seconds']} {answer['reason']}")
+        return 0
+    if args.pace_log:
+        try:
+            pools = read_pools(args.pools)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pools = {}
+        report = pace_log(pools if isinstance(pools, dict) else {}, cfg, launches_path=args.pace_log)
+        print(json.dumps(report) if args.json else "\n".join(pace_log_lines(report)))
         return 0
     if args.burn:
         report = burn_report(cfg)

@@ -232,6 +232,71 @@ class BurnTests(unittest.TestCase):
         self.assertFalse(pp.claude_helper(pools)["allowed"])
 
 
+class PaceLogTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = str(Path(tmp.name, "launches.jsonl"))
+        self.reset = T + 6 * 86400
+        self.start = self.reset - 7 * 86400
+        rows = [{"at": self.start - 3600, "lane": "codex"},
+                {"at": self.start + 60, "lane": "codex"},
+                {"at": self.start + 120, "lane": "codex"},
+                {"at": self.start + 30, "lane": "cursor"},
+                {"at": self.start + 40, "lane": "vercel"},
+                {"at": self.start + 50, "lane": None}]
+        Path(self.path).write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def pools(self, codex_ratio=1.6):
+        return {"codex": {"state": "ON", "used_pct": 19.0, "resets_at": self.reset,
+                           "elapsed_pct": 11.9, "window_minutes": 10080, "pace_ratio": codex_ratio},
+                "grok": {"state": "WARN", "used_pct": 91.4, "resets_at": T + 5 * 86400,
+                         "elapsed_pct": 29.4, "window_minutes": 10080, "pace_ratio": 3.11}}
+
+    def test_counts_launches_since_the_plans_own_window_start(self):
+        report = pp.pace_log(self.pools(), {"lanes": LANES}, T, launches_path=self.path)
+        codex = report["lanes"]["codex"]
+        self.assertEqual(codex["since"], self.start)
+        self.assertTrue(codex["since_reset"])
+        self.assertEqual(codex["launches"], 2)
+        self.assertEqual(codex["used_pct"], 19.0)
+        self.assertEqual(codex["pace_ratio"], 1.6)
+        self.assertEqual(report["lanes"]["cursor"]["launches"], 1)
+        self.assertEqual(report["lanes"]["vercel"]["launches"], 1)
+
+    def test_text_prints_the_launches_and_the_plan_counter(self):
+        report = pp.pace_log(self.pools(), {"lanes": LANES}, T, launches_path=self.path)
+        lines = list(pp.pace_log_lines(report))
+        codex = next(line for line in lines if line.startswith("codex:"))
+        self.assertIn("2 launches since", codex)
+        self.assertIn("19% used", codex)
+        self.assertIn("11.9% of 168 h gone", codex)
+        self.assertIn("pace 1.60x", codex)
+        self.assertIn("no tokens", " ".join(lines).lower())
+
+    def test_lanes_without_a_counter_say_so_instead_of_guessing(self):
+        lanes = [dict(lane, credit="vercel") if lane["lane"] == "vercel" else lane for lane in LANES]
+        report = pp.pace_log({}, {"lanes": lanes}, T, launches_path=self.path)
+        lines = list(pp.pace_log_lines(report))
+        self.assertIn("credit lane, no plan counter", next(line for line in lines if line.startswith("vercel:")))
+        self.assertIn("counter unknown", next(line for line in lines if line.startswith("codex:")))
+        self.assertFalse(report["lanes"]["codex"]["since_reset"])
+
+    def test_main_prints_json_or_text(self):
+        pools_path = self.path + ".pools.json"
+        Path(pools_path).write_text(json.dumps(self.pools()))
+        for flags, check in (([], "Pace log:"), (["--json"], None)):
+            out = io.StringIO()
+            with mock.patch.object(pp.time, "time", return_value=T), redirect_stdout(out):
+                code = pp.main(["--pace-log", self.path, "--pools", pools_path] + flags)
+            self.assertEqual(code, 0)
+            if check:
+                self.assertIn(check, out.getvalue())
+                self.assertIn("pace 1.60x", out.getvalue())
+            else:
+                self.assertEqual(json.loads(out.getvalue())["lanes"]["codex"]["launches"], 2)
+
+
 class PickTests(unittest.TestCase):
     def test_first_lane_wins_when_nothing_reads_it(self):
         got = pick({"codex": pool(), "grok": pool()})
