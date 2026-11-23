@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
@@ -1642,6 +1643,41 @@ class CommandTests(unittest.TestCase):
         out = self.run_cli({"claude": pool("ON", 1.8)}, "--claude-helper", "--json")
         self.assertEqual(json.loads(out.stdout)["allowed"], False)
         self.assertEqual(sorted(json.loads(out.stdout)), ["allowed", "reason"])
+
+    def emergency_until(self, hours):
+        return datetime.fromtimestamp(time.time() + hours * 3600, timezone.utc).isoformat()
+
+    def test_claude_helper_emergency_allows_above_pace(self):
+        until = self.emergency_until(2)
+        self.assertEqual(self.cli("--claude-emergency-until", until, "--reason", "workers blocked").returncode, 0)
+        out = self.run_cli({"claude": pool("ON", 1.8)}, "--claude-helper")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, f"Claude helper: allowed. Why: emergency allowance until {until} "
+                                     "(workers blocked); pace 1.80x.\n")
+
+    def test_claude_helper_emergency_keeps_used_up_refusal(self):
+        self.cli("--claude-emergency-until", self.emergency_until(2), "--reason", "x")
+        out = self.run_cli({"claude": pool("OFF", 1.8)}, "--claude-helper")
+        self.assertEqual(out.returncode, 3)
+
+    def test_claude_helper_expired_emergency_refuses_and_is_removed(self):
+        state = Path(self.home) / ".local" / "state" / "token-ladder" / "claude-emergency.json"
+        state.parent.mkdir(parents=True)
+        state.write_text(json.dumps({"until": self.emergency_until(-1), "reason": "old", "set_at": "x"}))
+        out = self.run_cli({"claude": pool("ON", 1.8)}, "--claude-helper")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("pace 1.80x is above 1.1x", out.stdout)
+        self.assertFalse(state.exists())
+
+    def test_claude_emergency_off_removes_it(self):
+        self.cli("--claude-emergency-until", self.emergency_until(2), "--reason", "x")
+        self.assertEqual(self.cli("--claude-emergency-until", "off").returncode, 0)
+        out = self.run_cli({"claude": pool("ON", 1.8)}, "--claude-helper")
+        self.assertEqual(out.returncode, 3)
+
+    def test_claude_emergency_needs_reason_and_zone(self):
+        self.assertEqual(self.cli("--claude-emergency-until", self.emergency_until(2)).returncode, 2)
+        self.assertEqual(self.cli("--claude-emergency-until", "2030-01-01T00:00:00", "--reason", "x").returncode, 2)
 
     def test_unreadable_pools_fail_loud(self):
         out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--pools", "/nonexistent"],
