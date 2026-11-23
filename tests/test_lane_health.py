@@ -127,45 +127,6 @@ class LaneHealthTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pp.balance_commandcode(get, lambda name: "fixture-key")
 
-    def test_visibility_uses_cwd_remote_and_caches_per_repo_for_a_day(self):
-        lane = {"lane": "commandcode", "credit": "commandcode", "public_only": True}
-        brief = Path(self.tmp.name) / "brief.txt"
-        brief.write_text("Fix the current checkout")
-        run = mock.Mock(side_effect=[subprocess.CompletedProcess([], 0, "git@github.com:owner/project.git\n"),
-                                     subprocess.CompletedProcess([], 0, '{"visibility":"PUBLIC"}')])
-        cache = str(Path(self.tmp.name) / "visibility.json")
-        got = pp.with_repo_visibility({}, [lane], str(brief), run, cache_path=cache, now=NOW)
-        self.assertEqual(got, {})
-        self.assertEqual(run.call_args_list[1].args[0],
-                         ["gh", "repo", "view", "owner/project", "--json", "visibility"])
-        brief.write_text("Repo owner/project\nhttps://github.com/owner/docs")
-        cached = mock.Mock(side_effect=AssertionError("must use cached visibility"))
-        self.assertEqual(pp.with_repo_visibility({}, [lane], str(brief), cached, cache_path=cache, now=NOW + 86399), {})
-        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{"visibility":"PRIVATE"}'))
-        got = pp.with_repo_visibility({}, [lane], str(brief), run, cache_path=cache, now=NOW + 86400)
-        self.assertEqual(got["credit:commandcode"]["state"], "OFF")
-        run.assert_called_once()
-
-    def test_repository_detection_and_refusal_fixtures(self):
-        fixtures = json.loads((Path(REPO) / "tests/fixtures/repo-visibility.json").read_text())
-        lane = {"lane": "commandcode", "credit": "commandcode", "public_only": True}
-        brief = Path(self.tmp.name) / "brief.txt"
-        for i, fixture in enumerate(fixtures):
-            with self.subTest(fixture=fixture):
-                brief.write_text(fixture["brief"])
-                answers = []
-                if "remote" in fixture:
-                    answers.append(subprocess.CompletedProcess([], 0, fixture["remote"]))
-                if "repo" in fixture:
-                    answers.append(subprocess.CompletedProcess([], 0, json.dumps({"visibility": fixture["visibility"]})))
-                run = mock.Mock(side_effect=answers)
-                got = pp.with_repo_visibility({}, [lane], str(brief), run,
-                                              cache_path=str(brief) + str(i), now=NOW)
-                self.assertEqual("credit:commandcode" not in got, fixture["allowed"])
-                if "repo" in fixture:
-                    self.assertEqual(run.call_args.args[0],
-                                     ["gh", "repo", "view", fixture["repo"], "--json", "visibility"])
-
     def test_legacy_limits_still_parse_and_metadata_is_html_escaped(self):
         from test_dashboard import base_status
         raw = {"old": NOW + 10, "legacy": NOW + 20, "legacy:reason": "retired",

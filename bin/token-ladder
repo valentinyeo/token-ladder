@@ -1441,8 +1441,6 @@ def render_dashboard(s):
             badges.append(_badge("shared with chats", "info"))
         if item.get("chat_only"):
             badges.append(_badge("chat-only", "muted"))
-        if item.get("public_only"):
-            badges.append(_badge("public repos only", "info"))
         meta_parts = []
         if item.get("models"):
             meta_parts.append(", ".join(str(m) for m in item["models"]))
@@ -1497,8 +1495,6 @@ def render_dashboard(s):
             flags.append("shared with chats")
         if item.get("chat_only"):
             flags.append("chat-only")
-        if item.get("public_only"):
-            flags.append("public repos only")
         if item.get("first_until"):
             stamp = datetime.fromtimestamp(item["first_until"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             flags.append(f"first until {stamp}")

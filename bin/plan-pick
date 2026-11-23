@@ -32,7 +32,6 @@ FAST_FAIL_BEFORE_WORK_S = 30
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
 LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
-REPO_VISIBILITY = os.path.expanduser("~/.local/state/token-ladder/repo-visibility.json")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
 PI = os.path.expanduser("~/.npm-global/bin/pi")
 PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
@@ -177,6 +176,38 @@ def limit_note(skip):
     return "; ".join(str(skip[key]) for key in ("reason", "source", "error_line") if skip.get(key))
 
 
+def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
+    name = lane["lane"]
+    pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+    if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
+        return "chat-only pool, never workers"
+    skip = parse_limit(limits, name, now)
+    if skip is not None:
+        return f"limited until {skip['until_text']}"
+    return skip_reason(pool, warn, no_pace)
+
+
+def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN):
+    now = time.time() if now is None else now
+    spec = {"anthropic": "claude", "openai": "codex", "google": "antigravity"}.get(spec, spec)
+    lane = next((lane for lane in lanes if lane["lane"] == spec), None)
+    if lane is None:
+        lane = next((lane for lane in lanes if spec in lane_names(lane)), None)
+    if lane is None and spec == "claude":
+        lane = {"lane": "claude", "pool": "claude", "shared_with_chats": True}
+    if lane is None:
+        return {"allowed": False, "reason": f"unknown lane or vendor {spec}"}
+    pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+    why = lane_skip_reason(lane, pools, limits, now, warn)
+    if not why and lane.get("credit") and not isinstance(pool, dict):
+        why = "credit unknown"
+    if not why and isinstance(pool, dict):
+        credit, floor = number(pool.get("credits_usd")), number(pool.get("credit_floor_usd"))
+        if credit is not None and floor is not None and credit <= floor:
+            why = f"credit ${credit:g} is at or below floor ${floor:g}"
+    return {"allowed": not why, "reason": f"{lane['lane']}: {why or 'allowed'}"}
+
+
 def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None):
     pools = pools if isinstance(pools, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
@@ -185,15 +216,12 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
     for lane in lanes:
         name = lane["lane"]
         pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
-        if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
-            skipped[name] = "chat-only pool, never workers"
-            continue
+        no_pace = burn is not None and name == burn["lane"]
         skip = parse_limit(limits, name, now)
         if skip is not None:
-            skipped[name] = f"limited until {skip['until_text']}" + (f" ({limit_note(skip)})" if skip["explicit_reason"] else "")
-            continue
-        no_pace = burn is not None and name == burn["lane"]
-        why = skip_reason(pool, warn, no_pace)
+            why = f"limited until {skip['until_text']}" + (f" ({limit_note(skip)})" if skip["explicit_reason"] else "")
+        else:
+            why = lane_skip_reason(lane, pools, limits, now, warn, no_pace)
         if why:
             skipped[name] = why
             if why.startswith("pace"):
@@ -350,62 +378,6 @@ def lanes_from(cfg, now=None):
     usable = [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
               and isinstance(lane.get("command"), str)]
     return lanes_with_first(usable, now)
-
-
-def with_repo_visibility(pools, lanes, brief="brief.txt", run=subprocess.run, cache_path=REPO_VISIBILITY, now=None):
-    restricted = [lane for lane in lanes if lane.get("public_only")]
-    if not restricted:
-        return pools
-    now = time.time() if now is None else now
-    try:
-        with open(brief) as fh:
-            text = fh.read()
-    except OSError:
-        text = ""
-    repos = re.findall(r"(?im)^\s*repo(?:sitory)?\s*[:=]?\s*(?:https?://github\.com/)?([\w.-]+/[\w.-]+)", text)
-    if not repos:
-        repos = re.findall(r"https?://github\.com/([\w.-]+/[\w.-]+)", text)
-    if not repos:
-        try:
-            out = run(["git", "remote", "get-url", "origin"], capture_output=True, text=True, timeout=5)
-            match = re.fullmatch(r"(?:https?://github\.com/|(?:ssh://)?git@github\.com[:/])([\w.-]+/[\w.-]+)/?", out.stdout.strip())
-            if out.returncode == 0 and match:
-                repos = [match[1]]
-        except (OSError, subprocess.SubprocessError):
-            pass
-    repos = list(dict.fromkeys(repo.rstrip(".").removesuffix(".git").lower() for repo in repos))
-    cache = read_limits(cache_path)
-    public = bool(repos)
-    changed = False
-    for repo in repos:
-        entry = cache.get(repo)
-        if isinstance(entry, dict) and 0 <= now - (number(entry.get("at")) or 0) < 86400:
-            visibility = entry.get("visibility")
-        else:
-            visibility = "UNKNOWN"
-            try:
-                out = run(["gh", "repo", "view", repo, "--json", "visibility"],
-                          capture_output=True, text=True, timeout=20)
-                if out.returncode == 0:
-                    visibility = json.loads(out.stdout).get("visibility", "UNKNOWN")
-            except (OSError, ValueError, AttributeError, subprocess.SubprocessError):
-                pass
-            cache[repo] = {"at": now, "visibility": visibility}
-            changed = True
-        public = public and visibility == "PUBLIC"
-    if changed:
-        try:
-            write_limits(cache, cache_path)
-        except OSError:
-            pass
-    if public:
-        return pools
-    pools = dict(pools)
-    for lane in restricted:
-        name = lane.get("pool") or f"credit:{lane['credit']}"
-        pools[name] = dict(pools.get(name) or {}, state="OFF",
-                           note="public repos only; repository is private or visibility is unknown")
-    return pools
 
 
 def lane_names(lane):
@@ -865,7 +837,7 @@ def credit_pool(entry, now, cfg):
         return None
     if now - entry["at"] > stale_s:
         return None
-    extra = {"credits_usd": entry["usd"]}
+    extra = {"credits_usd": entry["usd"], "credit_floor_usd": floor}
     if entry.get("resets_at") is not None:
         extra["resets_at"] = entry["resets_at"]
     if entry["usd"] < floor:
@@ -1502,7 +1474,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             "skip": skip,
             "chat_only": chat_only,
             "shared_with_chats": shared,
-            "public_only": bool(lane.get("public_only")),
             "first_until": first_until if first_until and first_until > now else None,
             "burn_until": burn["until"] if no_pace else None,
             "reason": why,
@@ -1549,7 +1520,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
         shared = bool(plan.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats"))
                       or any(l.get("shared_with_chats") for l in matched))
         chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not shared)
-        public_only = bool(any(l.get("public_only") for l in matched))
         retired = isinstance(plan.get("extra_cost"), str) and plan["extra_cost"].lower().startswith("retired")
         no_pace = bool(burn and any(l["lane"] == burn["lane"] for l in matched))
         st = entry_status(pool, skip, now, warn, chat_only=chat_only, retired=retired, no_pace=no_pace)
@@ -1568,7 +1538,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             "monthly_price_usd": number(plan.get("monthly_price_usd")),
             "chat_only": chat_only,
             "shared_with_chats": shared,
-            "public_only": public_only,
             "retired": retired,
             "skip": skip,
             **st,
@@ -1597,7 +1566,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             "monthly_price_usd": None,
             "chat_only": chat_only,
             "shared_with_chats": shared,
-            "public_only": bool(any(l.get("public_only") for l in matched)),
             "retired": False,
             "skip": skip,
             **st,
@@ -1633,6 +1601,9 @@ def main(argv):
     parser.add_argument("--plans", action="store_true",
                         help="print what each subscription includes, where it runs and whether it costs extra")
     parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
+    parser.add_argument("--lane-ok", metavar="LANE_OR_VENDOR",
+                        help="check one lane without fallback (exit 0 allowed, 3 refused with one reason line)")
+    parser.add_argument("--cloud", action="store_true", help="check the same shared pool for a cloud launch with --lane-ok")
     parser.add_argument("--claude-helper", action="store_true",
                         help="answer whether an in-chat Claude helper is allowed (exit 0 allowed, 3 refused)")
     parser.add_argument("--loop-interval", action="store_true",
@@ -1653,6 +1624,8 @@ def main(argv):
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     parser.add_argument("--reason", help="optional reason recorded with --limited in lane-limits.json")
     args = parser.parse_args(argv)
+    if args.cloud and not args.lane_ok:
+        parser.error("--cloud requires --lane-ok")
     cfg = load_config()
     if args.set_credit is not None:
         lane, value = args.set_credit
@@ -1746,6 +1719,9 @@ def main(argv):
         if not args.pools:
             pools = with_credits(pools, lanes, cfg)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if args.lane_ok:
+            print(f"{args.lane_ok}: cannot read pool state")
+            return 3
         print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
         return 1
     pools = with_antigravity_reserve(pools, cfg)
@@ -1759,9 +1735,12 @@ def main(argv):
     excluded = vendor_exclusions(args.not_vendor)
     if excluded:
         lanes = [lane for lane in lanes if not any(name in lane_names(lane) for name in excluded)]
-    pools = with_repo_visibility(pools, lanes)
     if any(lane.get("credit") == "commandcode" for lane in lanes) and "credit:commandcode" not in pools:
         pools = dict(pools, **{"credit:commandcode": commandcode_pool(None, time.time(), cfg)})
+    if args.lane_ok:
+        answer = lane_ok(args.lane_ok, lanes, pools, read_limits(), warn=warn)
+        print(" ".join(answer["reason"].splitlines()))
+        return 0 if answer["allowed"] else 3
     burn = parse_burn(cfg, lanes)
     lanes = lanes_with_burn(lanes, burn)
     if args.run:
