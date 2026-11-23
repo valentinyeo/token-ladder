@@ -12,7 +12,7 @@ Subcommands:
   hook-bash      PreToolUse(Bash) hook: refuse disallowed models and paid fallbacks
   hook-agent     PreToolUse(Agent) hook: respect the Claude pool
 """
-import argparse, fcntl, glob, html, json, math, os, re, selectors, shlex, signal, socket, subprocess, sys, tempfile, time, urllib.request
+import argparse, fcntl, glob, html, json, math, os, re, selectors, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -25,7 +25,9 @@ RESOURCES = os.path.join(STATE, "resources.jsonl")
 PRESSURE = os.path.join(STATE, "pressure.json")
 HISTORY_DAYS = 7
 HISTORY_SAMPLE_SECONDS = 300
-PACE_MIN_ELAPSED_PCT = 10
+PACE_MIN_WEEK_ELAPSED_PCT = 2
+PACE_MIN_SHORT_ELAPSED_PCT = 10
+CODEX_PATHS = ("~/.npm-global/bin/codex", "~/.local/bin/codex", "~/.bun/bin/codex", "/usr/local/bin/codex")
 LOCAL_CODEX = "hax --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p <prompt>"
 
 
@@ -325,10 +327,22 @@ def parse_codex_response(response):
     return out
 
 
+def codex_command():
+    """Codex lives off PATH in timers, worker shells and hooks, so try the usual installs too."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    for path in CODEX_PATHS:
+        candidate = os.path.expanduser(path)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return "codex"
+
+
 def probe_codex(timeout=20):
     """Read account limits without starting a thread or making a model call."""
     deadline = time.monotonic() + timeout
-    with subprocess.Popen(["codex", "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
+    with subprocess.Popen([codex_command(), "app-server", "--listen", "stdio://"], stdin=subprocess.PIPE,
                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, start_new_session=True) as proc:
         try:
             def send(message):
@@ -783,23 +797,25 @@ def pool_state(week, five_hour, cfg, now, five_hour_off_pct=None):
                 if bar.get("time_gone") is not None:
                     bar["time_gone"] = max(0, min(100, 100 * (1 - (reset - now) / (minutes * 60))))
         if bar.get("used") is not None:
-            windows.append(bar)
+            windows.append((bar, minutes))
             if minutes == 300 and five_hour_off_pct is not None and bar["used"] >= five_hour_off_pct:
                 short_capped = True
     if not windows:
         return {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown"}
     warn, off = cfg.get("pool_warn_pct", 80), cfg.get("pool_off_pct", 95)
     state = "ON"
-    if short_capped or any(w["used"] >= off for w in windows):
+    if short_capped or any(bar["used"] >= off for bar, _ in windows):
         state = "OFF"
-    elif any(w["used"] >= warn or ((w.get("time_gone") or 0) >= warn and
-                                   w["used"] >= w["time_gone"]) for w in windows):
+    elif any(bar["used"] >= warn or ((bar.get("time_gone") or 0) >= warn and
+                                     bar["used"] >= bar["time_gone"]) for bar, _ in windows):
         state = "WARN"
-    limiting = max(windows, key=lambda w: w["used"])
-    pace_ratios = [window_pace(w, [], now)["ratio"] for w in windows
-                   if (w.get("time_gone") or 0) >= PACE_MIN_ELAPSED_PCT]
+    limiting, minutes = max(windows, key=lambda pair: pair[0]["used"])
+    pace_ratios = [window_pace(dict(bar, time_gone=max(bar.get("time_gone") or 0.0, floor)), [], now)["ratio"]
+                   for bar, span in windows if (span >= 1440 or (bar.get("time_gone") or 0) >= PACE_MIN_SHORT_ELAPSED_PCT)
+                   for floor in (PACE_MIN_WEEK_ELAPSED_PCT if span >= 1440 else PACE_MIN_SHORT_ELAPSED_PCT,)]
     return {"used_pct": limiting["used"], "hours_left": limiting.get("hours_left"),
-            "resets_at": limiting.get("resets_at"), "state": state,
+            "resets_at": limiting.get("resets_at"), "state": state, "window_minutes": minutes,
+            "elapsed_pct": limiting.get("time_gone"),
             "pace_ratio": max((ratio for ratio in pace_ratios if ratio is not None), default=None)}
 
 
