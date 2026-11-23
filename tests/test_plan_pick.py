@@ -96,25 +96,59 @@ class PrepaidCreditTests(unittest.TestCase):
             with mock.patch.object(pp, "load_config", return_value=dict(pp.load_config(), **overrides)):
                 self.assertEqual(self.live_state()["state"], "OFF")
 
-    def test_floor_holds_lane_until_renewal_then_included_allowance_reopens(self):
+    def test_floor_lock_clears_on_a_live_read_above_the_floor_and_names_the_date(self):
         renewal = NOW + 8 * 86400
+        stamp = datetime.fromtimestamp(renewal, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         cfg = pp.load_config()
         live = {"at": NOW, "windows": month_full_windows(), "credits_usd": 2,
                 "credits_at": NOW, "resets_at": {"monthly": renewal}}
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pp, "read_opencode", return_value=live):
             path = str(Path(tmp, "limits.json"))
-            mark = pp.mark_limited
-            with mock.patch.object(pp, "mark_limited", side_effect=lambda lane, hours, now:
-                                   mark(lane, hours, now, path)):
-                got = pp.with_opencode({}, cfg, NOW)
-            limits = pp.read_limits(path)
-            self.assertEqual(limits["opencode"], renewal)
+            got = pp.with_opencode({}, cfg, NOW, limits_path=path)
+            self.assertEqual(pp.read_limits(path)["opencode"], renewal)
+            self.assertIn(f"skip until monthly renewal {stamp}", got["opencode"]["note"])
+            result = pp.pick(LANES, got, pp.read_limits(path), NOW)
+            self.assertEqual(result["plan"], "vercel")
+            self.assertIn(f"opencode (limited until {stamp[:10]} ", result["reason"])
             live.update(at=NOW + 60, credits_at=NOW + 60, credits_usd=24.64)
-            got = pp.with_opencode({}, cfg, NOW + 60)
-            self.assertEqual(pp.pick(LANES, got, limits, NOW + 60)["plan"], "vercel")
+            got = pp.with_opencode({}, cfg, NOW + 60, limits_path=path)
+            self.assertNotIn("opencode", pp.read_limits(path))
+            self.assertEqual(pp.pick(LANES, got, pp.read_limits(path), NOW + 60)["plan"], "opencode")
             live.update(at=renewal, windows={"monthly": 0, "weekly": 0, "5-hour": 0})
-            got = pp.with_opencode({}, cfg, renewal)
-            self.assertEqual(pp.pick(LANES, got, limits, renewal)["plan"], "opencode")
+            got = pp.with_opencode({}, cfg, renewal, limits_path=path)
+            self.assertEqual(pp.pick(LANES, got, pp.read_limits(path), renewal)["plan"], "opencode")
+
+    def test_live_credit_above_the_floor_leaves_a_rate_limit_lock_alone(self):
+        cfg = pp.load_config()
+        live = {"at": NOW, "windows": month_full_windows(), "credits_usd": 24.64,
+                "credits_at": NOW, "resets_at": {"monthly": NOW + 8 * 86400}}
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pp, "read_opencode", return_value=live):
+            path = str(Path(tmp, "limits.json"))
+            pp.mark_limited("opencode", 1, NOW, path)
+            got = pp.with_opencode({}, cfg, NOW, limits_path=path)
+            self.assertEqual(pp.read_limits(path)["opencode"], NOW + 3600)
+            self.assertEqual(pp.pick(LANES, got, pp.read_limits(path), NOW)["plan"], "vercel")
+
+    def test_missing_reader_reports_credit_unknown_not_used_up(self):
+        with mock.patch.object(pp, "read_opencode", return_value=None):
+            got = pp.opencode_pool(NOW, pp.load_config(), tempfile.mkdtemp())
+        self.assertEqual(got["state"], "OFF")
+        self.assertTrue(got["credit_unknown"])
+        result = pick({"opencode": got})
+        self.assertEqual(result["plan"], "vercel")
+        self.assertIn("opencode (credit unknown: OpenCode live usage unavailable; credit unknown", result["reason"])
+        self.assertNotIn("opencode (used up", result["reason"])
+
+    def test_missing_credit_reader_on_exhausted_month_reports_credit_unknown(self):
+        live = {"at": NOW, "windows": month_full_windows(), "credits_usd": None,
+                "credits_at": None, "resets_at": {"monthly": NOW + 8 * 86400}}
+        with mock.patch.object(pp, "read_opencode", return_value=live):
+            got = pp.opencode_pool(NOW, pp.load_config(), history([live]))
+        self.assertTrue(got["credit_unknown"])
+        self.assertIn("credit unknown", got["note"])
+        result = pick({"opencode": got})
+        self.assertEqual(result["plan"], "vercel")
+        self.assertIn("opencode (credit unknown:", result["reason"])
 
     def test_live_reader_executes_read_only_commands_and_keeps_zero_credit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1237,6 +1271,35 @@ class CommandTests(unittest.TestCase):
         out = self.plan_not_from("vercel", ("opencode",), "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout)["plan"], "openrouter")
+
+    def test_not_vendor_accumulates_repeats_and_comma_lists(self):
+        cfg = {"lanes": [{"lane": name, "vendor": name, "command": f"echo {name}-ran"}
+                         for name in ("alpha", "beta", "gamma")]}
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (repo / "config.json").write_text(json.dumps(cfg))
+        pools = Path(self.home) / "pools.json"
+        pools.write_text("{}")
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.pacing),
+               "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
+        base = [sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools)]
+        for flags in (("--not-vendor", "alpha", "--not-vendor", "beta"),
+                      ("--not-vendor", "alpha,beta"),
+                      ("--not-vendor", "alpha, beta")):
+            with self.subTest(flags=flags):
+                out = subprocess.run(base + ["--json", *flags], capture_output=True, text=True, env=env)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertEqual(json.loads(out.stdout)["plan"], "gamma")
+                text = subprocess.run(base + list(flags), capture_output=True, text=True, env=env)
+                self.assertIn("Worker plan: gamma.", text.stdout)
+                self.assertIn("--not-vendor alpha --not-vendor beta", text.stdout)
+        ran = subprocess.run(base + ["--run", "--not-vendor", "alpha", "--not-vendor", "beta"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("gamma-ran", ran.stdout)
+        self.assertNotIn("beta-ran", ran.stdout)
 
     def test_run_skips_a_lane_excluded_by_its_own_name(self):
         cfg = {"lanes": [{"lane": "vercel", "credit": "vercel", "vendor": "deepseek",

@@ -87,7 +87,7 @@ The monthly renewal was 30 November, about 8 days and 1 hour away. Weekly reset 
 Extra Usage is on. Enabled models are `beam-free`, `deepseek-v4.1-flash`, and `glm-5.3-flash`; workers still use DeepSeek Flash only.
 
 Prepaid credit already held gets used. Once the included allowance is gone, workers use OpenCode Extra Usage while the live or anchored available credit is above `opencode_credit_floor_usd`, which defaults to $2.
-At or below the floor, the lane is skipped until the monthly renewal. Worker selection records that renewal in the existing lane-limits file, so a later balance change cannot reopen it early.
+At or below the floor, the lane is skipped until the monthly renewal, and the reason names that renewal date. Worker selection records that renewal in the existing lane-limits file; a later live credit read above the floor clears that lock, while a rate-limit lock stays.
 Auto top-up is OFF. The reader never purchases credit or changes billing settings.
 
 `opencode_reader_command` configures the installed read-only `opencode-read` command.
@@ -120,7 +120,7 @@ Anchors older than seven days, future anchors, and invalid balances close prepai
 
 | Rule | Enforced by |
 |---|---|
-| Use prepaid credit already held down to its floor; never top up automatically. OpenCode stops at $2 until monthly renewal. | `PrepaidCreditTests.test_prepaid_credit_floor_is_inclusive_and_configurable`, `test_floor_holds_lane_until_renewal_then_included_allowance_reopens`, `test_live_reader_executes_read_only_commands_and_keeps_zero_credit` in `tests/test_plan_pick.py` |
+| Use prepaid credit already held down to its floor; never top up automatically. OpenCode stops at $2 until monthly renewal, and a live read above the floor clears that lock. | `PrepaidCreditTests.test_prepaid_credit_floor_is_inclusive_and_configurable`, `test_floor_lock_clears_on_a_live_read_above_the_floor_and_names_the_date`, `test_live_credit_above_the_floor_leaves_a_rate_limit_lock_alone`, `test_live_reader_executes_read_only_commands_and_keeps_zero_credit` in `tests/test_plan_pick.py` |
 | Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Live credit or an anchor no older than seven days can authorize Extra Usage. Deduct run costs, or $0.50 per unknown-cost run. | `AnchoredCreditTests`, `CommandTests.test_set_credit_and_usage_logs_drive_selection_without_browser_credit`, `PrepaidCreditTests` |
 | DeepSeek direct is retired; no more top-ups or worker/CI selection. | `PrepaidCreditTests.test_deepseek_direct_is_retired_from_workers_and_ci` |
 
