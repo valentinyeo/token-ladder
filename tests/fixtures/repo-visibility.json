@@ -1,0 +1,8 @@
+[
+  {"brief": "Repo valentinyeo/example (fresh clone).", "repo": "valentinyeo/example", "visibility": "PUBLIC", "allowed": true},
+  {"brief": "Repository: https://github.com/valentinyeo/example.git", "repo": "valentinyeo/example", "visibility": "PRIVATE", "allowed": false},
+  {"brief": "Fix https://github.com/valentinyeo/example/pull/1", "repo": "valentinyeo/example", "visibility": "PUBLIC", "allowed": true},
+  {"brief": "Fix the current checkout", "remote": "https://github.com/valentinyeo/example.git", "repo": "valentinyeo/example", "visibility": "INTERNAL", "allowed": false},
+  {"brief": "Fix the current checkout", "remote": "ssh://git@github.com/valentinyeo/example.git", "repo": "valentinyeo/example", "visibility": "UNKNOWN", "allowed": false},
+  {"brief": "Fix the current checkout", "remote": "https://example.invalid/valentinyeo/example.git", "allowed": false}
+]

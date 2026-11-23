@@ -205,7 +205,10 @@ class QuotaFallthroughTests(unittest.TestCase):
         self.assertEqual(runner.call_count, 2)
         self.assertTrue(self.said[0].startswith("lane antigravity:"), self.said[0])
         self.assertIn("lane antigravity hit a rate or usage limit", self.said[1])
-        self.assertEqual(json.loads(Path(self.limits).read_text())["antigravity"], NOW + 3600)
+        entry = json.loads(Path(self.limits).read_text())["antigravity"]
+        self.assertEqual(entry["until"], NOW + 300)
+        self.assertEqual(entry["source"], "quota error")
+        self.assertIn("ResourceExhausted", entry["error_line"])
         self.assertEqual(json.loads(Path(self.launches).read_text().splitlines()[1])["lane"], "vercel")
 
     def test_a_used_up_reading_leaves_nothing_to_run(self):

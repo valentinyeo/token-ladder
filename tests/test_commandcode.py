@@ -112,9 +112,10 @@ class CommandCodeTests(unittest.TestCase):
         brief = Path(self.home.name) / "brief.txt"
         brief.write_text("Repo owner/private-repo (fresh clone).\nhttps://github.com/owner/public-docs")
         for visibility in ("PRIVATE", "INTERNAL", "", "PUBLIC"):
-            run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, visibility))
-            pools = pp.with_repo_visibility({"credit:commandcode": {"state": "ON"}}, [self.lane], str(brief), run)
-            run.assert_called_once_with(["gh", "repo", "view", "owner/private-repo", "--json", "visibility", "--jq", ".visibility"],
+            run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps({"visibility": visibility})))
+            pools = pp.with_repo_visibility({"credit:commandcode": {"state": "ON"}}, [self.lane], str(brief), run,
+                                            cache_path=str(brief) + visibility + ".cache")
+            run.assert_called_once_with(["gh", "repo", "view", "owner/private-repo", "--json", "visibility"],
                                         capture_output=True, text=True, timeout=20)
             result = pp.pick([self.lane], pools, now=AT, burn={"lane": "commandcode", "until": AT + 60})
             self.assertEqual(result["plan"], "commandcode" if visibility == "PUBLIC" else "none")
@@ -130,9 +131,9 @@ class CommandCodeTests(unittest.TestCase):
     def test_all_brief_repositories_must_be_public(self):
         brief = Path(self.home.name) / "brief.txt"
         brief.write_text("https://github.com/owner/public\nhttps://github.com/owner/private")
-        run = mock.Mock(side_effect=[subprocess.CompletedProcess([], 0, "PUBLIC"),
-                                     subprocess.CompletedProcess([], 0, "PRIVATE")])
-        pools = pp.with_repo_visibility({}, [self.lane], str(brief), run)
+        run = mock.Mock(side_effect=[subprocess.CompletedProcess([], 0, '{"visibility":"PUBLIC"}'),
+                                     subprocess.CompletedProcess([], 0, '{"visibility":"PRIVATE"}')])
+        pools = pp.with_repo_visibility({}, [self.lane], str(brief), run, cache_path=str(brief) + ".cache")
         self.assertEqual(pools["credit:commandcode"]["state"], "OFF")
 
     def test_worker_uses_configured_provider_and_preserves_secret_override(self):
@@ -158,11 +159,13 @@ class CommandCodeTests(unittest.TestCase):
         pools.write_text(json.dumps({"credit:commandcode": {"state": "ON"}}))
         for visibility in ("PRIVATE", "PUBLIC"):
             env = dict(os.environ, HOME=str(root), PATH=str(root) + os.pathsep + os.environ.get("PATH", ""),
-                       TOKEN_LADDER_LOCAL_CONFIG=str(cfg), TEST_VISIBILITY=visibility)
+                       TOKEN_LADDER_LOCAL_CONFIG=str(cfg), TEST_VISIBILITY=json.dumps({"visibility": visibility}))
+            cache = root / ".local/state/token-ladder/repo-visibility.json"
+            cache.unlink(missing_ok=True)
             out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--run", "--pools", str(pools)],
                                  cwd=root, env=env, capture_output=True, text=True, timeout=20)
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertIn("repo view owner/target-repo --json visibility --jq .visibility", (root / "gh-args").read_text())
+            self.assertIn("repo view owner/target-repo --json visibility", (root / "gh-args").read_text())
             self.assertIn("commandcode-worker" if visibility == "PUBLIC" else "next-worker", out.stdout)
             if visibility == "PRIVATE":
                 self.assertNotIn("commandcode-worker", out.stdout)
