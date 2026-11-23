@@ -981,6 +981,19 @@ def update_state(path, key, value):
         os.replace(tmp, path)
 
 
+def parse_pages(stdout):
+    pages, decoder, index = [], json.JSONDecoder(), 0
+    while index < len(stdout):
+        while index < len(stdout) and stdout[index] in " \t\r\n":
+            index += 1
+        if index >= len(stdout):
+            break
+        page, index = decoder.raw_decode(stdout, index)
+        pages.append(page)
+    return [comment for page in pages if isinstance(page, list)
+            for comment in page if isinstance(comment, dict)]
+
+
 def first_verdict(pr, cache_path, run=subprocess.run):
     match = PR_URL.fullmatch(pr or "")
     if not match:
@@ -989,13 +1002,15 @@ def first_verdict(pr, cache_path, run=subprocess.run):
     if cached in ("PASS", "FAIL"):
         return cached
     repo, num = match.groups()
-    proc = run(["gh", "api", "--paginate", "--slurp",
+    proc = run(["gh", "api", "--paginate",
                 f"repos/{repo}/issues/{num}/comments?per_page=100"],
                capture_output=True, text=True, timeout=60)
     if proc.returncode:
         raise ValueError(f"cannot read verifier comments for {repo}#{num}")
-    pages = json.loads(proc.stdout)
-    comments = [comment for page in pages for comment in page]
+    try:
+        comments = parse_pages(proc.stdout)
+    except ValueError as exc:
+        raise ValueError(f"cannot read verifier comments for {repo}#{num}: {exc}")
     comments.sort(key=lambda c: (c.get("created_at", ""), c.get("id", 0)))
     for comment in comments:
         body = comment.get("body", "")
@@ -1049,7 +1064,11 @@ def climb_reason(prior, cache_path):
         return None
     if prior["exit_code"] != 0 or not prior.get("pr_url"):
         return "prior run failed"
-    verdict = first_verdict(prior.get("pr_url"), cache_path)
+    try:
+        verdict = first_verdict(prior.get("pr_url"), cache_path)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"plan-pick: {exc}; verdict unknown, no climb", file=sys.stderr)
+        return None
     if verdict == "FAIL":
         return f"prior FAIL on PR {prior['pr_url'].rsplit('/', 1)[-1]}"
     return None
