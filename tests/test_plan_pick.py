@@ -986,7 +986,7 @@ class ConfigTests(unittest.TestCase):
         cfg = pp.load_config()
         lanes = pp.lanes_from(cfg)
         self.assertEqual([lane["lane"] for lane in lanes],
-                         ["opencode", "vercel", "commandcode", "openrouter", "codex", "cursor"])
+                         ["opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex", "cursor"])
         self.assertEqual(cfg["pace_warn_ratio"], pp.DEFAULT_PACE_WARN)
 
     def test_shipped_commands_obey_the_model_rules(self):
@@ -997,7 +997,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertNotIn("baseten", command)
                 self.assertNotRegex(command, r"deepseek\S*pro")
                 self.assertNotIn("claude", command)
-                self.assertIn(lane.get("vendor"), ("deepseek", "openai", "cursor"))
+                self.assertIn(lane.get("vendor"), ("deepseek", "openai", "cursor", "google"))
                 self.assertIn(lane.get("credit"), (None, *pp.BALANCES))
                 self.assertTrue(command.endswith("</dev/null"), command)
                 self.assertIsNone(tl.bash_refusal(lane["command"], {}), lane["command"])
@@ -1047,44 +1047,47 @@ class PlansTests(unittest.TestCase):
                 self.assertEqual(pp.plans_from(cfg), [])
 
 
-class GoogleWorkerExclusionTests(unittest.TestCase):
-    def test_google_pool_or_lane_is_never_picked_even_without_a_reading(self):
-        for lane in ({"lane": "google", "pool": None, "command": "echo forbidden"},
-                     {"lane": "renamed", "pool": "google", "command": "echo forbidden"}):
-            for reading in (None, {}, pool("ON", 0.1), pool("OFF"), pool("ON", 2.0)):
-                pools = {} if reading is None else {"google": reading}
-                with self.subTest(lane=lane, reading=reading):
-                    burn = {"lane": lane["lane"], "until": T + 60}
-                    got = pp.pick([lane], pools, now=T, burn=burn)
-                    self.assertEqual(got["plan"], "none")
-                    self.assertIsNone(got["command"])
-                    self.assertIn("chat-only", got["reason"])
+class ChatOnlyPoolTests(unittest.TestCase):
+    def test_a_chat_only_reading_is_never_picked_without_the_opt_in(self):
+        lane = {"lane": "renamed", "pool": "google", "command": "echo forbidden"}
+        pools = {"google": {"state": "ON", "used_pct": 40.0, "pace_ratio": 0.1, "chat_only": True}}
+        got = pp.pick([lane], pools, now=T)
+        self.assertEqual(got["plan"], "none")
+        self.assertIsNone(got["command"])
+        self.assertIn("chat-only", got["reason"])
 
-    def test_worker_fallback_and_least_ahead_selection_exclude_google(self):
-        google = {"lane": "google", "pool": "google", "command": "echo forbidden"}
-        worker = {"lane": "worker", "pool": "worker", "command": "echo allowed"}
-        for ratio in (0.1, 2.0):
-            with self.subTest(ratio=ratio):
-                got = pp.pick([google, worker], {"google": pool("ON", 0.0), "worker": pool("ON", ratio)}, now=T)
-                self.assertEqual(got["plan"], "worker")
-
-    def test_run_never_launches_google(self):
-        lane = {"lane": "google", "pool": "google", "command": "echo forbidden"}
-        runner = mock.Mock(side_effect=AssertionError("no Google worker"))
+    def test_the_opt_in_lane_shares_the_plan_and_runs(self):
+        lane = {"lane": "antigravity", "pool": "google", "shared_with_chats": True, "command": "echo allowed"}
+        pools = {"google": {"state": "ON", "used_pct": 40.0, "pace_ratio": None,
+                            "chat_only": False, "shared_with_chats": True}}
+        self.assertEqual(pp.pick([lane], pools, now=T)["plan"], "antigravity")
+        runner = mock.Mock(return_value=(0, "done", 4.0, True))
         with tempfile.TemporaryDirectory() as home:
-            result = pp.run_lanes([lane], {}, {}, 1.1, runner=runner,
+            code = pp.run_lanes([lane], pools, {}, 1.1, runner=runner,
+                                limits_path=os.path.join(home, "limits.json"), now=T, say=lambda text: None,
+                                launches_path=os.path.join(home, "launches.jsonl"))
+        self.assertEqual(code, 0)
+        runner.assert_called_once_with("echo allowed")
+
+    def test_a_chat_only_reading_keeps_run_lanes_off_that_pool(self):
+        lane = {"lane": "antigravity", "pool": "google", "command": "echo forbidden"}
+        runner = mock.Mock(side_effect=AssertionError("no chat-only worker"))
+        with tempfile.TemporaryDirectory() as home:
+            result = pp.run_lanes([lane], {"google": {"state": "ON", "chat_only": True}}, {}, 1.1, runner=runner,
                                   limits_path=os.path.join(home, "limits.json"), now=T, say=lambda text: None,
                                   launches_path=os.path.join(home, "launches.jsonl"))
         self.assertEqual(result, 4)
         runner.assert_not_called()
 
-    def test_google_is_a_chat_only_plan_without_a_shipped_lane(self):
+    def test_the_shipped_antigravity_lane_is_the_google_plan_lane(self):
         cfg = pp.load_config()
         google = next(plan for plan in pp.plans_from(cfg) if plan["vendor"] == "google")
         self.assertEqual(google["pool"], "google")
-        self.assertTrue(google["chat_only"])
-        self.assertFalse(any(lane.get("pool") == "google" or lane["lane"] == "google"
-                             for lane in pp.lanes_from(cfg)))
+        self.assertTrue(google["shared_with_chats"])
+        self.assertNotIn("chat_only", google)
+        lane = next(lane for lane in pp.lanes_from(cfg) if lane["pool"] == "google")
+        self.assertEqual(lane["lane"], "antigravity")
+        self.assertTrue(lane["shared_with_chats"])
 
 
 class WorkerEnvTests(unittest.TestCase):
@@ -1181,8 +1184,10 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(out.stdout.startswith("Lane vercel is skipped until"), out.stdout)
         self.cli("--limited", "opencode")
         got = json.loads(self.run_cli({}, "--json").stdout)
-        self.assertEqual(got["plan"], "openrouter")
-        self.assertIn("vercel (limited until", got["reason"])
+        self.assertEqual(got["plan"], "antigravity")
+        self.assertIn("opencode (limited until", got["reason"])
+        self.cli("--limited", "antigravity")
+        self.assertEqual(json.loads(self.run_cli({}, "--json").stdout)["plan"], "openrouter")
 
     def test_run_skips_a_400_lane_end_to_end(self):
         cfg = {"lanes": [{"lane": "a", "pool": None, "command": "echo '400 model request was rejected'; exit 1"},
@@ -1248,18 +1253,22 @@ class CommandTests(unittest.TestCase):
 
     def test_not_vendor_skips_the_authors_vendor(self):
         got = json.loads(self.run_cli({"codex": pool()}, "--json", "--not-vendor", "deepseek").stdout)
-        self.assertEqual(got["plan"], "codex")
-        got = json.loads(self.run_cli({"codex": pool("OFF")}, "--json", "--not-vendor", "DeepSeek").stdout)
-        self.assertEqual(got["plan"], "cursor")
+        self.assertEqual(got["plan"], "antigravity")
         line = self.run_cli({"codex": pool()}, "--not-vendor", "deepseek").stdout
-        self.assertTrue(line.startswith("Worker plan: codex. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
+        self.assertTrue(line.startswith("Worker plan: antigravity. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
+
+    def test_not_vendor_excludes_google_for_a_google_author(self):
+        self.cli("--limited", "opencode")
+        got = json.loads(self.run_cli({"codex": pool()}, "--json", "--not-vendor", "Google").stdout)
+        self.assertEqual(got["plan"], "vercel")
 
     def test_not_vendor_excludes_each_lane_by_its_own_vendor(self):
-        cases = (("opencode", (), "vercel"),
-                 ("vercel", ("opencode",), "openrouter"),
-                 ("openrouter", ("opencode", "vercel"), "codex"),
-                 ("codex", ("opencode", "vercel", "openrouter"), "cursor"),
-                 ("cursor", ("opencode", "vercel", "openrouter", "codex"), None))
+        cases = (("opencode", (), "antigravity"),
+                 ("google", (), "opencode"),
+                 ("vercel", ("opencode",), "antigravity"),
+                 ("antigravity", ("opencode",), "vercel"),
+                 ("deepseek", ("opencode", "antigravity"), "codex"),
+                 ("codex", ("opencode", "antigravity", "vercel", "commandcode", "openrouter"), "cursor"))
         for vendor, earlier, expected in cases:
             with self.subTest(vendor=vendor):
                 out = self.plan_not_from(vendor, earlier)
@@ -1268,7 +1277,7 @@ class CommandTests(unittest.TestCase):
                 self.assertTrue(out.stdout.startswith(start), out.stdout)
 
     def test_not_vendor_also_applies_to_json(self):
-        out = self.plan_not_from("vercel", ("opencode",), "--json")
+        out = self.plan_not_from("vercel", ("opencode", "antigravity"), "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(json.loads(out.stdout)["plan"], "openrouter")
 
@@ -1342,7 +1351,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn('anchored credit $24.64', got['reason'])
         path = Path(self.home, '.pi/agent/sessions/worker/run.jsonl')
         path.parent.mkdir(parents=True)
-        for cost, plan, balance in ((1.5, 'opencode', '23.14'), (22.65, 'vercel', '1.99')):
+        for cost, plan, balance in ((1.5, 'opencode', '23.14'), (22.65, 'antigravity', '1.99')):
             path.write_text(json.dumps(lane_use(now - 60, cost=cost)) + '\n')
             got = json.loads(self.run_cli({}, '--json').stdout)
             self.assertEqual(got['plan'], plan)
@@ -1391,7 +1400,7 @@ class CommandTests(unittest.TestCase):
         plans = json.loads(out.stdout)
         google = next(plan for plan in plans if plan["vendor"] == "google")
         self.assertEqual(google["usage"]["state"], "unknown")
-        self.assertTrue(google["usage"]["chat_only"])
+        self.assertTrue(google["usage"]["shared_with_chats"])
         self.assertIsNone(google["usage"]["limit"])
         for plan in plans:
             plan.pop("usage", None)
@@ -1404,10 +1413,10 @@ class CommandTests(unittest.TestCase):
 
     def test_plans_prints_google_count_without_claiming_a_known_quota(self):
         usage = {"state": "unknown", "used": 3, "limit": None, "pace_ratio": None,
-                 "unit": "local history entries today (UTC)", "chat_only": True}
+                 "unit": "local history entries today (UTC)", "shared_with_chats": True}
         out = self.run_cli({"google": usage}, "--plans")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("Pool: google. Chat-only, never workers.", out.stdout)
+        self.assertIn("Pool: google. Shared with chats, so worker runs keep a reserve.", out.stdout)
         self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown.", out.stdout)
         self.assertNotIn("Used up", out.stdout)
         plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
@@ -1415,7 +1424,7 @@ class CommandTests(unittest.TestCase):
 
     def test_plans_names_google_used_up_and_the_time_seen(self):
         usage = {"state": "OFF", "used": 3, "limit": None, "pace_ratio": None,
-                 "unit": "local history entries today (UTC)", "chat_only": True,
+                 "unit": "local history entries today (UTC)", "shared_with_chats": True,
                  "used_up": True, "used_up_at": "2026-11-22T09:05:00Z"}
         out = self.run_cli({"google": usage}, "--plans")
         self.assertEqual(out.returncode, 0, out.stderr)
@@ -1427,7 +1436,8 @@ class CommandTests(unittest.TestCase):
     def test_plans_survives_unavailable_google_reading(self):
         out = self.cli("--plans", "--pools", "/nonexistent")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("Pool: google. Chat-only, never workers. Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
+        self.assertIn("Pool: google. Shared with chats, so worker runs keep a reserve. "
+                      "Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
 
     def test_limited_unknown_lane_fails(self):
         out = self.cli("--limited", "baseten")
@@ -1439,9 +1449,9 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(out.stdout.startswith("Worker plan: opencode. Launch: ~/.local/bin/plan-pick --run (reads brief.txt, runs ~/.npm-global/bin/pi -p"), out.stdout)
 
     def test_none_line_has_no_launch(self):
-        for lane in ("vercel", "deepseek", "openrouter"):
+        for lane in ("vercel", "deepseek", "openrouter", "antigravity"):
             self.cli("--limited", lane)
-        out = self.run_cli({p: pool("OFF") for p in ("opencode", "codex", "grok")})
+        out = self.run_cli({p: pool("OFF") for p in ("opencode", "codex", "grok", "google")})
         self.assertTrue(out.stdout.startswith("Worker plan: none. Why:"), out.stdout)
 
     def test_claude_helper_under_pace_exits_zero(self):
@@ -1471,7 +1481,8 @@ class CommandTests(unittest.TestCase):
                              env={"HOME": tempfile.mkdtemp(), "PATH": "/usr/bin:/bin",
                                   "TOKEN_LADDER_LOCAL_CONFIG": self.local_config})
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn(json.loads(out.stdout)["plan"], ("vercel", "deepseek", "opencode", "codex", "cursor", "openrouter", "none"))
+        self.assertIn(json.loads(out.stdout)["plan"],
+                      ("vercel", "deepseek", "opencode", "antigravity", "codex", "cursor", "openrouter", "none"))
 
 
 class LoopIntervalTests(unittest.TestCase):

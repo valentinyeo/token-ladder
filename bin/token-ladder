@@ -856,7 +856,7 @@ def google_quota_used_up(now):
 
 def read_google(now):
     pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
-            "pace_ratio": None, "chat_only": True, "used": None, "limit": None,
+            "pace_ratio": None, "chat_only": False, "shared_with_chats": True, "used": None, "limit": None,
             "unit": "local history entries today (UTC)", "estimated": True,
             "source": "agy local history timestamps; Antigravity quota unavailable"}
     start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()

@@ -49,7 +49,8 @@ class GooglePoolTests(unittest.TestCase):
         got = tl.read_google(NOW)
         self.assertEqual(got["used"], 3)
         self.assertEqual(got["unit"], "local history entries today (UTC)")
-        self.assertTrue(got["chat_only"])
+        self.assertFalse(got["chat_only"])
+        self.assertTrue(got["shared_with_chats"])
         self.assertTrue(got["estimated"])
         self.assertEqual(got["state"], "unknown")
         for key in ("limit", "used_pct", "pace_ratio", "resets_at", "hours_left"):
@@ -102,7 +103,7 @@ class GooglePoolTests(unittest.TestCase):
         self.history.write_text(FIXTURE.read_text())
         got = tl.current_pools({}, NOW)["google"]
         self.assertEqual(got["used"], 3)
-        self.assertTrue(got["chat_only"])
+        self.assertTrue(got["shared_with_chats"])
         self.assertEqual(got["state"], "unknown")
 
     def test_exhausted_quota_error_marks_google_used_up_with_the_time_seen(self):
@@ -110,7 +111,7 @@ class GooglePoolTests(unittest.TestCase):
         self.write_log(REFRESH, EXHAUSTED)
         self.assertEqual(tl.read_google(NOW), {
             "used_pct": None, "hours_left": None, "resets_at": None, "state": "OFF",
-            "pace_ratio": None, "chat_only": True, "used": 3, "limit": None,
+            "pace_ratio": None, "chat_only": False, "shared_with_chats": True, "used": 3, "limit": None,
             "unit": "local history entries today (UTC)", "estimated": True,
             "source": "agy local history timestamps; Antigravity quota unavailable",
             "used_up_at": "2026-11-22T09:05:00Z", "used_up": True})

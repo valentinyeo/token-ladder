@@ -1,6 +1,6 @@
 # token-ladder
 
-Token Ladder reads subscription usage for Claude, Codex (including `hax`), Grok and Google Antigravity. Google is a chat-only pool, never a worker lane.
+Token Ladder reads subscription usage for Claude, Codex (including `hax`), Grok and Google Antigravity. The Google Antigravity plan is shared by chats and the `antigravity` worker lane.
 
 `collect` runs on a timer and writes the state. `pools --json` prints the current pool states for any caller. `grok-set` records a Grok reading. Nothing here chooses a plan, reserves a pool, launches a session or holds a lease: those rules live in `spawn-worker` code and in the valentin-mode skill.
 
@@ -31,12 +31,27 @@ While `until` is in the future, `plan-pick` runs that lane first and ignores its
 | Order | Lane | Included usage / credit |
 |---|---|---|
 | 1 | OpenCode Go | Plan windows, then prepaid credit |
-| 2 | Vercel Token Pass | Token Pass balance only |
-| 3 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week; public repos only |
-| 4 | OpenRouter | Prepaid credit |
-| 5 | DeepSeek direct | Prepaid credit |
-| 6 | Codex | Subscription pool |
-| 7 | Cursor | Subscription pool |
+| 2 | Antigravity (`agy`) | Google Antigravity plan quota; shared with chats, so the lane keeps a reserve |
+| 3 | Vercel Token Pass | Token Pass balance only |
+| 4 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week; public repos only |
+| 5 | OpenRouter | Prepaid credit |
+| 6 | DeepSeek direct | Prepaid credit |
+| 7 | Codex | Subscription pool |
+| 8 | Cursor | Subscription pool |
+
+### Antigravity worker lane
+
+`agy models` on this server lists `gemini-4-neon-high`, Gemini 4 Neon (High), and that slug is the lane's model. The lane runs `agy --print "$(cat brief.txt)" --model gemini-4-neon-high --dangerously-skip-permissions --print-timeout 45m --output-format json` in the brief directory, with the worker timeout also recorded as the lane's `print_timeout` field.
+
+No `--add-dir` is needed. A probe run in one directory created a file in a separate clone and read `git status --short` there, and a second run answered `gh version 2.103.3 (2026-10-26)`. `agy` keeps a 0s print timeout by default, which waits forever; the lane sets 45m instead.
+
+Google documents this use. [Headless mode](https://antigravity.google/docs/cli/headless/) describes print mode for scripting and CI pipelines, including `-p`, `--output-format json`, `--print-timeout`, `--dangerously-skip-permissions` and a worked CI example, so automated headless runs are supported rather than banned. The [terms](https://antigravity.google/terms) ban third-party access to the service: "Using third party software, tools, or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement." This lane runs Google's own `agy` and never lifts a credential into another client, so it stays inside that line. The [plans page](https://antigravity.google/docs/plans.md) lists CLI access in the baseline of every plan and describes five-hour and weekly quotas; it publishes no numeric daily limit.
+
+No extra cost holds only while overages are off. [CLI AI credits](https://antigravity.google/docs/cli/credits/) says the `useG1Credits` setting and the **AI Credit Overages** setting decide whether exhausted quota spends purchased credits, so that setting must stay on **Never**. The lane never changes it and never buys credit.
+
+The lane keeps a reserve for the chats on the same plan. With a known daily limit, `plan-pick` skips the lane once today's count reaches `antigravity_reserve_share_pct` (default 60) of that limit. With no known limit it caps the lane at `antigravity_max_daily_runs` (default 15) launched runs per UTC day, counted from the `antigravity` entries in `~/.local/state/token-ladder/launches.jsonl`. Neither number is a quota reading: the local history cannot separate chats from workers.
+
+A run that fails early on `RESOURCE_EXHAUSTED` or any quota error marks the lane limited for `limited_hours` and launches the next lane with the same fast-fail path as the other lanes. An `agy` quota error written to `cli.log` also marks the `google` pool OFF, so the next pick skips the lane without launching it.
 
 ### CommandCode GOAT
 
@@ -59,7 +74,7 @@ Change the pin in `ci/lanes.json` and both paths follow.
 
 ## Google Antigravity usage
 
-`plan-pick --plans` shows the `google` pool as chat-only with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. Worker selection rejects this pool even if a local config adds a lane or burn override for it.
+`plan-pick --plans` shows the `google` pool as shared with chats, with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. The `antigravity` worker lane reads this pool and keeps the chat reserve described under [Antigravity worker lane](#antigravity-worker-lane).
 
 The read-only fallback counts `timestamp` metadata in `~/.gemini/antigravity-cli/history.jsonl` from midnight UTC through now. These timestamps are milliseconds since the Unix epoch. The count covers local history entries, which can include slash commands, not model requests, tokens or quota consumption. Other devices, retries, tool calls and unrecorded chats are not counted. The reader never opens credential or token files, calls a quota endpoint, signs in, buys overages or runs an agent.
 
@@ -231,7 +246,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 | OpenCode Go Plus ($40/month) | `opencode-read --print` and `--credits --print`; `plan-pick --plans` | Separate monthly, weekly and 5-hour windows; $200 included allowance; live or anchored prepaid credit above $2 after included allowance is gone; never top up |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
 | Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
-| Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; chat-only |
+| Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; shared with chats and the antigravity lane |
 
 ## Core idea: pace, not percent
 
