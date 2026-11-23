@@ -33,6 +33,7 @@ PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.lo
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
 LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
+EMERGENCY = os.path.expanduser("~/.local/state/token-ladder/claude-emergency.json")
 PI = os.path.expanduser("~/.npm-global/bin/pi")
 PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
 DEFAULT_CREDIT_FLOOR_USD = 2.0
@@ -249,17 +250,67 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
             + (f"; skipped {others}" if others else "")}
 
 
-def claude_helper(pools, warn=DEFAULT_PACE_WARN):
+def parse_until(text):
+    stamp = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("needs a time zone, for example 2026-11-23T23:59:00Z")
+    return stamp
+
+
+def set_emergency(until_text, reason, now=None, path=EMERGENCY):
+    now = time.time() if now is None else now
+    if until_text.strip().lower() == "off":
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return None
+    until = parse_until(until_text)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("needs --reason")
+    data = {"until": until.isoformat(), "reason": reason.strip(),
+            "set_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
+    write_limits(data, path)
+    return data
+
+
+def read_emergency(now=None, path=EMERGENCY):
+    now = time.time() if now is None else now
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        until = parse_until(data["until"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if until.timestamp() <= now:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    return {"until": data["until"], "reason": str(data.get("reason", ""))}
+
+
+def claude_helper(pools, warn=DEFAULT_PACE_WARN, now=None, path=EMERGENCY):
     pool = pools.get("claude") if isinstance(pools, dict) else None
+    why = skip_reason(pool, warn, no_pace=True)
+    if why:
+        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper"}
+    ratio = number(pool.get("pace_ratio")) if isinstance(pool, dict) else None
+    emergency = read_emergency(now, path)
+    if emergency:
+        pace = "unknown" if ratio is None else f"{ratio:.2f}x"
+        return {"allowed": True, "reason": f"emergency allowance until {emergency['until']} "
+                                           f"({emergency['reason']}); pace {pace}"}
     why = skip_reason(pool, warn)
     if why:
         return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper"}
     if not isinstance(pool, dict):
         note = "no Claude reading, assumed under pace"
-    elif number(pool.get("pace_ratio")) is None:
+    elif ratio is None:
         note = "pace unknown, not ahead"
     else:
-        note = f"pace {pool['pace_ratio']:.2f}x, within {warn:g}x"
+        note = f"pace {ratio:.2f}x, within {warn:g}x"
     return {"allowed": True, "reason": f"Claude is under its pace: {note}"}
 
 
@@ -1582,6 +1633,8 @@ def main(argv):
     parser.add_argument("--cloud", action="store_true", help="check the same shared pool for a cloud launch with --lane-ok")
     parser.add_argument("--claude-helper", action="store_true",
                         help="answer whether an in-chat Claude helper is allowed (exit 0 allowed, 3 refused)")
+    parser.add_argument("--claude-emergency-until", metavar="ISO8601_OR_OFF",
+                        help="let --claude-helper allow Claude above pace until this time (needs --reason); off removes it")
     parser.add_argument("--loop-interval", action="store_true",
                         help="print how many seconds a loop should wait before its next tick, from Claude's pace")
     parser.add_argument("--limited", metavar="LANE",
@@ -1689,6 +1742,15 @@ def main(argv):
         hours = args.hours if args.hours is not None else number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS
         until = mark_limited(args.limited, hours, reason=args.reason)
         print(f"Lane {args.limited} is skipped until {datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC.")
+        return 0
+    if args.claude_emergency_until:
+        try:
+            data = set_emergency(args.claude_emergency_until, args.reason)
+        except ValueError as exc:
+            print(f"plan-pick: --claude-emergency-until {exc}", file=sys.stderr)
+            return 2
+        print("Claude emergency allowance removed." if data is None
+              else f"Claude emergency allowance until {data['until']} ({data['reason']}).")
         return 0
     try:
         pools = with_opencode(read_pools(args.pools), cfg)

@@ -178,6 +178,19 @@ A window that has just reset still shows a pace: the weekly used share is measur
 Codex is looked up on `PATH` and in the usual install folders, so a timer or worker shell without `~/.npm-global/bin` still gets the live reading instead of a stale session log.
 No tokens are read or printed. Pass a path to `--pace-log` to read a saved launch log instead of the live one.
 
+## Claude emergency allowance
+
+`--claude-helper` refuses while Claude is above its weekly pace. An emergency keeps it saying allowed past that pace until a set time, then it refuses again on its own.
+
+```sh
+plan-pick --claude-emergency-until 2026-11-23T23:59:00Z --reason "workers blocked"
+plan-pick --claude-emergency-until off
+```
+
+The first writes `~/.local/state/token-ladder/claude-emergency.json` with `until`, `reason` and `set_at`. The second deletes the file. The time needs a zone; a missing zone or a missing `--reason` prints a message and exits 2.
+
+While `until` is in the future, `--claude-helper` exits 0 and its line names the time, the reason and Claude's pace. A Claude pool that is used up or OFF still refuses, so an emergency never reopens a spent pool. Once `until` passes, the file counts as gone and `plan-pick` deletes it on the next read, so chats refuse again with nobody turning it off.
+
 ## Loop interval
 
 Chats that wake on a timer cost a turn every time they wake, so they ask how long to wait before the next tick:
