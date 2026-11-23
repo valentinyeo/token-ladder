@@ -28,7 +28,7 @@ CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|cr
 RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _]exhausted|"
                         r"limit (reached|exceeded)|hit your limit", re.I)
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
-PROVIDER_HTTP = re.compile(r"\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
+PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
 MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
 PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
@@ -172,7 +172,13 @@ def parse_limit(limits, name, now):
         "until_text": until_text(until, now),
         "reason": reason,
         "explicit_reason": explicit,
+        "source": raw.get("source") if isinstance(raw, dict) else None,
+        "error_line": raw.get("error_line") if isinstance(raw, dict) else None,
     }
+
+
+def limit_note(skip):
+    return "; ".join(str(skip[key]) for key in ("reason", "source", "error_line") if skip.get(key))
 
 
 def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
@@ -216,7 +222,11 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
         name = lane["lane"]
         pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
         no_pace = burn is not None and name == burn["lane"]
-        why = lane_skip_reason(lane, pools, limits, now, warn, no_pace)
+        skip = parse_limit(limits, name, now)
+        if skip is not None:
+            why = f"limited until {skip['until_text']}" + (f" ({limit_note(skip)})" if skip["explicit_reason"] else "")
+        else:
+            why = lane_skip_reason(lane, pools, limits, now, warn, no_pace)
         if why:
             skipped[name] = why
             if why.startswith("pace"):
@@ -230,17 +240,24 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
         if skipped:
             reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
         return {"plan": name, "command": lane["command"], "reason": reason}
-    if not ahead or strict_pace:
-        reason = "every lane is used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
-        frees = {}
-        for name in skipped:
-            skip = parse_limit(limits, name, now)
-            if skip is not None:
-                frees[name] = skip["until"]
+    codex = pools.get("codex")
+    codex_ahead = isinstance(codex, dict) and (number(codex.get("pace_ratio")) or 0) > 1.3
+    frees = {}
+    for lane in lanes:
+        name = lane["lane"]
+        skip = parse_limit(limits, name, now)
+        pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+        if skip and (not codex_ahead or (not skip_reason(pool, warn, no_pace=True) and not (
+                isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats")))):
+            frees[name] = skip["until"]
+    if not ahead or strict_pace or (codex_ahead and frees):
+        reason = "every lane is ahead of pace, used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
         next_free = None
         if frees:
             lane_name = min(frees, key=frees.get)
             next_free = {"lane": lane_name, "at": frees[lane_name]}
+            if codex_ahead:
+                reason += f"; Codex pace {codex['pace_ratio']:.2f}x is above 1.3x"
             reason += (f"; {lane_name} frees at {until_text(frees[lane_name], now)},"
                        " so wait for it and run plan-pick --run again")
         else:
@@ -418,37 +435,6 @@ def lanes_from(cfg, now=None):
     return lanes_with_first(usable, now)
 
 
-def with_repo_visibility(pools, lanes, brief="brief.txt", run=subprocess.run):
-    restricted = [lane for lane in lanes if lane.get("public_only")]
-    if not restricted:
-        return pools
-    try:
-        with open(brief) as fh:
-            text = fh.read()
-        repos = re.findall(r"(?im)^\s*repo(?:sitory)?\s*[:=]?\s*(?:https?://github\.com/)?([\w.-]+/[\w.-]+)", text)
-        if not repos:
-            repos = re.findall(r"https?://github\.com/([\w.-]+/[\w.-]+)", text)
-        repos = list(dict.fromkeys(repo.rstrip(".").removesuffix(".git") for repo in repos))
-    except OSError:
-        repos = [None]
-    public = bool(repos)
-    for repo in repos:
-        try:
-            args = ["gh", "repo", "view"] + ([repo] if repo else [])
-            out = run(args + ["--json", "visibility", "--jq", ".visibility"],
-                      capture_output=True, text=True, timeout=20)
-            public = public and out.returncode == 0 and out.stdout.strip() == "PUBLIC"
-        except (OSError, subprocess.SubprocessError):
-            public = False
-    if public:
-        return pools
-    pools = dict(pools)
-    for lane in restricted:
-        name = lane.get("pool") or f"credit:{lane['credit']}"
-        pools[name] = {"state": "OFF", "note": "public repos only; repository is private or visibility is unknown"}
-    return pools
-
-
 def lane_names(lane):
     names = (lane.get("lane"), lane.get("vendor"), lane.get("credit"))
     return {name.lower() for name in names if isinstance(name, str)}
@@ -541,21 +527,28 @@ def live_limits(path, now):
     return out
 
 
-def mark_limited(lane, hours, now=None, path=LIMITS, reason=None):
+def redact_error(text):
+    text = re.sub(r"(?i)(bearer\s+)[\w.\-]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|access[_-]?token|credential)[\"'\s:=]+)[^\s\"',}]+", r"\1[REDACTED]", text)
+    return re.sub(r"\b(?:sk-|ghp_|gho_)[\w\-]+", "[REDACTED]", text)
+
+
+def mark_limited(lane, hours, now=None, path=LIMITS, reason=None, source="manual", error_line=""):
     now = time.time() if now is None else now
     limits = live_limits(path, now)
-    limits[lane] = now + hours * 3600
-    if isinstance(reason, str) and reason.strip():
-        limits[f"{lane}:reason"] = reason.strip()
-    else:
-        limits.pop(f"{lane}:reason", None)
+    until = now + hours * 3600
+    limits[lane] = {"until": until, "reason": redact_error((reason or "").strip() or "manual skip"),
+                    "source": source, "error_line": redact_error(error_line)}
+    limits.pop(f"{lane}:reason", None)
+    limits.pop(f"{lane}:floor", None)
     write_limits(limits, path)
-    return limits[lane]
+    return until
 
 
 def mark_floor_lock(lane, until, now, path=LIMITS):
     limits = live_limits(path, now)
-    limits[lane] = until
+    limits[lane] = {"until": until, "reason": "credit floor reached", "source": "quota error", "error_line": ""}
+    limits.pop(f"{lane}:reason", None)
     limits[f"{lane}:floor"] = until
     write_limits(limits, path)
     return until
@@ -566,15 +559,35 @@ def clear_floor_lock(lane, now, path=LIMITS):
     until = number(limits.pop(f"{lane}:floor", None))
     if until is None:
         return
-    if number(limits.get(lane)) == until:
+    skip = parse_limit(limits, lane, now)
+    if skip and skip["until"] == until:
         limits.pop(lane, None)
     write_limits(limits, path)
+
+
+def provider_error(tail):
+    lines = tail.splitlines()
+    for line in reversed(lines):
+        try:
+            if line.startswith("AGY_ERROR: "):
+                error = json.loads(line[len("AGY_ERROR: "):])
+            elif line.startswith("{"):
+                data = json.loads(line)
+                error = data.get("error") if data.get("status") == "ERROR" else None
+            else:
+                continue
+            if isinstance(error, dict) and "short_error" in error:
+                message = "print_timeout" if error.get("reason") == "print_timeout" else error["short_error"]
+                return str(error.get("status", "")) + ": " + str(message)
+        except (ValueError, AttributeError):
+            pass
+    return next((line.strip() for line in reversed(lines) if line.strip()), "")[-ERROR_CHARS:]
 
 
 def limit_kind(code, tail):
     if code == 0:
         return None
-    tail = tail[-ERROR_CHARS:]
+    tail = provider_error(tail)
     if CREDIT_ERROR.search(tail):
         return "credit"
     if BLOCKED_ERROR.search(tail):
@@ -667,10 +680,10 @@ def log_launch(path, lane, now, not_vendor, metadata=None):
 def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, now=None, say=None,
               launches_path=LAUNCHES, not_vendor=None, burn=None, rung=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
-    hours = {"rate": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
+    hours = {"rate": (number(cfg.get("rate_limited_minutes")) or 5) / 60,
              "silent": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
              "credit": number(cfg.get("credit_limited_hours")) or DEFAULT_CREDIT_LIMITED_HOURS,
-             "blocked": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS}
+             "blocked": (number(cfg.get("fast_fail_minutes")) or 5) / 60}
     why = {"rate": "hit a rate or usage limit", "credit": "is out of credit", "silent": "exited with no output",
            "blocked": "was blocked by the provider's bot challenge"}
     tried = set()
@@ -696,16 +709,27 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         code, tail, elapsed, work = unpack_run(runner(result["command"]))
         if rung:
             launch_finish(launches_path, launch_id, rung, lane, code, tail, cfg, now)
-        kind = limit_kind(code, tail)
+        error_line = provider_error(tail)
+        fast = fast_fail_kind(code, error_line, elapsed, work)
+        kind = limit_kind(code, error_line)
+        status = re.search(r"(?:^\s*|HTTP\s+|statusCode[\"':\s]+)(4\d{2})\b", error_line, re.I)
+        nonquota_http = status and status[1] not in ("402", "429")
+        if fast and nonquota_http and kind != "blocked":
+            kind = None
         if kind is None:
-            skip = fast_fail_kind(code, tail, elapsed, work)
-            if skip is None:
+            if fast is None:
                 return code
             tried.add(result["plan"])
-            say(f"skipped lane {result['plan']}: {skip} (exit {code})")
+            source = "fast-fail 4xx" if nonquota_http else "fast-fail"
+            mark_limited(result["plan"], (number(cfg.get("fast_fail_minutes")) or 5) / 60,
+                         now, limits_path, reason=fast, source=source, error_line=error_line)
+            say(f"skipped lane {result['plan']}: {fast} (exit {code})")
             continue
         tried.add(result["plan"])
-        until = mark_limited(result["plan"], hours[kind], now, limits_path)
+        source = ("429" if re.search(r"\b429\b", error_line) else
+                  "fast-fail 4xx" if kind == "blocked" else "silent exit" if kind == "silent" else "quota error")
+        until = mark_limited(result["plan"], hours[kind], now, limits_path,
+                             reason=why[kind], source=source, error_line=error_line)
         say(f"lane {result['plan']} {why[kind]} (exit {code}); skipped until "
             f"{datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC, trying the next lane")
 
@@ -1102,8 +1126,10 @@ def balance_commandcode(get, key):
         window = windows[name]
         if any(number(window[field]) is None for field in ("used", "cap", "resetAt")):
             raise ValueError("invalid CommandCode window")
-        if window["used"] < 0 or window["cap"] <= 0 or window["resetAt"] <= 0:
+        if window["used"] < 0 or window["cap"] <= 0 or window["resetAt"] < 0:
             raise ValueError("invalid CommandCode window")
+        if window["resetAt"] == 0 and (window["used"] != 0 or window.get("exceeded")):
+            raise ValueError("invalid CommandCode idle window")
     return {"credits": credits, "windows": windows,
             "period_start": datetime.fromisoformat(subscription["currentPeriodStart"].replace("Z", "+00:00")).timestamp(),
             "period_end": datetime.fromisoformat(subscription["currentPeriodEnd"].replace("Z", "+00:00")).timestamp()}
@@ -1119,6 +1145,7 @@ def commandcode_pool(entry, now, cfg):
         used = max(0, 70 - credits)
         elapsed = max(0, min(1, (now - start) / (end - start))) if end > start else 0
         pace = used / 70 / elapsed if elapsed > 0 else None
+        pace_text = f"{pace:.2f}x" if pace is not None else "unknown"
         state = "ON" if credits > 0 else "OFF"
         windows = []
         for name, label in (("fiveHour", "5h"), ("weekly", "week")):
@@ -1130,7 +1157,8 @@ def commandcode_pool(entry, now, cfg):
             windows.append(f"{label} {spent:g}/{window['cap']:g} credits")
         return {"state": state, "used": used, "limit": 70, "unit": "plan credits", "pace_ratio": pace,
                 "resets_at": end,
-                "note": f"{credits:g}/70 monthly credits left (~${credits * 100 / 70:.2f} Flash usage); "
+                "note": f"{used:g}/70 monthly credits used, pace {pace_text}; "
+                        f"{credits:g}/70 monthly credits left (~${credits * 100 / 70:.2f} Flash usage); "
                         + "; ".join(windows) + "; extra paid credits excluded"}
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         return {"state": "OFF", "note": "CommandCode credit reading is invalid"}
@@ -1192,7 +1220,7 @@ def plan_credits(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
     for plan in plans:
         name = plan.get("credit")
         entry = data.get(name) if isinstance(name, str) else None
-        if isinstance(name, str) and (not isinstance(entry, dict) or number(entry.get("usd")) is None
+        if isinstance(name, str) and (not isinstance(entry, dict) or number(entry.get("credits" if name == "commandcode" else "usd")) is None
                                       or now - (number(entry.get("at")) or 0) > every):
             due.append(name)
     if due:
@@ -1203,7 +1231,7 @@ def plan_credits(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
         entry = data.get(name) if isinstance(name, str) else None
         if not isinstance(entry, dict):
             continue
-        read_at, left = number(entry.get("at")), number(entry.get("usd"))
+        read_at, left = number(entry.get("at")), number(entry.get("credits" if name == "commandcode" else "usd"))
         if read_at is not None and left is not None and now - read_at <= stale_s:
             fresh[name] = entry
     return fresh
@@ -1842,7 +1870,7 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
         if chat_only:
             why = "chat-only pool, never workers"
         elif skip:
-            why = f"skipped until {skip['until_text']} ({skip['reason']})"
+            why = f"skipped until {skip['until_text']} ({limit_note(skip)})"
         elif st["status"] == "OFF" and isinstance(pool, dict) and pool.get("note"):
             why = pool["note"]
         else:
@@ -1859,7 +1887,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             "skip": skip,
             "chat_only": chat_only,
             "shared_with_chats": shared,
-            "public_only": bool(lane.get("public_only")),
             "first_until": first_until if first_until and first_until > now else None,
             "burn_until": burn["until"] if no_pace else None,
             "reason": why,
@@ -1906,7 +1933,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
         shared = bool(plan.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats"))
                       or any(l.get("shared_with_chats") for l in matched))
         chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not shared)
-        public_only = bool(any(l.get("public_only") for l in matched))
         retired = isinstance(plan.get("extra_cost"), str) and plan["extra_cost"].lower().startswith("retired")
         no_pace = bool(burn and any(l["lane"] == burn["lane"] for l in matched))
         st = entry_status(pool, skip, now, warn, chat_only=chat_only, retired=retired, no_pace=no_pace)
@@ -1925,7 +1951,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             "monthly_price_usd": number(plan.get("monthly_price_usd")),
             "chat_only": chat_only,
             "shared_with_chats": shared,
-            "public_only": public_only,
             "retired": retired,
             "skip": skip,
             **st,
@@ -1954,7 +1979,6 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             "monthly_price_usd": None,
             "chat_only": chat_only,
             "shared_with_chats": shared,
-            "public_only": bool(any(l.get("public_only") for l in matched)),
             "retired": False,
             "skip": skip,
             **st,
@@ -2149,7 +2173,6 @@ def main(argv):
     excluded = vendor_exclusions(args.not_vendor)
     if excluded:
         lanes = [lane for lane in lanes if not any(name in lane_names(lane) for name in excluded)]
-    pools = with_repo_visibility(pools, lanes)
     if any(lane.get("credit") == "commandcode" for lane in lanes) and "credit:commandcode" not in pools:
         pools = dict(pools, **{"credit:commandcode": commandcode_pool(None, time.time(), cfg)})
     if args.lane_ok:

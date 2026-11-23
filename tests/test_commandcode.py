@@ -107,63 +107,20 @@ class CommandCodeTests(unittest.TestCase):
         for text in ("$10/month", "$100 Flash usage/month", "$20/5h", "$50/week",
                      "Limit: 70", "/14 credits", "/35 credits", "Flash usage"):
             self.assertIn(text, line)
-        self.assertNotIn("public repos only", line)
-
-    def test_all_repo_visibilities_are_allowed_without_lookup_including_burn(self):
-        brief = Path(self.home.name) / "brief.txt"
-        for text in ("Repo owner/private-repo", "Do some work"):
-            brief.write_text(text)
-            run = mock.Mock(side_effect=FileNotFoundError())
-            pools = pp.with_repo_visibility({"credit:commandcode": {"state": "ON"}}, [self.lane], str(brief), run)
-            run.assert_not_called()
-            for burn in (None, {"lane": "commandcode", "until": AT + 60}):
-                with self.subTest(brief=text, burn=burn):
-                    result = pp.pick([self.lane], pools, now=AT, burn=burn)
-                    self.assertEqual(result["plan"], "commandcode")
-
-    def test_public_only_lane_refuses_private_internal_and_unknown_repo_including_burn(self):
-        brief = Path(self.home.name) / "brief.txt"
-        brief.write_text("Repo owner/private-repo (fresh clone).\nhttps://github.com/owner/public-docs")
-        for visibility in ("PRIVATE", "INTERNAL", "", "PUBLIC"):
-            run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, visibility))
-            pools = pp.with_repo_visibility({"credit:commandcode": {"state": "ON"}},
-                                            [dict(self.lane, public_only=True)], str(brief), run)
-            run.assert_called_once_with(["gh", "repo", "view", "owner/private-repo", "--json", "visibility", "--jq", ".visibility"],
-                                        capture_output=True, text=True, timeout=20)
-            result = pp.pick([self.lane], pools, now=AT, burn={"lane": "commandcode", "until": AT + 60})
-            self.assertEqual(result["plan"], "commandcode" if visibility == "PUBLIC" else "none")
-
-    def test_public_only_lane_visibility_failure_and_ambiguous_brief_fail_closed(self):
-        brief = Path(self.home.name) / "brief.txt"
-        for text in ("Repo https://github.com/owner/private-repo.git", "Do some work"):
-            brief.write_text(text)
-            for error in (FileNotFoundError(), subprocess.TimeoutExpired("gh", 20)):
-                pools = pp.with_repo_visibility({}, [dict(self.lane, public_only=True)],
-                                                str(brief), mock.Mock(side_effect=error))
-                self.assertEqual(pools["credit:commandcode"]["state"], "OFF")
-
-    def test_public_only_lane_requires_all_brief_repositories_to_be_public(self):
-        brief = Path(self.home.name) / "brief.txt"
-        brief.write_text("https://github.com/owner/public\nhttps://github.com/owner/private")
-        run = mock.Mock(side_effect=[subprocess.CompletedProcess([], 0, "PUBLIC"),
-                                     subprocess.CompletedProcess([], 0, "PRIVATE")])
-        pools = pp.with_repo_visibility({}, [dict(self.lane, public_only=True)], str(brief), run)
-        self.assertEqual(pools["credit:commandcode"]["state"], "OFF")
 
     def test_worker_uses_configured_provider_and_preserves_secret_override(self):
         command = self.lane["command"]
         self.assertIn("COMMANDCODE_API_KEY", command)
         self.assertIn("--provider commandcode --model deepseek/deepseek-v4.1-flash", command)
         self.assertIn("-e ~/projects/token-ladder/tools/pi-commandcode.mjs", command)
-        self.assertFalse(any(lane.get("public_only") for lane in self.lanes))
         shipped = json.loads((Path(REPO) / "ci" / "lanes.json").read_text())
         self.assertNotIn("commandcode", [lane["name"] for lane in shipped])
 
-    def test_cli_runs_commandcode_for_private_internal_unknown_and_public_repos(self):
+    def test_cli_runs_commandcode_on_a_private_repo_brief(self):
         root = Path(self.home.name)
         (root / "brief.txt").write_text("Repo owner/target-repo\n")
         gh = root / "gh"
-        gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$HOME/gh-args"\nprintf "%s\\n" "$TEST_VISIBILITY"\n')
+        gh.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$HOME/gh-args"\nexit 1\n')
         gh.chmod(0o755)
         cfg = root / "config.json"
         cfg.write_text(json.dumps({"lanes": [dict(self.lane, command="printf commandcode-worker"),
@@ -178,7 +135,7 @@ class CommandCodeTests(unittest.TestCase):
             out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--run", "--pools", str(pools)],
                                  cwd=root, env=env, capture_output=True, text=True, timeout=20)
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertFalse((root / "gh-args").exists())
+            self.assertFalse((root / "gh-args").exists(), "no repository lookup")
             self.assertIn("commandcode-worker", out.stdout)
             self.assertNotIn("next-worker", out.stdout)
             self.assertNotIn("public repos only", out.stderr)

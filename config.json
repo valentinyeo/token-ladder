@@ -55,7 +55,6 @@
       "credit": "commandcode",
       "vendor": "deepseek",
       "pool": null,
-      "public_only": false,
       "command": "COMMANDCODE_API_KEY=\"${COMMANDCODE_API_KEY:-$(~/.local/bin/yeo-key 'Commando Code API Key' credential)}\" ~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-commandcode.mjs --provider commandcode --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {

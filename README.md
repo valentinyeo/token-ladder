@@ -90,7 +90,11 @@ No extra cost holds only while overages are off. [CLI AI credits](https://antigr
 
 The lane burns the whole Antigravity quota by default. `antigravity_reserve_share_pct` is 100, so no daily limit is held back for chats, and there is no default per-day run cap. The lane stops only when today's newest quota line in `~/.gemini/antigravity-cli/cli.log` is a `RESOURCE_EXHAUSTED` or quota-exceeded error; then the next lane runs. Lower `antigravity_reserve_share_pct` below 100 to keep part of a known daily limit for chats, or set `antigravity_max_daily_runs` to cap launched runs per UTC day from the `antigravity` entries in `~/.local/state/token-ladder/launches.jsonl`. Neither number is a quota reading: the local history cannot separate chats from workers.
 
-A run that fails early on `RESOURCE_EXHAUSTED` or any quota error marks the lane limited for `limited_hours` and launches the next lane with the same fast-fail path as the other lanes. An `agy` quota error written to `cli.log` also marks the `google` pool OFF, so the next pick skips the lane without launching it.
+A run that fails on `RESOURCE_EXHAUSTED`, 429 or a quota error marks the lane limited for `rate_limited_minutes` (default 5) and launches the next lane. Provider challenges and fast failures before work use `fast_fail_minutes` (default 5). Empty credit still uses `credit_limited_hours` (default 12); silent failures use `limited_hours`. An `agy` quota error written to `cli.log` also marks the `google` pool OFF. A print timeout is not a quota error, even when the agent's work summary mentions quota.
+
+New entries in `lane-limits.json` contain `until`, `reason`, `source` and `error_line`. Both plan-pick and the dashboard show the diagnostic. Numeric expiries and the older `LANE:reason` format remain readable. Manual limits default to source `manual`.
+
+When every lane is skipped and Codex pace is above 1.3x, plan-pick returns `plan: none` with `next_free` for the soonest expiring limit whose pool is otherwise usable. It waits instead of launching a limited lane early or sending another job to Codex. Run `--run` again after that time. At or below 1.3x, or without an eligible expiry, the existing least-ahead fallback stays.
 
 ### CommandCode GOAT
 
@@ -100,9 +104,9 @@ The reader calls `https://api.commandcode.ai/alpha/billing/credits` and `/alpha/
 
 The pi lane loads `tools/pi-commandcode.mjs` and uses the [OpenAI-compatible Provider API](https://commandcode.ai/docs/provider). Set `COMMANDCODE_API_KEY` in the environment, or the launch command reads the `credential` field of 1Password item `Commando Code API Key` with `yeo-key`. No key belongs in `config.json` or a PR.
 
-The Provider API docs explicitly support agent clients and coding plans. However, the [terms](https://commandcode.ai/terms) prohibit automated website requests, and the [privacy policy](https://commandcode.ai/privacy) allows up to 30 days of prompt retention and does not guarantee upstream no-training without [ZDR](https://commandcode.ai/docs/resources/zdr). Valentin approved this lane for every job on 2026-11-23, including private and internal repositories and unknown visibility. Repository visibility does not restrict selection or launch, including burn overrides. The generic `public_only` guard remains available, but no configured lane enables it.
+The Provider API docs explicitly support agent clients and coding plans. Valentin approved this lane for every job on 2026-11-23, including private and internal repositories and unknown visibility. Repository visibility does not restrict selection or launch, including burn overrides, and selection never inspects the target repository. The [terms](https://commandcode.ai/terms) prohibit automated website requests, and the [privacy policy](https://commandcode.ai/privacy) allows up to 30 days of prompt retention and does not guarantee upstream no-training without [ZDR](https://commandcode.ai/docs/resources/zdr).
 
-A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and `deepseek/deepseek-v4.1-flash` on 2026-11-22. It supports chat judging technically, but is not in `ci/lanes.json`. A future judge lane would need `COMMANDCODE_API_KEY`; no GitHub secret is set by this change.
+A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and `deepseek/deepseek-v4.1-flash` on 2026-11-22. It supports chat judging technically, but is not in `ci/lanes.json` yet. A future judge lane would need `COMMANDCODE_API_KEY`; no GitHub secret is set by this change.
 
 The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lane uses one upstream provider, so neither can fall to Baseten when its credit runs low.
 The gateway carries two lanes, both pinned to Token Pass: the DeepSeek lane and, right after it, a `zai/glm-5.3-flash` judge lane. The Token Pass already covers that model, so the judge adds no cost, and a DeepSeek-authored PR still has a judge from another family.

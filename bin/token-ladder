@@ -1441,8 +1441,6 @@ def render_dashboard(s):
             badges.append(_badge("shared with chats", "info"))
         if item.get("chat_only"):
             badges.append(_badge("chat-only", "muted"))
-        if item.get("public_only"):
-            badges.append(_badge("public repos only", "info"))
         meta_parts = []
         if item.get("models"):
             meta_parts.append(", ".join(str(m) for m in item["models"]))
@@ -1466,7 +1464,7 @@ def render_dashboard(s):
         if item.get("skip"):
             sk = item["skip"]
             label = "Used up / skipped" if item.get("used_up") else "Skipped"
-            notes.append(f"{label} until {sk['until_text']} ({sk['reason']})")
+            notes.append(f"{label} until {sk['until_text']} ({pp.limit_note(sk)})")
         if usage.get("used_up") and usage.get("used_up_at"):
             notes.append(f"Used up at {usage['used_up_at']}")
         elif item.get("used_up") and not item.get("skip") and not usage.get("note"):
@@ -1497,8 +1495,6 @@ def render_dashboard(s):
             flags.append("shared with chats")
         if item.get("chat_only"):
             flags.append("chat-only")
-        if item.get("public_only"):
-            flags.append("public repos only")
         if item.get("first_until"):
             stamp = datetime.fromtimestamp(item["first_until"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
             flags.append(f"first until {stamp}")
@@ -1508,7 +1504,7 @@ def render_dashboard(s):
         detail_parts = []
         if item.get("skip"):
             sk = item["skip"]
-            detail_parts.append(f"skipped until {sk['until_text']} ({sk['reason']})")
+            detail_parts.append(f"skipped until {sk['until_text']} ({pp.limit_note(sk)})")
         elif item.get("reason"):
             detail_parts.append(str(item["reason"]))
         if flags:
@@ -1537,7 +1533,7 @@ def render_dashboard(s):
     if snap["skips"]:
         skip_items = "".join(
             f'<li><b>{html.escape(sk["lane"])}</b>: skipped until {html.escape(sk["until_text"])} '
-            f'({html.escape(sk["until_iso"])}) — {html.escape(sk["reason"])}</li>'
+            f'({html.escape(sk["until_iso"])}) — {html.escape(pp.limit_note(sk))}</li>'
             for sk in snap["skips"])
         skips_section = f'<section><b>Manual skips</b> (lane-limits.json)<ul>{skip_items}</ul></section>'
     resets = "".join(f"<li>Codex full reset, expires {html.escape(r['expires'])}</li>" for r in cfg.get("codex_resets", []))

@@ -53,7 +53,6 @@ class LaneOkTests(unittest.TestCase):
                 mock.patch.object(pp, "with_opencode", side_effect=lambda pools, cfg: pools), \
                 mock.patch.object(pp, "with_credits", side_effect=lambda pools, lanes, cfg: pools), \
                 mock.patch.object(pp, "with_antigravity_reserve", side_effect=lambda pools, cfg: pools), \
-                mock.patch.object(pp, "with_repo_visibility", side_effect=lambda pools, lanes: pools), \
                 mock.patch.object(pp, "read_limits", return_value=limits or {}), \
                 mock.patch.object(pp.time, "time", return_value=T), redirect_stdout(out):
             code = pp.main(["--lane-ok", spec] + (["--cloud"] if cloud else []))
@@ -202,7 +201,7 @@ class PrepaidCreditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(pp, "read_opencode", return_value=live):
             path = str(Path(tmp, "limits.json"))
             got = pp.with_opencode({}, cfg, NOW, limits_path=path)
-            self.assertEqual(pp.read_limits(path)["opencode"], renewal)
+            self.assertEqual(pp.read_limits(path)["opencode"]["until"], renewal)
             self.assertIn(f"skip until monthly renewal {stamp}", got["opencode"]["note"])
             result = pp.pick(LANES, got, pp.read_limits(path), NOW)
             self.assertEqual(result["plan"], "vercel")
@@ -223,7 +222,7 @@ class PrepaidCreditTests(unittest.TestCase):
             path = str(Path(tmp, "limits.json"))
             pp.mark_limited("opencode", 1, NOW, path)
             got = pp.with_opencode({}, cfg, NOW, limits_path=path)
-            self.assertEqual(pp.read_limits(path)["opencode"], NOW + 3600)
+            self.assertEqual(pp.read_limits(path)["opencode"]["until"], NOW + 3600)
             self.assertEqual(pp.pick(LANES, got, pp.read_limits(path), NOW)["plan"], "vercel")
 
     def test_missing_reader_reports_credit_unknown_not_used_up(self):
@@ -430,11 +429,11 @@ class PickTests(unittest.TestCase):
     def test_unknown_state_is_not_skipped(self):
         self.assertEqual(pick({"opencode": {"state": "unknown"}}, {"vercel": T + 60, "deepseek": T + 60})["plan"], "opencode")
 
-    def test_only_paced_lanes_left_picks_least_ahead(self):
+    def test_only_paced_lanes_left_picks_least_ahead_when_codex_is_not_over_1_3(self):
         limits = {lane["lane"]: T + 60 for lane in LANES if lane["lane"] not in ("codex", "cursor")}
-        got = pick({"codex": pool("ON", 2.0), "grok": pool("ON", 1.5)}, limits)
+        got = pick({"codex": pool("ON", 1.3), "grok": pool("ON", 1.2)}, limits)
         self.assertEqual(got["plan"], "cursor")
-        self.assertIn("least ahead is cursor (pace 1.50x is above 1.1x)", got["reason"])
+        self.assertIn("least ahead is cursor (pace 1.20x is above 1.1x)", got["reason"])
 
     def test_nothing_left_gives_none(self):
         limits = {lane["lane"]: T + 60 for lane in LANES}
@@ -522,13 +521,15 @@ class RunTests(unittest.TestCase):
         code = self.go({"run opencode": (1, '429: {"error":"Too Many Requests"}'), "run vercel": (0, "done")})
         self.assertEqual(code, 0)
         self.assertEqual(self.ran, ["run opencode", "run vercel"])
-        self.assertEqual(pp.read_limits(self.limits), {"opencode": T + 3600})
+        self.assertEqual(pp.read_limits(self.limits)["opencode"], {"until": T + 300,
+                         "reason": "hit a rate or usage limit", "source": "429",
+                         "error_line": '429: {"error":"Too Many Requests"}'})
         self.assertTrue(any("opencode hit a rate or usage limit" in line for line in self.said), self.said)
 
     def test_empty_credit_is_skipped_longer(self):
         Path(self.limits).write_text(json.dumps({"opencode": T + 3600, "openrouter": T + 3600}))
         self.go({"run vercel": (1, '402: {"error":{"message":"Insufficient Balance"}}'), "run deepseek": (0, "ok")})
-        self.assertEqual(pp.read_limits(self.limits)["vercel"], T + 12 * 3600)
+        self.assertEqual(pp.read_limits(self.limits)["vercel"]["until"], T + 12 * 3600)
 
     def test_clean_exit_with_no_output_is_done_not_retried(self):
         self.assertEqual(self.go({"run opencode": (0, "  \n")}), 0)
@@ -554,7 +555,8 @@ class RunTests(unittest.TestCase):
         code = self.go({"run opencode": (1, msg), "run vercel": (0, "done")})
         self.assertEqual(code, 0)
         self.assertEqual(self.ran, ["run opencode", "run vercel"])
-        self.assertEqual(pp.read_limits(self.limits), {})
+        self.assertEqual(pp.read_limits(self.limits)["opencode"]["source"], "fast-fail 4xx")
+        self.assertEqual(pp.read_limits(self.limits)["opencode"]["until"], T + 300)
         self.assertTrue(any("skipped lane opencode: model request was rejected" in line for line in self.said), self.said)
 
     def test_failure_after_work_does_not_fall_through(self):
@@ -574,8 +576,8 @@ class RunTests(unittest.TestCase):
         self.assertIn("no lane left, nothing ran", self.said[-1])
 
     def test_hours_come_from_config(self):
-        self.go({"run opencode": (1, "429"), "run vercel": (0, "ok")}, cfg={"limited_hours": 3})
-        self.assertEqual(pp.read_limits(self.limits)["opencode"], T + 3 * 3600)
+        self.go({"run opencode": (1, "429"), "run vercel": (0, "ok")}, cfg={"rate_limited_minutes": 180})
+        self.assertEqual(pp.read_limits(self.limits)["opencode"]["until"], T + 3 * 3600)
 
     def test_limit_kind_reads_real_error_texts(self):
         cases = {"Error: You've hit your usage limit. Try again later": "rate",
@@ -738,7 +740,8 @@ class LimitTests(unittest.TestCase):
         Path(path).write_text(json.dumps({"old": T - 10, "codex": T + 99}))
         until = pp.mark_limited("vercel", 2, T, path)
         self.assertEqual(until, T + 7200)
-        self.assertEqual(pp.read_limits(path), {"codex": T + 99, "vercel": T + 7200})
+        self.assertEqual(pp.read_limits(path), {"codex": T + 99, "vercel": {
+            "until": T + 7200, "reason": "manual skip", "source": "manual", "error_line": ""}})
 
     def test_unreadable_limits_are_empty(self):
         self.assertEqual(pp.read_limits("/nonexistent/x.json"), {})

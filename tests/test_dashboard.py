@@ -384,8 +384,9 @@ class DashboardRendererTests(unittest.TestCase):
         path = str(self.state / "lane-limits.json")
         until = pp.mark_limited("cursor", 48, DASH_NOW, path, reason="quota exhausted")
         raw = pp.read_limits(path)
-        self.assertEqual(raw["cursor"], until)
-        self.assertEqual(raw["cursor:reason"], "quota exhausted")
+        self.assertEqual(raw["cursor"]["until"], until)
+        self.assertEqual(raw["cursor"]["reason"], "quota exhausted")
+        self.assertEqual(raw["cursor"]["source"], "manual")
         parsed = pp.parse_limit(raw, "cursor", DASH_NOW)
         self.assertEqual(parsed["reason"], "quota exhausted")
         lanes = [{"lane": "cursor", "pool": "grok", "command": "run cursor"},
