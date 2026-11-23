@@ -61,12 +61,14 @@ class StubHandler(BaseHTTPRequestHandler):
     routes = {}
     delay = 0
     last_bodies = []
+    last_headers = []
 
     def do_POST(self):
         if self.delay:
             time.sleep(self.delay)
         length = int(self.headers.get('Content-Length') or 0)
         raw = self.rfile.read(length) if length else b''
+        StubHandler.last_headers.append(dict(self.headers))
         try:
             StubHandler.last_bodies.append(json.loads(raw))
         except json.JSONDecodeError:
@@ -166,6 +168,21 @@ def write_vercel_then_opencode(port):
 
 
 class LadderCallTests(unittest.TestCase):
+    def test_gateway_tags_reach_http_server(self):
+        StubHandler.last_headers = []
+        server, port = run_server({'/v1/chat/completions': (200, {
+            'choices': [{'message': {'content': 'PASS'}}],
+        }, None)})
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        fixture = json.loads((FIXTURE_DIR / 'gateway-tags.json').read_text())[0]
+        result = ladder_call(dict(fixture['env'], AI_GATEWAY_API_KEY='stub', LADDER_CALL_CALLER=''),
+                             {'messages': []}, lanes_file=lanes_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(StubHandler.last_headers[-1]['Ai-Reporting-Tags'], ','.join(fixture['tags']))
+
     def test_excluded_family_is_never_called(self):
         StubHandler.last_bodies = []
         server, port = run_server({

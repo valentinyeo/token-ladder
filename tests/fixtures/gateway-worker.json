@@ -1,0 +1,5 @@
+{
+  "cwd": "/tmp/vsta-136-worker",
+  "brief": "Ticket VSTA-136 https://app.hypertask.ai/detail/project-13556/136\nPrivate task details must never become tags.\n",
+  "tags": ["caller=plan-pick-worker", "brief=c1f543c2bce0", "ticket=VSTA-136"]
+}

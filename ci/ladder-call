@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -153,6 +155,23 @@ def call_cursor_lane(lane, key, body):
     return {'choices': [{'message': {'content': text}}]}, None
 
 
+def gateway_tags(env):
+    def slug(value, default):
+        return value.lower() if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', value) else default
+
+    repo = slug(env.get('GITHUB_REPOSITORY', '').rsplit('/', 1)[-1], 'token-ladder')
+    job = slug(env.get('GITHUB_JOB', ''), 'cli')
+    caller = slug(env.get('LADDER_CALL_CALLER', ''), job)
+    tag = f'caller={repo}-{caller}'
+    if len(tag) > 64:
+        tag = tag[:51] + '-' + hashlib.sha256(tag.encode()).hexdigest()[:12]
+    tags = [tag]
+    pr = env.get('LADDER_CALL_PR', '')
+    if env.get('GITHUB_EVENT_NAME') in ('pull_request', 'pull_request_target') and re.fullmatch(r'[1-9][0-9]{0,9}', pr):
+        tags.append(f'pr={pr}')
+    return tags
+
+
 def call_lane(lane, key, body):
     url = lane_url(lane)
     headers = {
@@ -160,6 +179,8 @@ def call_lane(lane, key, body):
         'Content-Type': 'application/json',
         'User-Agent': 'token-ladder-ladder-call/1',
     }
+    if lane['name'] == 'vercel-ai-gateway':
+        headers['ai-reporting-tags'] = ','.join(gateway_tags(os.environ))
     if lane['name'] == 'opencode-go':
         if os.environ.get('GITHUB_RUN_ID'):
             headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']

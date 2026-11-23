@@ -1,0 +1,6 @@
+[
+  {"env": {"GITHUB_REPOSITORY": "valentinyeo/multiprompt", "GITHUB_JOB": "verifier", "GITHUB_EVENT_NAME": "pull_request", "LADDER_CALL_PR": "42"}, "tags": ["caller=multiprompt-verifier", "pr=42"]},
+  {"env": {"GITHUB_REPOSITORY": "valentinyeo/multiprompt", "GITHUB_JOB": "checks", "LADDER_CALL_CALLER": "verifier", "GITHUB_EVENT_NAME": "push", "LADDER_CALL_PR": "42"}, "tags": ["caller=multiprompt-verifier"]},
+  {"env": {"GITHUB_REPOSITORY": "valentinyeo/token-ladder", "GITHUB_JOB": "checks", "LADDER_CALL_CALLER": "user@example.com", "GITHUB_EVENT_NAME": "pull_request", "LADDER_CALL_PR": "not-a-number"}, "tags": ["caller=token-ladder-checks"]},
+  {"env": {}, "tags": ["caller=token-ladder-cli"]}
+]
