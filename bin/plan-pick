@@ -127,14 +127,57 @@ def until_text(until, now):
     return (f"{stamp:%H:%M}" if stamp.date() == today else f"{stamp:%Y-%m-%d %H:%M}") + " UTC"
 
 
+def parse_limit(limits, name, now):
+    if not isinstance(limits, dict) or not isinstance(name, str) or not name:
+        return None
+    raw = limits.get(name)
+    until, reason, explicit = None, None, False
+    if isinstance(raw, dict):
+        val = raw.get("until")
+        until = number(val)
+        if until is None and isinstance(val, str):
+            try:
+                stamp = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                until = stamp.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                until = None
+        if isinstance(raw.get("reason"), str) and raw["reason"].strip():
+            reason = raw["reason"].strip()
+            explicit = True
+    else:
+        until = number(raw)
+        if until is not None:
+            raw_reason = limits.get(f"{name}:reason")
+            if isinstance(raw_reason, str) and raw_reason.strip():
+                reason = raw_reason.strip()
+                explicit = True
+            elif number(limits.get(f"{name}:floor")) == until:
+                reason = "credit floor reached"
+                explicit = True
+    if until is None or not math.isfinite(until) or until <= now:
+        return None
+    if not reason:
+        reason = "manual skip (lane-limits)" if until - now > 24 * 3600 else "limited (lane-limits)"
+    return {
+        "lane": name,
+        "until": until,
+        "until_iso": datetime.fromtimestamp(until, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "until_text": until_text(until, now),
+        "reason": reason,
+        "explicit_reason": explicit,
+    }
+
+
 def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
     name = lane["lane"]
     pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
     if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
         return "chat-only pool, never workers"
-    until = number(limits.get(name))
-    if until is not None and until > now:
-        return f"limited until {until_text(until, now)}"
+    skip = parse_limit(limits, name, now)
+    if skip is not None:
+        return f"limited until {skip['until_text']}"
     return skip_reason(pool, warn, no_pace)
 
 
@@ -184,7 +227,11 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
         return {"plan": name, "command": lane["command"], "reason": reason}
     if not ahead:
         reason = "every lane is used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
-        frees = {name: number(limits.get(name)) for name in skipped if (number(limits.get(name)) or 0) > now}
+        frees = {}
+        for name in skipped:
+            skip = parse_limit(limits, name, now)
+            if skip is not None:
+                frees[name] = skip["until"]
         next_free = None
         if frees:
             lane_name = min(frees, key=frees.get)
@@ -421,13 +468,32 @@ def write_limits(limits, path=LIMITS):
 
 
 def live_limits(path, now):
-    return {k: v for k, v in read_limits(path).items() if (number(v) or 0) > now}
+    raw = read_limits(path)
+    out = {}
+    for key, val in raw.items():
+        if key.endswith(":reason"):
+            continue
+        if isinstance(val, dict):
+            if parse_limit(raw, key, now) is not None:
+                out[key] = val
+        elif (number(val) or 0) > now:
+            out[key] = val
+    for key, val in raw.items():
+        if key.endswith(":reason") and isinstance(val, str) and val.strip():
+            base = key[:-len(":reason")]
+            if base in out:
+                out[key] = val.strip()
+    return out
 
 
-def mark_limited(lane, hours, now=None, path=LIMITS):
+def mark_limited(lane, hours, now=None, path=LIMITS, reason=None):
     now = time.time() if now is None else now
     limits = live_limits(path, now)
     limits[lane] = now + hours * 3600
+    if isinstance(reason, str) and reason.strip():
+        limits[f"{lane}:reason"] = reason.strip()
+    else:
+        limits.pop(f"{lane}:reason", None)
     write_limits(limits, path)
     return limits[lane]
 
@@ -650,6 +716,7 @@ def commandcode_pool(entry, now, cfg):
                 state = "OFF"
             windows.append(f"{label} {spent:g}/{window['cap']:g} credits")
         return {"state": state, "used": used, "limit": 70, "unit": "plan credits", "pace_ratio": pace,
+                "resets_at": end,
                 "note": f"{credits:g}/70 monthly credits left (~${credits * 100 / 70:.2f} Flash usage); "
                         + "; ".join(windows) + "; extra paid credits excluded"}
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
@@ -742,10 +809,12 @@ def credit_pool(entry, now, cfg):
         return None
     if now - entry["at"] > stale_s:
         return None
+    extra = {"credits_usd": entry["usd"], "credit_floor_usd": floor}
+    if entry.get("resets_at") is not None:
+        extra["resets_at"] = entry["resets_at"]
     if entry["usd"] < floor:
-        return {"state": "OFF", "note": f"${entry['usd']:.2f} credit left, under ${floor:g}"}
-    return {"state": "ON", "note": f"${entry['usd']:.2f} credit left",
-            "credits_usd": entry["usd"], "credit_floor_usd": floor}
+        return dict(state="OFF", note=f"${entry['usd']:.2f} credit left, under ${floor:g}", **extra)
+    return dict(state="ON", note=f"${entry['usd']:.2f} credit left", **extra)
 
 
 def refresh_later(names, now, path):
@@ -835,20 +904,24 @@ def read_opencode(cfg):
     return reading
 
 
-def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launches_path=LAUNCHES):
+def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launches_path=LAUNCHES,
+                  credits_path=None, allow_live=True):
+    credits_path = CREDITS if credits_path is None else credits_path
     plan = next((p for p in plans_from(cfg) if p.get("vendor") == "opencode"), {})
     allowance = number(plan.get("included_allowance_usd"))
-    try:
-        reading = read_opencode(cfg)
-    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
-        reading = None
+    reading = None
+    if allow_live:
+        try:
+            reading = read_opencode(cfg)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            reading = None
     now = time.time() if now is None else now
     credit = number((reading or {}).get("credits_usd"))
     credit_at = number((reading or {}).get("credits_at"))
     live_credit = (credit is not None and math.isfinite(credit) and credit >= 0 and credit_at is not None
                    and math.isfinite(credit_at) and 0 <= now - credit_at <= 60)
     if live_credit:
-        save_credits({"opencode": {"usd": credit, "at": credit_at, "source": "OpenCode live console"}}, CREDITS)
+        save_credits({"opencode": {"usd": credit, "at": credit_at, "source": "OpenCode live console"}}, credits_path)
     live = bool(reading and reading.get("windows"))
     reading = reading if live else last_windows(pacing_dir)
     if not reading:
@@ -873,7 +946,8 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
     if result["included_exhausted"]:
         result["note"] += "; included allowance used up"
     at = number(reading.get("at"))
-    if not live or at is None or not 0 <= now - at <= 300:
+    fresh_s = 300 if allow_live else (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+    if (allow_live and not live) or at is None or not 0 <= now - at <= fresh_s:
         result["note"] += "; live usage unavailable or stale; never top up"
         if not result["included_exhausted"]:
             return result
@@ -890,7 +964,7 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
     if live_credit:
         result["note"] += f"; live available credit ${credit:.2f}"
     else:
-        anchor = read_credits(CREDITS).get("opencode")
+        anchor = read_credits(credits_path).get("opencode")
         anchor = anchor if isinstance(anchor, dict) else {}
         credit, credit_at = number(anchor.get("usd")), number(anchor.get("at"))
         if (credit is None or not math.isfinite(credit) or credit < 0 or credit_at is None
@@ -1202,6 +1276,298 @@ def with_opencode(pools, cfg, now=None, limits_path=LIMITS):
     return pools
 
 
+VENDOR_POOLS = {
+    "anthropic": "claude",
+    "openai": "codex",
+    "cursor": "grok",
+    "opencode": "opencode",
+    "google": "google",
+}
+
+
+def lane_pool_key(lane):
+    if lane.get("pool"):
+        return lane["pool"]
+    if lane.get("credit"):
+        return f"credit:{lane['credit']}"
+    return None
+
+
+def to_timestamp(value):
+    num = number(value)
+    if num is not None and math.isfinite(num):
+        return float(num)
+    if isinstance(value, str) and value.strip():
+        try:
+            stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp.timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return None
+
+
+def entry_status(pool, skip, now, warn, chat_only=False, retired=False, no_pace=False):
+    pool = pool if isinstance(pool, dict) else {}
+    state = pool.get("state")
+    used_pct = number(pool.get("used_pct"))
+    pace = number(pool.get("pace_ratio"))
+    note = pool.get("note") if isinstance(pool.get("note"), str) else ""
+    stale_off = bool(pool.get("credit_unknown") or (state == "OFF" and any(
+        phrase in note.lower() for phrase in ("missing or stale", "is invalid", "unavailable"))))
+    pool_used_up = bool(pool.get("used_up") or pool.get("floor_reached") or (
+        state == "OFF" and not stale_off) or (
+        pool.get("funding") != "prepaid" and used_pct is not None and used_pct >= 100))
+    skip_used_up = bool(skip and (pool_used_up or state == "WARN" or skip["until"] - now > 24 * 3600
+                                  or "used up" in skip["reason"].lower()))
+    used_up = bool(pool_used_up or skip_used_up)
+    if retired:
+        return {"status": "RETIRED", "status_kind": "muted", "used_up": used_up}
+    if chat_only:
+        return {"status": "USED UP · CHAT ONLY" if pool_used_up else "CHAT ONLY",
+                "status_kind": "hot" if pool_used_up else "muted", "used_up": pool_used_up}
+    if skip:
+        return {"status": "USED UP · SKIPPED" if used_up else "SKIPPED", "status_kind": "hot", "used_up": used_up}
+    if pool_used_up:
+        return {"status": "USED UP", "status_kind": "hot", "used_up": True}
+    if stale_off:
+        return {"status": "OFF", "status_kind": "warn", "used_up": False}
+    if pool.get("included_exhausted") and state == "ON":
+        return {"status": "EXTRA USAGE ON", "status_kind": "warn", "used_up": False}
+    if not no_pace and pace is not None and pace > warn:
+        return {"status": "OVER PACE", "status_kind": "warn", "used_up": False}
+    if state == "WARN":
+        return {"status": "WARN", "status_kind": "warn", "used_up": False}
+    if state == "ON":
+        return {"status": "ON", "status_kind": "ok", "used_up": False}
+    return {"status": "UNKNOWN", "status_kind": "muted", "used_up": False}
+
+
+def match_lanes_to_plans(plans, lanes):
+    by_plan = {i: [] for i in range(len(plans))}
+    lane_to_plan = {}
+    matchers = (
+        lambda p, l: bool(p.get("pool") and p["pool"] == lane_pool_key(l)),
+        lambda p, l: bool(p.get("credit") and p["credit"] == l.get("credit")),
+        lambda p, l: bool(p.get("vendor") and p["vendor"] in (l.get("lane"), l.get("credit"), l.get("pool"))),
+        lambda p, l: bool(p.get("vendor") and p["vendor"] == l.get("vendor")),
+    )
+    for matcher in matchers:
+        for lane in lanes:
+            name = lane["lane"]
+            if name in lane_to_plan:
+                continue
+            for idx, plan in enumerate(plans):
+                if matcher(plan, lane):
+                    by_plan[idx].append(lane)
+                    lane_to_plan[name] = idx
+                    break
+    return by_plan, lane_to_plan
+
+
+def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None, limits_path=None,
+                       credits_path=None, pacing_dir=None, sessions=None, launches_path=None,
+                       allow_live=False):
+    limits_path = LIMITS if limits_path is None else limits_path
+    credits_path = CREDITS if credits_path is None else credits_path
+    pacing_dir = PACING_DIR if pacing_dir is None else pacing_dir
+    sessions = PI_SESSIONS if sessions is None else sessions
+    launches_path = LAUNCHES if launches_path is None else launches_path
+    cfg = cfg if isinstance(cfg, dict) else {}
+    now = time.time() if now is None else now
+    warn = number(cfg.get("pace_warn_ratio")) or DEFAULT_PACE_WARN
+    raw_lanes = lanes_from(cfg, now)
+    burn = parse_burn(cfg, raw_lanes, now)
+    lanes = lanes_with_burn(raw_lanes, burn)
+    plans = plans_from(cfg)
+    limits = read_limits(limits_path) if limits is None else (limits if isinstance(limits, dict) else {})
+    credits_data = read_credits(credits_path) if credits_data is None else (
+        credits_data if isinstance(credits_data, dict) else {})
+    all_pools = {k: dict(v) for k, v in (pools.items() if isinstance(pools, dict) else ()) if isinstance(v, dict)}
+    has_opencode = any(l.get("pool") == "opencode" for l in lanes) or any(p.get("vendor") == "opencode" for p in plans)
+    if has_opencode and "opencode" not in all_pools:
+        all_pools["opencode"] = opencode_pool(
+            now, cfg, pacing_dir=pacing_dir, sessions=sessions, launches_path=launches_path,
+            credits_path=credits_path, allow_live=allow_live)
+    credit_names = []
+    for name in ([l.get("credit") for l in lanes] + [p.get("credit") for p in plans]
+                 + [p["pool"][7:] for p in plans if isinstance(p.get("pool"), str) and p["pool"].startswith("credit:")]):
+        if isinstance(name, str) and name and name not in credit_names:
+            credit_names.append(name)
+    for name in credit_names:
+        key = f"credit:{name}"
+        if key in all_pools:
+            continue
+        if name == "commandcode":
+            all_pools[key] = commandcode_pool(credits_data.get(name), now, cfg)
+        else:
+            state = credit_pool(credits_data.get(name), now, cfg)
+            if state:
+                all_pools[key] = state
+    all_pools = with_antigravity_reserve(all_pools, cfg, now=now, path=launches_path)
+    by_plan, lane_to_plan = match_lanes_to_plans(plans, lanes)
+
+    def lane_skip(lane):
+        return parse_limit(limits, lane["lane"], now) or parse_limit(limits, lane.get("pool"), now)
+
+    lane_rows = []
+    for lane in lanes:
+        name = lane["lane"]
+        pkey = lane_pool_key(lane)
+        pool = all_pools.get(pkey) if pkey else None
+        skip = lane_skip(lane)
+        no_pace = burn is not None and name == burn["lane"]
+        chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"))
+        shared = bool(lane.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats")))
+        plan_idx = lane_to_plan.get(name)
+        plan = plans[plan_idx] if plan_idx is not None else {}
+        credit_name = lane.get("credit") or plan.get("credit")
+        credit_entry = credits_data.get(credit_name) if isinstance(credit_name, str) else None
+        st = entry_status(pool, skip, now, warn, chat_only=chat_only, no_pace=no_pace)
+        why = None
+        if chat_only:
+            why = "chat-only pool, never workers"
+        elif skip:
+            why = f"skipped until {skip['until_text']} ({skip['reason']})"
+        elif st["status"] == "OFF" and isinstance(pool, dict) and pool.get("note"):
+            why = pool["note"]
+        else:
+            why = skip_reason(pool, warn, no_pace) or pool_note(pool, warn)
+        first_until = lane_first_until(lane)
+        lane_rows.append({
+            "lane": name,
+            "vendor": lane.get("vendor"),
+            "plan_name": plan.get("name"),
+            "pool_key": pkey,
+            "usage": dict(pool) if isinstance(pool, dict) else {},
+            "credit": dict(credit_entry) if isinstance(credit_entry, dict) else None,
+            "usd_per_cycle": number(plan.get("usd_per_cycle")),
+            "skip": skip,
+            "chat_only": chat_only,
+            "shared_with_chats": shared,
+            "public_only": bool(lane.get("public_only")),
+            "first_until": first_until if first_until and first_until > now else None,
+            "burn_until": burn["until"] if no_pace else None,
+            "reason": why,
+            **st,
+        })
+
+    plan_rows = []
+    covered_pools = set()
+    for idx, plan in enumerate(plans):
+        matched = by_plan[idx]
+        pkey = plan.get("pool")
+        if not pkey and plan.get("credit"):
+            pkey = f"credit:{plan['credit']}"
+        if not pkey and matched:
+            pkey = lane_pool_key(matched[0])
+        if not pkey:
+            vendor = plan.get("vendor")
+            if vendor in VENDOR_POOLS:
+                pkey = VENDOR_POOLS[vendor]
+            elif vendor in all_pools:
+                pkey = vendor
+            elif isinstance(vendor, str) and f"credit:{vendor}" in all_pools:
+                pkey = f"credit:{vendor}"
+        if pkey:
+            covered_pools.add(pkey)
+        pool = all_pools.get(pkey) if pkey else None
+        credit_name = plan.get("credit")
+        if not credit_name and isinstance(pkey, str) and pkey.startswith("credit:"):
+            credit_name = pkey[7:]
+        if not credit_name and plan.get("vendor") in credits_data:
+            credit_name = plan.get("vendor")
+        credit_entry = credits_data.get(credit_name) if isinstance(credit_name, str) else None
+        skip = None
+        for lane in matched:
+            skip = lane_skip(lane)
+            if skip:
+                break
+        if not skip and pkey:
+            skip = parse_limit(limits, pkey, now)
+        if not skip and credit_name:
+            skip = parse_limit(limits, credit_name, now)
+        if not skip and plan.get("vendor"):
+            skip = parse_limit(limits, plan["vendor"], now)
+        shared = bool(plan.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats"))
+                      or any(l.get("shared_with_chats") for l in matched))
+        chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not shared)
+        public_only = bool(any(l.get("public_only") for l in matched))
+        retired = isinstance(plan.get("extra_cost"), str) and plan["extra_cost"].lower().startswith("retired")
+        no_pace = bool(burn and any(l["lane"] == burn["lane"] for l in matched))
+        st = entry_status(pool, skip, now, warn, chat_only=chat_only, retired=retired, no_pace=no_pace)
+        plan_rows.append({
+            "name": plan["name"],
+            "vendor": plan.get("vendor"),
+            "models": list(plan.get("included_models") or []),
+            "runs_on": list(plan.get("runs_on") or []),
+            "extra_cost": plan.get("extra_cost"),
+            "pool_key": pkey,
+            "lanes": [l["lane"] for l in matched],
+            "usage": dict(pool) if isinstance(pool, dict) else {},
+            "credit": dict(credit_entry) if isinstance(credit_entry, dict) else None,
+            "usd_per_cycle": number(plan.get("usd_per_cycle")),
+            "included_allowance_usd": number(plan.get("included_allowance_usd")),
+            "monthly_price_usd": number(plan.get("monthly_price_usd")),
+            "chat_only": chat_only,
+            "shared_with_chats": shared,
+            "public_only": public_only,
+            "retired": retired,
+            "skip": skip,
+            **st,
+        })
+
+    for pkey, pool in all_pools.items():
+        if pkey in covered_pools:
+            continue
+        matched = [l for l in lanes if lane_pool_key(l) == pkey]
+        skip = next((lane_skip(l) for l in matched if lane_skip(l)), None) or parse_limit(limits, pkey, now)
+        shared = bool(pool.get("shared_with_chats") or any(l.get("shared_with_chats") for l in matched))
+        chat_only = bool(pool.get("chat_only") and not shared)
+        st = entry_status(pool, skip, now, warn, chat_only=chat_only)
+        plan_rows.append({
+            "name": pkey,
+            "vendor": pkey,
+            "models": [],
+            "runs_on": [],
+            "extra_cost": None,
+            "pool_key": pkey,
+            "lanes": [l["lane"] for l in matched],
+            "usage": dict(pool),
+            "credit": None,
+            "usd_per_cycle": None,
+            "included_allowance_usd": None,
+            "monthly_price_usd": None,
+            "chat_only": chat_only,
+            "shared_with_chats": shared,
+            "public_only": bool(any(l.get("public_only") for l in matched)),
+            "retired": False,
+            "skip": skip,
+            **st,
+        })
+
+    skips = []
+    for key in limits:
+        if key.endswith(":floor") or key.endswith(":reason"):
+            continue
+        parsed = parse_limit(limits, key, now)
+        if parsed:
+            skips.append(parsed)
+    skips.sort(key=lambda item: (item["until"], item["lane"]))
+
+    picked = pick(lanes, all_pools, limits, now=now, warn=warn, burn=burn) if lanes else None
+    return {
+        "now": now,
+        "warn": warn,
+        "plans": plan_rows,
+        "lanes": lane_rows,
+        "pools": all_pools,
+        "skips": skips,
+        "picked": picked,
+    }
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog="plan-pick", description="Pick the lane for the next background worker.")
     parser.add_argument("--json", action="store_true", help="print plan, command and reason as JSON")
@@ -1232,6 +1598,7 @@ def main(argv):
     parser.add_argument("--credit-source", default="Valentin dashboard screenshot", help="balance anchor source")
     parser.add_argument("--credit-at", help="balance anchor time in ISO 8601 with timezone (default: now UTC)")
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
+    parser.add_argument("--reason", help="optional reason recorded with --limited in lane-limits.json")
     args = parser.parse_args(argv)
     if args.cloud and not args.lane_ok:
         parser.error("--cloud requires --lane-ok")
@@ -1320,7 +1687,7 @@ def main(argv):
             print(f"plan-pick: unknown lane {args.limited}; lanes: {', '.join(l['lane'] for l in lanes)}", file=sys.stderr)
             return 2
         hours = args.hours if args.hours is not None else number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS
-        until = mark_limited(args.limited, hours)
+        until = mark_limited(args.limited, hours, reason=args.reason)
         print(f"Lane {args.limited} is skipped until {datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC.")
         return 0
     try:

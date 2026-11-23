@@ -47,7 +47,7 @@
       "credit": "commandcode",
       "vendor": "deepseek",
       "pool": null,
-      "public_only": true,
+      "public_only": false,
       "command": "COMMANDCODE_API_KEY=\"${COMMANDCODE_API_KEY:-$(~/.local/bin/yeo-key 'Commando Code API Key' credential)}\" ~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-commandcode.mjs --provider commandcode --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
@@ -76,7 +76,7 @@
       "name": "Claude",
       "vendor": "anthropic",
       "included_models": ["Claude Opus 5.5", "Claude Sonnet 5.5", "Claude Haiku 5.5", "Claude Fable"],
-      "runs_on": ["local"],
+      "runs_on": ["local", "cloud"],
       "extra_cost": "none",
       "source": "unknown"
     },
@@ -144,7 +144,7 @@
       "runs_on": [
         "local"
       ],
-      "extra_cost": "$10/month; up to $100 Flash usage/month, $20/5h, $50/week; public repos only",
+      "extra_cost": "$10/month; up to $100 Flash usage/month, $20/5h, $50/week",
       "source": "https://commandcode.ai/docs/plans/goat; https://commandcode.ai/docs/resources/usage-limits"
     },
     {

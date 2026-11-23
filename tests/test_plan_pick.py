@@ -65,6 +65,16 @@ class LaneOkTests(unittest.TestCase):
         self.assertIn("limited until", reason)
         self.assertEqual(len(reason.splitlines()), 1)
 
+    def test_structured_skips_refuse_until_expired(self):
+        for until in (T + 3600, burn_until()):
+            with self.subTest(until=until):
+                code, reason = self.check_lane("cursor", {"grok": pool()},
+                                               {"cursor": {"until": until, "reason": "manual skip"}})
+                self.assertEqual(code, 3)
+                self.assertIn("limited until", reason)
+        self.assertEqual(self.check_lane("cursor", {"grok": pool()},
+                                         {"cursor": {"until": T, "reason": "expired"}})[0], 0)
+
     def test_lane_and_vendor_names_use_their_own_pool_not_the_first_usable_lane(self):
         for name, pool_name in (("cursor", "grok"), ("codex", "codex"), ("openai", "codex"),
                                 ("claude", "claude"), ("anthropic", "claude"),
