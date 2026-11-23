@@ -173,13 +173,13 @@ class DashboardRendererTests(unittest.TestCase):
             "CommandCode GOAT",
             "credit:commandcode",
             "0.5 / 70 plan credits",
-            "public repos only",
             "OpenRouter",
             "DeepSeek direct",
             "RETIRED",
             "Next worker lane:",
         ):
             self.assertIn(text, page)
+        self.assertNotIn("public repos only", page)
 
     def test_cloud_agents_badges_follow_plan_fixtures(self):
         cfg = json.loads((FIXTURES / "dashboard-cloud-plans.json").read_text())

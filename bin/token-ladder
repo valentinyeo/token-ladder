@@ -1715,9 +1715,12 @@ def bash_refusal(cmd, environment=None):
         if "openrouter" in providers and env.get("TOKEN_LADDER_OPENROUTER_OK") != "1":
             return "Token ladder: OpenRouter runs only as the openrouter-credit lane plan-pick prints."
         deepseek_only = exe == "pi" and models and all(m.lower().startswith(DEEPSEEK_FLASH_MODELS) for m in models)
+        glm_lane = (exe == "pi" and models == ["zai/glm-5.3-flash"] and providers == ["vercel-ai-gateway"]
+                    and any(words[i] in ("-e", "--extension") and words[i + 1].endswith("/tools/pi-lane-pins.mjs")
+                            for i in range(len(words) - 1)))
         if (any(w == "--api-key" or w.startswith("--api-key=") for w in words[1:]) or
-                any(p not in ("codex", "openrouter") and not (p in PI_LANE_PROVIDERS and deepseek_only) for p in providers)):
-            return "Token ladder: only the lanes plan-pick prints; DeepSeek Flash on pi, no paid-key fallback."
+                any(p not in ("codex", "openrouter") and not (p in PI_LANE_PROVIDERS and (deepseek_only or glm_lane)) for p in providers)):
+            return "Token ladder: only the lanes plan-pick prints; DeepSeek Flash or pinned GLM Flash on pi, no paid-key fallback."
     return None
 
 

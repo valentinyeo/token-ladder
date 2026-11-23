@@ -128,13 +128,17 @@ class CommandCodeTests(unittest.TestCase):
                                    "burn": {"lane": "commandcode", "until": "2099-01-01T00:00:00Z"}}))
         pools = root / "pools.json"
         pools.write_text(json.dumps({"credit:commandcode": {"state": "ON"}}))
-        env = dict(os.environ, HOME=str(root), PATH=str(root) + os.pathsep + os.environ.get("PATH", ""),
-                   TOKEN_LADDER_LOCAL_CONFIG=str(cfg))
-        out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--run", "--pools", str(pools)],
-                             cwd=root, env=env, capture_output=True, text=True, timeout=20)
-        self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("commandcode-worker", out.stdout)
-        self.assertFalse((root / "gh-args").exists(), "no repository lookup")
+        for visibility in ("PRIVATE", "INTERNAL", "", "PUBLIC"):
+            (root / "brief.txt").write_text(f"Repo owner/{visibility.lower() or 'unknown'}-repo\n")
+            env = dict(os.environ, HOME=str(root), PATH=str(root) + os.pathsep + os.environ.get("PATH", ""),
+                       TOKEN_LADDER_LOCAL_CONFIG=str(cfg), TEST_VISIBILITY=visibility)
+            out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--run", "--pools", str(pools)],
+                                 cwd=root, env=env, capture_output=True, text=True, timeout=20)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertFalse((root / "gh-args").exists(), "no repository lookup")
+            self.assertIn("commandcode-worker", out.stdout)
+            self.assertNotIn("next-worker", out.stdout)
+            self.assertNotIn("public repos only", out.stderr)
 
     def test_command_guard_allows_only_flash_on_commandcode(self):
         self.assertIsNone(tl.bash_refusal(self.lane["command"], {}))
