@@ -55,6 +55,8 @@ def number(value):
 def skip_reason(pool, warn, no_pace=False):
     if not isinstance(pool, dict):
         return None
+    if pool.get("credit_unknown"):
+        return "credit unknown" + (f": {pool['note']}" if pool.get("note") else "")
     if pool.get("state") == "OFF" or (pool.get("funding") != "prepaid" and (number(pool.get("used_pct")) or 0) >= 100):
         return "used up" + (f": {pool['note']}" if pool.get("note") else "")
     ratio = number(pool.get("pace_ratio"))
@@ -115,6 +117,12 @@ def lanes_with_burn(lanes, burn):
     return head + tail
 
 
+def until_text(until, now):
+    stamp = datetime.fromtimestamp(until, timezone.utc)
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    return (f"{stamp:%H:%M}" if stamp.date() == today else f"{stamp:%Y-%m-%d %H:%M}") + " UTC"
+
+
 def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None):
     pools = pools if isinstance(pools, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
@@ -128,7 +136,7 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
             continue
         until = number(limits.get(name))
         if until is not None and until > now:
-            skipped[name] = f"limited until {datetime.fromtimestamp(until, timezone.utc):%H:%M} UTC"
+            skipped[name] = f"limited until {until_text(until, now)}"
             continue
         no_pace = burn is not None and name == burn["lane"]
         why = skip_reason(pool, warn, no_pace)
@@ -152,7 +160,7 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
         if frees:
             lane_name = min(frees, key=frees.get)
             next_free = {"lane": lane_name, "at": frees[lane_name]}
-            reason += (f"; {lane_name} frees at {datetime.fromtimestamp(frees[lane_name], timezone.utc):%H:%M} UTC,"
+            reason += (f"; {lane_name} frees at {until_text(frees[lane_name], now)},"
                        " so wait for it and run plan-pick --run again")
         else:
             reason += "; wait for the next plan reset"
@@ -290,6 +298,16 @@ def lane_names(lane):
     return {name.lower() for name in names if isinstance(name, str)}
 
 
+def vendor_exclusions(values):
+    names = []
+    for value in values or []:
+        for part in value.split(","):
+            name = part.strip().lower()
+            if name and name not in names:
+                names.append(name)
+    return names
+
+
 def plans_from(cfg):
     plans = cfg.get("plans")
     if not isinstance(plans, list):
@@ -340,16 +358,42 @@ def read_limits(path=LIMITS):
     return data if isinstance(data, dict) else {}
 
 
-def mark_limited(lane, hours, now=None, path=LIMITS):
-    now = time.time() if now is None else now
-    limits = {k: v for k, v in read_limits(path).items() if (number(v) or 0) > now}
-    limits[lane] = now + hours * 3600
+def write_limits(limits, path=LIMITS):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(limits, fh)
     os.replace(tmp, path)
+
+
+def live_limits(path, now):
+    return {k: v for k, v in read_limits(path).items() if (number(v) or 0) > now}
+
+
+def mark_limited(lane, hours, now=None, path=LIMITS):
+    now = time.time() if now is None else now
+    limits = live_limits(path, now)
+    limits[lane] = now + hours * 3600
+    write_limits(limits, path)
     return limits[lane]
+
+
+def mark_floor_lock(lane, until, now, path=LIMITS):
+    limits = live_limits(path, now)
+    limits[lane] = until
+    limits[f"{lane}:floor"] = until
+    write_limits(limits, path)
+    return until
+
+
+def clear_floor_lock(lane, now, path=LIMITS):
+    limits = live_limits(path, now)
+    until = number(limits.pop(f"{lane}:floor", None))
+    if until is None:
+        return
+    if number(limits.get(lane)) == until:
+        limits.pop(lane, None)
+    write_limits(limits, path)
 
 
 def limit_kind(code, tail):
@@ -753,7 +797,8 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
     live = bool(reading and reading.get("windows"))
     reading = reading if live else last_windows(pacing_dir)
     if not reading:
-        return {"state": "OFF", "note": "OpenCode live usage unavailable; never top up"}
+        return {"state": "OFF", "credit_unknown": True,
+                "note": "OpenCode live usage unavailable; credit unknown; never top up"}
     used = parse_opencode_windows(reading.get("windows", reading.get("used")))
     monthly = number(used.get("monthly"))
     windows = ", ".join(f"{name} {used[name]:g}%" if number(used.get(name)) is not None else f"{name} unknown"
@@ -795,7 +840,8 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
         credit, credit_at = number(anchor.get("usd")), number(anchor.get("at"))
         if (credit is None or not math.isfinite(credit) or credit < 0 or credit_at is None
                 or not math.isfinite(credit_at) or not 0 <= now - credit_at <= 7 * 86400):
-            result["note"] += "; live credit unavailable; balance anchor missing, invalid or older than 7 days; never top up"
+            result["note"] += "; live credit unavailable; balance anchor missing, invalid or older than 7 days; credit unknown; never top up"
+            result["credit_unknown"] = True
             return result
         spent, unknown = opencode_spend(credit_at, now, sessions, launches_path)
         credit = max(0.0, round(credit - spent, 10))
@@ -810,7 +856,11 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
     result["note"] += f" (floor ${floor:g}); never top up"
     if credit <= floor:
         result.update(floor_reached=True)
-        result["note"] += "; skip until monthly renewal"
+        if number(renewal) is not None and math.isfinite(renewal) and renewal > now:
+            stamp = datetime.fromtimestamp(renewal, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result["note"] += f"; skip until monthly renewal {stamp}"
+        else:
+            result["note"] += "; skip until monthly renewal"
     elif cfg.get("opencode_extra_usage") is not True or cfg.get("opencode_auto_topup") is not False:
         result["note"] += "; prepaid usage requires Extra Usage on and auto top-up OFF"
     elif number(renewal) is None or not math.isfinite(renewal) or renewal <= now:
@@ -960,13 +1010,15 @@ def read_pools(source):
     return json.loads(out)
 
 
-def with_opencode(pools, cfg, now=None):
+def with_opencode(pools, cfg, now=None, limits_path=LIMITS):
     pools = pools if isinstance(pools, dict) else {}
     if "opencode" not in pools:
         state = opencode_pool(now, cfg)
         now = time.time() if now is None else now
         if state.get("floor_reached") and (number(state.get("resets_at")) or 0) > now:
-            mark_limited("opencode", (state["resets_at"] - now) / 3600, now)
+            mark_floor_lock("opencode", state["resets_at"], now, limits_path)
+        elif state.get("state") == "ON" and state.get("funding") == "prepaid":
+            clear_floor_lock("opencode", now, limits_path)
         pools = dict(pools, opencode=state)
     return pools
 
@@ -984,8 +1036,9 @@ def main(argv):
                         help="print how many seconds a loop should wait before its next tick, from Claude's pace")
     parser.add_argument("--limited", metavar="LANE",
                         help="mark LANE limited after a 429, quota or empty-credit error; plan-pick skips it for a while")
-    parser.add_argument("--not-vendor", metavar="VENDOR",
-                        help="skip lanes from VENDOR, so a review comes from a different vendor than the author")
+    parser.add_argument("--not-vendor", metavar="VENDOR", action="append", default=[],
+                        help="skip lanes from VENDOR; repeat the flag or pass a comma list, so a review "
+                             "comes from a different vendor than every author")
     parser.add_argument("--run", action="store_true",
                         help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
@@ -1090,21 +1143,21 @@ def main(argv):
         else:
             print(f"Claude helper: {'allowed' if answer['allowed'] else 'refused'}. Why: {answer['reason']}.")
         return 0 if answer["allowed"] else 3
-    if args.not_vendor:
-        excluded = args.not_vendor.lower()
-        lanes = [lane for lane in lanes if excluded not in lane_names(lane)]
+    excluded = vendor_exclusions(args.not_vendor)
+    if excluded:
+        lanes = [lane for lane in lanes if not any(name in lane_names(lane) for name in excluded)]
     pools = with_repo_visibility(pools, lanes)
     if any(lane.get("credit") == "commandcode" for lane in lanes) and "credit:commandcode" not in pools:
         pools = dict(pools, **{"credit:commandcode": commandcode_pool(None, time.time(), cfg)})
     burn = parse_burn(cfg, lanes)
     lanes = lanes_with_burn(lanes, burn)
     if args.run:
-        return run_lanes(lanes, pools, cfg, warn, not_vendor=args.not_vendor, burn=burn)
+        return run_lanes(lanes, pools, cfg, warn, not_vendor=excluded or None, burn=burn)
     result = pick(lanes, pools, read_limits(), warn=warn, burn=burn)
     if args.json:
         print(json.dumps(result))
     elif result["command"]:
-        vendor_flag = f" --not-vendor {args.not_vendor}" if args.not_vendor else ""
+        vendor_flag = "".join(f" --not-vendor {name}" for name in excluded)
         print(f"Worker plan: {result['plan']}. Launch: ~/.local/bin/plan-pick --run{vendor_flag} (reads brief.txt, runs {result['command']}, "
               f"moves to the next lane on a 429). Why: {result['reason']}.")
     else:

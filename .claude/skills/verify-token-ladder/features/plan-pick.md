@@ -10,7 +10,7 @@ plan-pick chooses a worker lane from pool state, prints human or JSON plans, gat
 - `loop-interval` prints sleep seconds from Claude pace state.
 - `claude-helper` allows or refuses Sonnet helper use from pool pace.
 - `run-stub` runs a stub lane command end to end without real spend.
-- `prepaid-credit` uses live OpenCode credit or a balance anchor less recorded run costs for at most seven days, stops at $2, and waits until monthly renewal once the floor is reached.
+- `prepaid-credit` uses live OpenCode credit or a balance anchor less recorded run costs for at most seven days, stops at $2, names the monthly renewal date once the floor is reached, and clears that floor lock on a later live read above the floor.
 - `burn` reports current-month recorded pi costs and the separate measured 30-day DeepSeek direct account total.
 - `commandcode` reports weighted GOAT credit and refuses private or unknown repositories before launching pi.
 
