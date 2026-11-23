@@ -166,6 +166,104 @@ class RungTests(unittest.TestCase):
         self.assertIsNone(self.output([{"type": "result", "text": "done"}]).tokens)
 
 
+class RungPreviewTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "repo"
+        (self.repo / "bin").mkdir(parents=True)
+        (self.repo / "bin" / "plan-pick").write_text(Path(REPO, "bin/plan-pick").read_text())
+        (self.repo / "config.json").write_text(json.dumps({
+            "rungs": {"light": [{"lane": "l"}], "medium": [{"lane": "m"}], "hard": [{"lane": "h"}]},
+            "lanes": [{"lane": "l", "command": "echo ran-l"},
+                      {"lane": "m", "command": "echo ran-m"},
+                      {"lane": "h", "command": "echo '429: Too Many Requests'; exit 1"}]}))
+        self.home = self.root / "home"
+        (self.home / ".local/state/token-ladder").mkdir(parents=True)
+        (self.home / ".local/state/pacing").mkdir(parents=True)
+        self.pools = str(self.root / "pools.json")
+        Path(self.pools).write_text("{}")
+        self.brief = self.root / "brief.txt"
+        self.brief.write_text("Task: fixture\nRung: medium\n")
+        self.launches = self.home / ".local/state/token-ladder/launches.jsonl"
+        self.lease = self.root / "T-1.json"
+        self.lease.write_text(json.dumps({"ticket_id": "T-1"}))
+
+    def env(self, lease=False):
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
+               "PLAN_PICK_PACING_DIR": str(self.home / ".local/state/pacing"),
+               "PLAN_PICK_LAUNCHES": str(self.launches),
+               "TOKEN_LADDER_LOCAL_CONFIG": str(self.root / "missing.json")}
+        if lease:
+            env["PLAN_PICK_LEASE"] = str(self.lease)
+        return env
+
+    def cli(self, *args, lease=False):
+        return subprocess.run([sys.executable, str(self.repo / "bin/plan-pick"), "--pools", self.pools, *args],
+                              cwd=self.root, capture_output=True, text=True, env=self.env(lease), timeout=30)
+
+    def prior(self, **attempt):
+        self.launches.parent.mkdir(parents=True, exist_ok=True)
+        (self.launches.parent / "rung-attempts.json").write_text(json.dumps({"ticket:T-1": attempt}))
+
+    def test_preview_and_run_agree_after_a_prior_work_failure(self):
+        (self.repo / "config.json").write_text(json.dumps({
+            "rungs": {"light": [{"lane": "l"}], "medium": [{"lane": "m"}], "hard": [{"lane": "h"}]},
+            "lanes": [{"lane": "l", "command": "echo ran-l"},
+                      {"lane": "m", "command": "echo ran-m"},
+                      {"lane": "h", "command": "echo ran-h"}]}))
+        self.prior(rung="medium", exit_code=1, pr_url=None, failure="work")
+        preview = self.cli(lease=True)
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn("Worker plan: h", preview.stdout)
+        self.assertIn("Rung: hard", preview.stdout)
+        self.assertIn("prior run failed", preview.stdout)
+        got = json.loads(self.cli("--json", lease=True).stdout)
+        self.assertEqual((got["plan"], got["rung"]), ("h", "hard"))
+        self.assertEqual(self.cli("--lane-ok", "m", lease=True).returncode, 3)
+        ran = self.cli("--run", lease=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("ran-h", ran.stdout)
+        self.assertIn("rung medium -> hard (prior run failed)", ran.stderr)
+
+    def test_lane_limit_prior_leaves_plain_preview_and_run_on_the_brief_rung(self):
+        self.prior(rung="hard", exit_code=3, pr_url=None, failure="lane")
+        preview = self.cli()
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn("Worker plan: m", preview.stdout)
+        self.assertIn("Rung: medium", preview.stdout)
+        self.assertNotIn("prior run failed", preview.stdout)
+        got = json.loads(self.cli("--json").stdout)
+        self.assertEqual((got["plan"], got["rung"]), ("m", "medium"))
+        self.assertEqual(self.cli("--lane-ok", "m").returncode, 0)
+        self.assertEqual(self.cli("--lane-ok", "h").returncode, 3)
+        ran = self.cli("--run", lease=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("ran-m", ran.stdout)
+        self.assertIn("rung medium", ran.stderr)
+        self.assertNotIn("no lane left", ran.stderr)
+
+    def test_legacy_exit_75_is_a_lane_limit_not_a_work_failure(self):
+        self.prior(rung="medium", exit_code=75, pr_url=None)
+        got = json.loads(self.cli("--json", lease=True).stdout)
+        self.assertEqual((got["rung"], got["rung_source"]), ("medium", "brief line"))
+
+    def test_no_lane_left_is_recorded_as_a_lane_failure_and_never_climbs(self):
+        (self.repo / "config.json").write_text(json.dumps({
+            "rungs": {"light": [{"lane": "l"}], "medium": [{"lane": "m"}], "hard": [{"lane": "h"}]},
+            "lanes": [{"lane": "l", "command": "echo ran-l"},
+                      {"lane": "m", "command": "echo 'quota error: RESOURCE_EXHAUSTED'; exit 1"},
+                      {"lane": "h", "command": "echo 'quota error: RESOURCE_EXHAUSTED'; exit 1"}]}))
+        first = self.cli("--run", lease=True)
+        self.assertEqual(first.returncode, 75, first.stderr)
+        state = json.loads((self.launches.parent / "rung-attempts.json").read_text())["ticket:T-1"]
+        self.assertEqual((state["failure"], state["exit_code"]), ("lane", 75))
+        (self.home / ".local/state/token-ladder/lane-limits.json").unlink()
+        got = json.loads(self.cli("--json", lease=True).stdout)
+        self.assertEqual((got["rung"], got["rung_source"], got["plan"]), ("medium", "brief line", "m"))
+
+
 class RungReportTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

@@ -195,16 +195,22 @@ def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
     return skip_reason(pool, warn, no_pace)
 
 
-def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN):
+def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=None, cfg=None):
     now = time.time() if now is None else now
     spec = {"anthropic": "claude", "openai": "codex", "google": "antigravity"}.get(spec, spec)
     lane = next((lane for lane in lanes if lane["lane"] == spec), None)
     if lane is None:
         lane = next((lane for lane in lanes if spec in lane_names(lane)), None)
+    configured = lane is not None
     if lane is None and spec == "claude":
         lane = {"lane": "claude", "pool": "claude", "shared_with_chats": True}
     if lane is None:
         return {"allowed": False, "reason": f"unknown lane or vendor {spec}"}
+    if rung and cfg and configured:
+        allowed = {item["lane"] for item in rung_lanes(lanes, cfg, rung["rung"])}
+        if lane["lane"] not in allowed:
+            return {"allowed": False,
+                    "reason": f"{lane['lane']}: not in rung {rung['rung']} ({rung['rung_reason']})"}
     pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
     why = lane_skip_reason(lane, pools, limits, now, warn)
     if not why and lane.get("credit") and not isinstance(pool, dict):
@@ -902,6 +908,7 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
             result = pick(available, pools, read_limits(limits_path), now, warn, burn)
         if not result["command"]:
             log_launch(launches_path, None, now, not_vendor)
+            record_no_lane(rung, now)
             say(f"no lane left, nothing ran. {result['reason']}")
             return 75
         say(f"lane {result['plan']}: {result['reason']}")
@@ -925,8 +932,10 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         if fast and nonquota_http and kind != "blocked":
             kind = None
         effective_code = 1 if code == 0 and (kind is not None or fast is not None or info["error"] is not None) else code
+        lane_failure = kind is not None or fast is not None
         if rung:
-            launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now)
+            launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now,
+                          lane_failure=lane_failure)
         if kind is None:
             if fast is None:
                 return effective_code
@@ -1029,6 +1038,23 @@ def lease_ticket(path=None):
     return lease_ticket(min(candidates)[1]) if candidates else None
 
 
+def lane_limit_attempt(prior):
+    if prior.get("failure") == "lane":
+        return True
+    return prior.get("failure") != "work" and prior.get("exit_code") == 75
+
+
+def climb_reason(prior, cache_path):
+    if lane_limit_attempt(prior):
+        return None
+    if prior["exit_code"] != 0 or not prior.get("pr_url"):
+        return "prior run failed"
+    verdict = first_verdict(prior.get("pr_url"), cache_path)
+    if verdict == "FAIL":
+        return f"prior FAIL on PR {prior['pr_url'].rsplit('/', 1)[-1]}"
+    return None
+
+
 def rung_context(brief, launches_path, lease=None):
     try:
         with open(brief) as fh:
@@ -1047,17 +1073,14 @@ def rung_context(brief, launches_path, lease=None):
            "ticket": ticket, "job": key, "state_path": state_path, "cache_path": cache_path,
            "rung_reason": f"rung {rung}"}
     prior = read_state(state_path).get(key)
-    if prior:
-        failed = prior["exit_code"] != 0 or not prior.get("pr_url")
-        verdict = first_verdict(prior.get("pr_url"), cache_path) if not failed else None
-        failed = failed or verdict == "FAIL"
+    if prior and not lane_limit_attempt(prior):
+        reason = climb_reason(prior, cache_path)
         old = prior["rung"]
-        next_index = min(RUNGS.index(old) + int(failed), len(RUNGS) - 1)
+        next_index = min(RUNGS.index(old) + int(reason is not None), len(RUNGS) - 1)
         chosen = RUNGS[max(RUNGS.index(rung), next_index)]
-        if failed or chosen != rung:
-            reason = (f"prior FAIL on PR {prior['pr_url'].rsplit('/', 1)[-1]}" if verdict == "FAIL"
-                      else "prior run failed" if failed else "prior climb")
-            ctx.update(rung=chosen, rung_source="climb", rung_reason=f"rung {old} -> {chosen} ({reason})")
+        if reason is not None or chosen != rung:
+            ctx.update(rung=chosen, rung_source="climb",
+                       rung_reason=f"rung {old} -> {chosen} ({reason or 'prior climb'})")
     return ctx
 
 
@@ -1187,18 +1210,39 @@ def measured_output(fh, tail):
     return output
 
 
-def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None):
+def attempt_failure(code, pr_url, lane_failure):
+    if lane_failure and code != 0:
+        return "lane"
+    if code != 0 or not pr_url:
+        return "work"
+    return None
+
+
+def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_failure=False):
     tokens = getattr(output, "tokens", None)
     price = cfg.get("list_prices", {}).get(lane.get("model"), {})
     cost = None
     if tokens is not None and all(number(price.get(k)) is not None for k in tokens):
         cost = sum(tokens[k] * price[k] for k in tokens) / 1_000_000
+    pr_url = getattr(output, "pr_url", None)
     finish = {"event": "finish", "launch_id": launch_id, "finished_at": time.time() if now is None else now,
-              "exit_code": code, "pr_url": getattr(output, "pr_url", None), "tokens": tokens,
-              "cost_usd": cost, "cost_basis": "list-equivalent"}
+              "exit_code": code, "pr_url": pr_url, "tokens": tokens,
+              "cost_usd": cost, "cost_basis": "list-equivalent",
+              "failure": attempt_failure(code, pr_url, lane_failure)}
     append_launch(path, finish)
     attempt = dict(finish, rung=ctx["rung"])
     update_state(ctx["state_path"], ctx["job"], attempt)
+
+
+def record_no_lane(ctx, now=None):
+    if not ctx:
+        return
+    prior = read_state(ctx["state_path"]).get(ctx["job"])
+    if prior and prior.get("failure") == "work":
+        return
+    update_state(ctx["state_path"], ctx["job"], {
+        "event": "finish", "exit_code": 75, "pr_url": None, "failure": "lane",
+        "rung": ctx["rung"], "finished_at": time.time() if now is None else now})
 
 
 def append_launch(path, row):
@@ -2397,7 +2441,12 @@ def main(argv):
     if any(lane.get("credit") == "commandcode" for lane in lanes) and "credit:commandcode" not in pools:
         pools = dict(pools, **{"credit:commandcode": commandcode_pool(None, time.time(), cfg)})
     if args.lane_ok:
-        answer = lane_ok(args.lane_ok, lanes, pools, read_limits(), warn=warn)
+        try:
+            rung = rung_context(args.brief, LAUNCHES, args.lease) if cfg.get("rungs") else None
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            print(f"{args.lane_ok}: cannot resolve rung: {exc}")
+            return 3
+        answer = lane_ok(args.lane_ok, lanes, pools, read_limits(), warn=warn, rung=rung, cfg=cfg)
         print(" ".join(answer["reason"].splitlines()))
         return 0 if answer["allowed"] else 3
     burn = parse_burn(cfg, lanes)
@@ -2408,19 +2457,22 @@ def main(argv):
             if args.brief != "brief.txt":
                 parser.error("--run reads brief.txt; use --brief only for dry runs")
             return run_lanes(lanes, pools, cfg, warn, not_vendor=excluded or None, burn=burn, rung=rung)
-        result = (pick_rung(lanes, pools, cfg, rung, read_limits(), warn)[0] if rung
-                  else pick(lanes, pools, read_limits(), warn=warn, burn=burn))
+        if rung:
+            result, rung, _ = pick_rung(lanes, pools, cfg, rung, read_limits(), warn)
+        else:
+            result = pick(lanes, pools, read_limits(), warn=warn, burn=burn)
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print(f"plan-pick: cannot pick rung: {exc}", file=sys.stderr)
         return 1
+    resolved = f" Rung: {rung['rung']} ({rung['rung_reason']})." if rung else ""
     if args.json:
         print(json.dumps(result))
     elif result["command"]:
         vendor_flag = "".join(f" --not-vendor {name}" for name in excluded)
         print(f"Worker plan: {result['plan']}. Launch: ~/.local/bin/plan-pick --run{vendor_flag} (reads brief.txt, runs {result['command']}, "
-              f"moves to the next lane on a 429). Why: {result['reason']}.")
+              f"moves to the next lane on a 429). Why: {result['reason']}.{resolved}")
     else:
-        print(f"Worker plan: none. Why: {result['reason']}.")
+        print(f"Worker plan: none. Why: {result['reason']}.{resolved}")
     return 0
 
 
