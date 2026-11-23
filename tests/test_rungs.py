@@ -104,7 +104,8 @@ class RungTests(unittest.TestCase):
         comments = [[{"id": 3, "created_at": "2026-01-03", "body": "PASS\nVerifier model: strong"},
                      {"id": 1, "created_at": "2026-01-01", "body": "PASS\nOrdinary author comment"}],
                     [{"id": 2, "created_at": "2026-01-02", "body": "FAIL\nVerifier model: cheap"}]]
-        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, json.dumps(comments), ""))
+        run = mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 0, "".join(json.dumps(page) for page in comments), ""))
         original = pp.first_verdict
         with mock.patch.object(pp, "first_verdict", side_effect=lambda pr, cache: original(pr, cache, run)):
             climbed = self.context()
@@ -112,6 +113,29 @@ class RungTests(unittest.TestCase):
         self.assertEqual(climbed["rung"], "medium")
         self.assertIn("rung light -> medium (prior FAIL on PR 31)", climbed["rung_reason"])
         self.assertEqual(run.call_count, 1)
+
+    def test_first_verdict_reads_pages_from_a_gh_that_rejects_slurp(self):
+        fake = self.root / "fakebin"
+        fake.mkdir()
+        script = fake / "gh"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "PAGES = [[{'id': 3, 'created_at': '2026-01-03', 'body': 'PASS\\nVerifier model: strong'},\n"
+            "          {'id': 1, 'created_at': '2026-01-01', 'body': 'PASS\\nOrdinary author comment'}],\n"
+            "         [{'id': 2, 'created_at': '2026-01-02', 'body': 'FAIL\\nVerifier model: cheap'}]]\n"
+            "if '--slurp' in sys.argv[1:]:\n"
+            "    sys.stderr.write('unknown flag: --slurp')\n"
+            "    raise SystemExit(1)\n"
+            "if '--paginate' not in sys.argv[1:]:\n"
+            "    raise SystemExit(1)\n"
+            "sys.stdout.write(''.join(json.dumps(page) for page in PAGES))\n")
+        script.chmod(0o755)
+        with mock.patch.dict(os.environ, {"PATH": f"{fake}:/usr/bin:/bin"}):
+            self.assertEqual(pp.first_verdict("https://github.com/a/b/pull/31",
+                                              str(self.root / "cache.json")), "FAIL")
+        self.assertEqual(json.loads((self.root / "cache.json").read_text()),
+                         {"https://github.com/a/b/pull/31": "FAIL"})
 
     def test_finish_records_usage_and_counts_once_in_existing_pace_log(self):
         ctx = self.context()
@@ -189,19 +213,24 @@ class RungPreviewTests(unittest.TestCase):
         self.launches = self.home / ".local/state/token-ladder/launches.jsonl"
         self.lease = self.root / "T-1.json"
         self.lease.write_text(json.dumps({"ticket_id": "T-1"}))
+        self.ghbin = self.root / "ghbin"
+        self.ghbin.mkdir()
 
-    def env(self, lease=False):
+    def env(self, lease=False, gh=False):
         env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
                "PLAN_PICK_PACING_DIR": str(self.home / ".local/state/pacing"),
                "PLAN_PICK_LAUNCHES": str(self.launches),
                "TOKEN_LADDER_LOCAL_CONFIG": str(self.root / "missing.json")}
+        if gh:
+            env["PATH"] = f"{self.ghbin}:{env['PATH']}"
         if lease:
             env["PLAN_PICK_LEASE"] = str(self.lease)
         return env
 
-    def cli(self, *args, lease=False):
+    def cli(self, *args, lease=False, gh=False):
         return subprocess.run([sys.executable, str(self.repo / "bin/plan-pick"), "--pools", self.pools, *args],
-                              cwd=self.root, capture_output=True, text=True, env=self.env(lease), timeout=30)
+                              cwd=self.root, capture_output=True, text=True,
+                              env=self.env(lease, gh), timeout=30)
 
     def prior(self, **attempt):
         self.launches.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +277,22 @@ class RungPreviewTests(unittest.TestCase):
         self.prior(rung="medium", exit_code=75, pr_url=None)
         got = json.loads(self.cli("--json", lease=True).stdout)
         self.assertEqual((got["rung"], got["rung_source"]), ("medium", "brief line"))
+
+    def test_gh_that_fails_entirely_still_launches(self):
+        (self.ghbin / "gh").write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            "sys.stderr.write('gh: hard fail')\n"
+            "raise SystemExit(1)\n")
+        (self.ghbin / "gh").chmod(0o755)
+        self.prior(rung="medium", exit_code=0, pr_url="https://github.com/a/b/pull/31")
+        preview = self.cli(lease=True, gh=True)
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn("Worker plan: m", preview.stdout)
+        self.assertIn("Rung: medium (rung medium)", preview.stdout)
+        self.assertEqual(preview.stderr.splitlines(),
+                         ["plan-pick: cannot read verifier comments for a/b#31; verdict unknown, no climb"])
+        self.assertNotIn("cannot pick rung", preview.stderr)
 
     def test_no_lane_left_is_recorded_as_a_lane_failure_and_never_climbs(self):
         (self.repo / "config.json").write_text(json.dumps({
