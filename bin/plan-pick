@@ -31,13 +31,17 @@ PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
 FAST_FAIL_BEFORE_WORK_S = 30
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
-LAUNCHES = os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
+LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
 PI = os.path.expanduser("~/.npm-global/bin/pi")
 PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
 DEFAULT_CREDIT_FLOOR_USD = 2.0
 DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
+ANTIGRAVITY_LANE = "antigravity"
+ANTIGRAVITY_POOL = "google"
+DEFAULT_ANTIGRAVITY_RESERVE_SHARE_PCT = 100
+DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS = None
 DEFAULT_LOOP_BASE_SECONDS = 7200
 DEFAULT_LOOP_AHEAD_SECONDS = 10800
 DEFAULT_LOOP_FAR_AHEAD_SECONDS = 14400
@@ -131,7 +135,7 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
     for lane in lanes:
         name = lane["lane"]
         pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
-        if name == "google" or lane.get("pool") == "google" or (isinstance(pool, dict) and pool.get("chat_only")):
+        if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
             skipped[name] = "chat-only pool, never workers"
             continue
         until = number(limits.get(name))
@@ -254,12 +258,37 @@ def load_config():
     return cfg
 
 
-def lanes_from(cfg):
+def lane_first_until(lane):
+    raw = lane.get("first_until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    try:
+        return stamp.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def lanes_with_first(lanes, now=None):
+    now = time.time() if now is None else now
+    front = [lane for lane in lanes if (lane_first_until(lane) or 0) > now]
+    if not front:
+        return lanes
+    return front + [lane for lane in lanes if lane not in front]
+
+
+def lanes_from(cfg, now=None):
     lanes = cfg.get("lanes")
     if not isinstance(lanes, list):
         return []
-    return [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
-            and isinstance(lane.get("command"), str)]
+    usable = [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
+              and isinstance(lane.get("command"), str)]
+    return lanes_with_first(usable, now)
 
 
 def with_repo_visibility(pools, lanes, brief="brief.txt", run=subprocess.run):
@@ -329,8 +358,8 @@ def plan_line(plan, credit=None):
         usage = plan.get("usage") or {}
         used, limit, pace = (number(usage.get(key)) for key in ("used", "limit", "pace_ratio"))
         line += f" Pool: {plan['pool']}."
-        if plan.get("chat_only"):
-            line += " Chat-only, never workers."
+        if plan.get("shared_with_chats"):
+            line += " Shared with chats; the antigravity lane burns the full quota."
         line += f" Used: {used:g}" if used is not None else " Used: unknown"
         if usage.get("unit"):
             line += f" {usage['unit']}"
@@ -1072,6 +1101,68 @@ def read_pools(source):
     return json.loads(out)
 
 
+def reserve_share_pct(cfg):
+    got = number(cfg.get("antigravity_reserve_share_pct"))
+    return DEFAULT_ANTIGRAVITY_RESERVE_SHARE_PCT if got is None else got
+
+
+def max_daily_runs(cfg):
+    got = number(cfg.get("antigravity_max_daily_runs"))
+    return DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS if got is None else got
+
+
+def midnight(now):
+    return datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def today_launches(path, lane, now):
+    start = midnight(now)
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return 0
+    count = 0
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("lane") != lane:
+            continue
+        at = number(row.get("at"))
+        if at is not None and start <= at <= now:
+            count += 1
+    return count
+
+
+def antigravity_reserve(pool, cfg, ran):
+    used, limit = number(pool.get("used")), number(pool.get("limit"))
+    if limit is not None and limit > 0:
+        share = reserve_share_pct(cfg)
+        if share < 100 and used is not None and used >= limit * share / 100:
+            return f"daily limit: {used:g} of {limit:g} today is at or past {share:g}%"
+        return None
+    cap = max_daily_runs(cfg)
+    if cap is not None and ran >= cap:
+        return f"daily cap: {ran:g} worker runs today, cap {cap:g}"
+    return None
+
+
+def with_antigravity_reserve(pools, cfg, now=None, path=LAUNCHES):
+    pools = pools if isinstance(pools, dict) else {}
+    pool = pools.get(ANTIGRAVITY_POOL)
+    if not isinstance(pool, dict) or pool.get("state") == "OFF":
+        return pools
+    now = time.time() if now is None else now
+    why = antigravity_reserve(pool, cfg, today_launches(path, ANTIGRAVITY_LANE, now))
+    if not why:
+        return pools
+    pools = dict(pools)
+    pools[ANTIGRAVITY_POOL] = dict(pool, state="OFF", note=why)
+    return pools
+
+
 def with_opencode(pools, cfg, now=None, limits_path=LIMITS):
     pools = pools if isinstance(pools, dict) else {}
     if "opencode" not in pools:
@@ -1208,6 +1299,7 @@ def main(argv):
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
         return 1
+    pools = with_antigravity_reserve(pools, cfg)
     if args.claude_helper:
         answer = claude_helper(pools, warn)
         if args.json:

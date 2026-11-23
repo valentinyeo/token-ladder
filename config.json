@@ -28,6 +28,14 @@
       "command": "~/.npm-global/bin/pi -p --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
+      "lane": "antigravity",
+      "vendor": "google",
+      "pool": "google",
+      "shared_with_chats": true,
+      "print_timeout": "45m",
+      "command": "~/.local/bin/agy --print \"$(cat brief.txt)\" --model gemini-4-neon-high --dangerously-skip-permissions --print-timeout 45m --output-format json </dev/null"
+    },
+    {
       "lane": "vercel",
       "credit": "vercel",
       "vendor": "deepseek",
@@ -59,6 +67,7 @@
       "lane": "cursor",
       "vendor": "cursor",
       "pool": "grok",
+      "first_until": "2026-11-24T23:59:00Z",
       "command": "~/.local/bin/cursor-agent -p --force --output-format text --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
     }
   ],
@@ -119,7 +128,7 @@
       "name": "Google Antigravity plan",
       "vendor": "google",
       "pool": "google",
-      "chat_only": true,
+      "shared_with_chats": true,
       "included_models": ["Gemini 4 Neon"],
       "runs_on": ["local"],
       "extra_cost": "none within the plan quota; never buys overages",
@@ -147,6 +156,8 @@
       "source": "unknown"
     }
   ],
+  "opencode_monthly_slack_pct": 25,
+  "antigravity_reserve_share_pct": 100,
   "limited_hours": 1,
   "pool_off_pct": 95,
   "claude_floor_percent": 15,
