@@ -26,9 +26,9 @@ While `until` is in the future, `plan-pick` runs that lane first and ignores its
 
 ## Worker lanes
 
-`plan-pick` runs a background worker on the first lane in `config.json` `lanes` that is free.
+`plan-pick` runs a background worker on the first free lane allowed by its rung in `config.json`.
 
-The Cursor lane runs first while its `first_until` time is in the future (`2026-11-24T23:59:00Z`, when Valentin's Cursor plan ends). After that time the order is the table below.
+For the default medium rung, the Cursor lane runs first while its `first_until` time is in the future (`2026-11-24T23:59:00Z`, when Valentin's Cursor plan ends). After that time the order is the table below.
 
 | Order | Lane | Included usage / credit |
 |---|---|---|
@@ -39,6 +39,44 @@ The Cursor lane runs first while its `first_until` time is in the future (`2026-
 | 5 | OpenRouter | Prepaid credit |
 | 6 | Codex | Subscription pool |
 | 7 | Cursor | Subscription pool; last after `first_until` |
+
+### Worker rungs and first-review cost
+
+The goal is the cheapest model that passes its first review. Starting rungs per model need a later eval. This change supplies the measurement and climb mechanism, not that eval.
+
+Add one line to `brief.txt`:
+
+```text
+Rung: light
+```
+
+The values are `light`, `medium`, and `hard`. No line means `medium`. Invalid or duplicate lines are errors. `plan-pick --run` and dry-run picks read this line. Use `--brief FILE` to preview another brief without running a worker.
+
+`config.json` `rungs` lists allowed lanes in order. Each entry can override `model` and `effort`.
+
+- Light uses DeepSeek Flash lanes and the pinned Vercel GLM 5.3 Flash lane, at low effort.
+- Medium keeps the existing order, including the temporary Cursor priority.
+- Hard allows only Codex `gpt-6.1-sol` at high effort and Antigravity `gemini-4-neon-high`.
+
+Pool limits, credit floors, manual skips, and pace apply within each rung. No capacity in light or medium climbs to the next rung. No capacity in hard makes `--run` exit 75, meaning wait. Rung picks never use the legacy least-ahead-of-pace fallback or bypass pace through a burn override.
+
+A nonzero exit, no PR URL in the worker's final answer, or the PR's first verifier FAIL raises the next run one rung. A later PASS does not erase a first FAIL. A successful retry keeps its climbed rung. A failed hard run stays hard and appears in the report's `hard_failed` count.
+
+The job identity is its lease ticket id, otherwise the SHA-256 of the brief. The picker detects its own ancestor's local fleet lease. You can also pass `--lease FILE` or set `PLAN_PICK_LEASE`. A lease receipt can supply `ticket_id`, `ticket`, or `key`; fleet receipts use the ticket filename. `rung-attempts.json` beside `launches.jsonl` stores the latest attempt per job. Neither file contains brief text.
+
+New launches append linked start and finish records. Start records contain rung, rung source, lane, model, effort, and ticket. Finish records contain exit code, PR URL, run-local input/cached/output tokens, and USD cost. JSON output from pi, hax, Antigravity, and Cursor supplies usage. Missing usage stays unknown, never zero. Input counts exclude cached reads. Prices in `list_prices` are USD per million tokens. All costs are labelled `list-equivalent`, including subscription lanes; these are comparison costs, not invoices.
+
+```sh
+plan-pick --rung-report --last 50
+```
+
+The metric is total cost of the last N finished launches divided by the count that passed first review. Lower is better. Failed attempts remain in the numerator. The report prints job, pass, unknown, and error counts, then first-pass rate and average known cost per rung and model. Review rates exclude unknown verdicts and include run failures. Errors count failed runs, malformed records, and failed review reads. Any missing cost makes the overall metric unavailable. No passes also makes it unavailable. Unknown reviews make the result provisional.
+
+The command reads each PR's earliest verifier PASS/FAIL comment through `gh api --paginate`. It caches definitive verdicts in `verifier-cache.json` beside the launch log. Ordinary author comments do not count. Old launch records remain readable, but lack finish data; `legacy_missing_finish` reports how many cannot enter this metric. `unfinished` counts new launches without a finish.
+
+`tests/fixtures/rung-report.json` fixes the sensitivity workload. Two cheap FAILs and one strong PASS cost $1.20 per first-pass job. If all three pass at the same costs, the metric is $0.40. The fixture makes no claim about actual model quality.
+
+Never use Hypertask `brain-*` labels or any ticket difficulty tag to select a rung. Never make an extra model call to judge difficulty. Only the brief and recorded outcomes select the rung.
 
 ### Antigravity worker lane
 
