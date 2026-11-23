@@ -1,0 +1,24 @@
+{
+  "plans": [
+    {
+      "name": "Cloud workshop",
+      "vendor": "workshop",
+      "runs_on": ["cloud"]
+    },
+    {
+      "name": "Hybrid studio",
+      "vendor": "studio",
+      "runs_on": ["local", "cloud"]
+    },
+    {
+      "name": "Local editor",
+      "vendor": "editor",
+      "runs_on": ["local"]
+    },
+    {
+      "name": "Unknown plan",
+      "vendor": "unknown"
+    }
+  ],
+  "lanes": []
+}

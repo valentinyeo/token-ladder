@@ -12,7 +12,7 @@ Subcommands:
   hook-bash      PreToolUse(Bash) hook: refuse disallowed models and paid fallbacks
   hook-agent     PreToolUse(Agent) hook: respect the Claude pool
 """
-import argparse, fcntl, glob, html, json, math, os, re, selectors, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request
+import argparse, fcntl, glob, html, importlib.machinery, importlib.util, json, math, os, re, selectors, shlex, shutil, signal, socket, subprocess, sys, tempfile, time, urllib.request
 from datetime import datetime, timezone
 
 HOME = os.path.expanduser("~")
@@ -1293,52 +1293,307 @@ def usage_line(w):
     return f'{w["used"]:.0f}% used, {pace_word(w)}, resets {reset_clock(w)}, in {w["hours_left"]:.0f} h'
 
 
+_PLAN_PICK = None
+
+
+def load_plan_pick():
+    global _PLAN_PICK
+    if _PLAN_PICK is None:
+        path = os.path.join(REPO, "bin", "plan-pick")
+        loader = importlib.machinery.SourceFileLoader("token_ladder_plan_pick", path)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        _PLAN_PICK = module
+    return _PLAN_PICK
+
+
+def dashboard_data(s):
+    pp = load_plan_pick()
+    ts = s.get("ts")
+    now = float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else time.time()
+    cfg = s.get("config") if isinstance(s.get("config"), dict) else load_config()
+    pools = s["pools"] if isinstance(s.get("pools"), dict) else current_pools(s, now)
+    pacing_dir = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.join(HOME, ".local/state/pacing")
+    launches_path = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.join(STATE, "launches.jsonl")
+    return pp.dashboard_snapshot(
+        cfg,
+        pools=pools,
+        now=now,
+        limits=s.get("limits"),
+        credits_data=s.get("credits"),
+        limits_path=os.path.join(STATE, "lane-limits.json"),
+        credits_path=os.path.join(STATE, "lane-credits.json"),
+        pacing_dir=pacing_dir,
+        sessions=os.path.join(HOME, ".pi/agent/sessions"),
+        launches_path=launches_path,
+        allow_live=False,
+    )
+
+
+def _num(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) else None
+
+
+def _pct_text(value):
+    return f"{value:.0f}%" if abs(value - round(value)) < 0.05 else f"{value:.1f}%"
+
+
+def _fmt_reset(item, now, pp):
+    usage = item.get("usage") or {}
+    raw = usage.get("resets_at")
+    if raw is None and isinstance(item.get("credit"), dict):
+        raw = item["credit"].get("resets_at")
+    ts = pp.to_timestamp(raw)
+    if ts is None:
+        return "unknown"
+    stamp = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if ts > now:
+        return f"{stamp} (in {(ts - now) / 3600:.0f} h)"
+    return stamp
+
+
+def _usd_text(value):
+    return f"-${abs(value):.2f}" if value < 0 else f"${value:.2f}"
+
+
+def _fmt_used_limit(item, openrouter=None):
+    usage = item.get("usage") or {}
+    used_pct = _num(usage.get("used_pct"))
+    used = _num(usage.get("used"))
+    limit = _num(usage.get("limit"))
+    unit = usage.get("unit") or ""
+    usd_per_cycle = _num(item.get("usd_per_cycle"))
+    credits_usd = _num(usage.get("credits_usd"))
+    allowance = _num(usage.get("included_allowance_usd")) or _num(item.get("included_allowance_usd"))
+    used_usd = _num(usage.get("used_usd"))
+    if used_pct is not None and allowance is not None:
+        part = f"{_pct_text(used_pct)} / 100%"
+        if used_usd is not None:
+            part += f" ({_usd_text(used_usd)} / ${allowance:g} included)"
+        if credits_usd is not None:
+            floor = _num(usage.get("credit_floor_usd"))
+            floor_s = f" (floor ${floor:g})" if floor is not None else ""
+            part += f"; {_usd_text(credits_usd)} prepaid left{floor_s}"
+        return part, max(0.0, min(100.0, used_pct))
+    if usd_per_cycle is not None and usd_per_cycle > 0 and credits_usd is not None:
+        spent = max(0.0, usd_per_cycle - credits_usd)
+        pct = max(0.0, min(100.0, spent / usd_per_cycle * 100))
+        return f"{_usd_text(spent)} / ${usd_per_cycle:g} ({_usd_text(credits_usd)} left)", pct
+    if used_pct is not None:
+        return f"{_pct_text(used_pct)} / 100%", max(0.0, min(100.0, used_pct))
+    if used is not None or limit is not None or unit:
+        u_s = f"{used:g}" if used is not None else "unknown"
+        l_s = f"{limit:g}" if limit is not None else "unknown"
+        suffix = f" {unit}" if unit else ""
+        pct = max(0.0, min(100.0, used / limit * 100)) if used is not None and limit is not None and limit > 0 else None
+        return f"{u_s} / {l_s}{suffix}", pct
+    if credits_usd is not None:
+        return f"{_usd_text(credits_usd)} credit left", None
+    if item.get("pool_key") == "credit:commandcode":
+        return "unknown / 70 plan credits", None
+    if item.get("vendor") == "openrouter" and isinstance(openrouter, dict):
+        if _num(openrouter.get("usage")) is not None:
+            lim = _num(openrouter.get("limit"))
+            return (f"{_usd_text(openrouter['usage'])} / ${lim:g}" if lim is not None else f"{_usd_text(openrouter['usage'])} spent"), None
+    return "unknown", None
+
+
+def _fmt_pace(usage):
+    ratio = _num((usage or {}).get("pace_ratio"))
+    return f"{ratio:.2f}x" if ratio is not None else "unknown"
+
+
+def _badge(text, cls="muted"):
+    return f'<span class="badge {cls}">{html.escape(text)}</span>'
+
+
 def render_dashboard(s):
+    pp = load_plan_pick()
+    snap = dashboard_data(s)
+    now = snap["now"]
+    cfg = s.get("config") if isinstance(s.get("config"), dict) else load_config()
+    claude = s.get("claude") if isinstance(s.get("claude"), dict) else {}
+    codex = s.get("codex") if isinstance(s.get("codex"), dict) else {}
+    claude_week = claude.get("week") or {"used": None}
+    claude_5h = claude.get("five_hour") or {"used": None}
+    codex_week = codex.get("week") or {"used": None}
+    codex_5h = codex.get("five_hour") or {"used": None}
+    openrouter = s.get("openrouter") if isinstance(s.get("openrouter"), dict) else {}
+
     def bar(label, w, note=""):
-        if w["used"] is None:
-            return f'<div class="row"><div class="lbl">{label}</div><div class="muted">unknown {html.escape(note)}</div></div>'
+        if w.get("used") is None:
+            return f'<div class="row"><div class="lbl">{html.escape(label)}</div><div class="muted">unknown {html.escape(note)}</div></div>'
         tick = f'<div class="tick" style="left:{w["time_gone"]}%" title="time gone"></div>'
         cls = "hot" if w["used"] >= 90 else ("behind" if w["time_gone"] - w["used"] > 10 else "")
-        return (f'<div class="row"><div class="lbl">{label}</div><div class="track"><div class="fill {cls}" '
-                f'style="width:{w["used"]}%"></div>{tick}</div><div class="num">{usage_line(w)}</div></div>')
+        return (f'<div class="row"><div class="lbl">{html.escape(label)}</div><div class="track"><div class="fill {cls}" '
+                f'style="width:{w["used"]}%"></div>{tick}</div><div class="num">{html.escape(usage_line(w))}</div></div>')
 
-    when = datetime.fromtimestamp(s["ts"], timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
-    resets = "".join(f"<li>Codex full reset, expires {html.escape(r['expires'])}</li>" for r in s["config"].get("codex_resets", []))
-    o = s["openrouter"]
-    orr = f"${o['usage']:.2f} spent" if o["usage"] is not None else html.escape(o["error"] or "unknown")
+    def render_plan_card(item):
+        usage = item.get("usage") or {}
+        used_limit, pct = _fmt_used_limit(item, openrouter)
+        pace = _fmt_pace(usage)
+        reset = _fmt_reset(item, now, pp)
+        badges = [_badge(item["status"], item["status_kind"])]
+        if "cloud" in item.get("runs_on", []):
+            badges.append(_badge("Cloud agents", "info"))
+        if item.get("shared_with_chats"):
+            badges.append(_badge("shared with chats", "info"))
+        if item.get("chat_only"):
+            badges.append(_badge("chat-only", "muted"))
+        if item.get("public_only"):
+            badges.append(_badge("public repos only", "info"))
+        meta_parts = []
+        if item.get("models"):
+            meta_parts.append(", ".join(str(m) for m in item["models"]))
+        if item.get("pool_key"):
+            meta_parts.append(f"pool: {item['pool_key']}")
+        if item.get("lanes"):
+            meta_parts.append("lanes: " + ", ".join(item["lanes"]))
+        elif item.get("chat_only") or item.get("pool_key") == "claude":
+            meta_parts.append("no worker lane")
+        if item.get("runs_on"):
+            meta_parts.append("runs on " + ", ".join(str(r) for r in item["runs_on"]))
+        meta = " · ".join(meta_parts)
+        bar_html = ""
+        if pct is not None:
+            elapsed = _num(usage.get("elapsed_pct"))
+            tick = f'<div class="tick" style="left:{elapsed}%" title="time gone"></div>' if elapsed is not None else ""
+            fill_cls = "hot" if item["status_kind"] == "hot" or pct >= 90 else (
+                "behind" if elapsed is not None and elapsed - pct > 10 else "")
+            bar_html = f'<div class="track"><div class="fill {fill_cls}" style="width:{pct:.1f}%"></div>{tick}</div>'
+        notes = []
+        if item.get("skip"):
+            sk = item["skip"]
+            label = "Used up / skipped" if item.get("used_up") else "Skipped"
+            notes.append(f"{label} until {sk['until_text']} ({sk['reason']})")
+        if usage.get("used_up") and usage.get("used_up_at"):
+            notes.append(f"Used up at {usage['used_up_at']}")
+        elif item.get("used_up") and not item.get("skip") and not usage.get("note"):
+            notes.append("Used up")
+        if usage.get("credits") is not None:
+            notes.append(f"Approved credits left: {usage['credits']:,.0f}")
+        if usage.get("note"):
+            notes.append(str(usage["note"]))
+        if item.get("extra_cost"):
+            notes.append(f"Cost: {item['extra_cost']}")
+        note_html = "".join(f'<div class="note">{html.escape(n)}</div>' for n in notes)
+        return (f'<div class="card"><div class="card-head"><b>{html.escape(item["name"])}</b> '
+                f'{" ".join(badges)}</div>'
+                f'<div class="muted small">{html.escape(meta)}</div>'
+                f'{bar_html}'
+                f'<div class="kv"><span><b>Used / limit:</b> {html.escape(used_limit)}</span>'
+                f'<span><b>Pace:</b> {html.escape(pace)}</span>'
+                f'<span><b>Reset:</b> {html.escape(reset)}</span></div>'
+                f'{note_html}</div>')
+
+    def render_lane_row(item):
+        usage = item.get("usage") or {}
+        used_limit, _ = _fmt_used_limit(item, openrouter)
+        pace = _fmt_pace(usage)
+        reset = _fmt_reset(item, now, pp)
+        flags = []
+        if item.get("shared_with_chats"):
+            flags.append("shared with chats")
+        if item.get("chat_only"):
+            flags.append("chat-only")
+        if item.get("public_only"):
+            flags.append("public repos only")
+        if item.get("first_until"):
+            stamp = datetime.fromtimestamp(item["first_until"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            flags.append(f"first until {stamp}")
+        if item.get("burn_until"):
+            stamp = datetime.fromtimestamp(item["burn_until"], timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            flags.append(f"burn until {stamp}")
+        detail_parts = []
+        if item.get("skip"):
+            sk = item["skip"]
+            detail_parts.append(f"skipped until {sk['until_text']} ({sk['reason']})")
+        elif item.get("reason"):
+            detail_parts.append(str(item["reason"]))
+        if flags:
+            detail_parts.append("; ".join(flags))
+        return (f'<tr><td><b>{html.escape(item["lane"])}</b></td>'
+                f'<td>{html.escape(item.get("pool_key") or "-")}</td>'
+                f'<td>{_badge(item["status"], item["status_kind"])}</td>'
+                f'<td>{html.escape(used_limit)}</td>'
+                f'<td>{html.escape(pace)}</td>'
+                f'<td>{html.escape(reset)}</td>'
+                f'<td class="small">{html.escape(" · ".join(detail_parts))}</td></tr>')
+
+    when = datetime.fromtimestamp(now, timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+    plans_html = "".join(render_plan_card(item) for item in snap["plans"])
+    lanes_rows = "".join(render_lane_row(item) for item in snap["lanes"])
+    picked = snap.get("picked")
+    picked_html = ""
+    if isinstance(picked, dict):
+        picked_html = (f'<div class="muted small">Next worker lane: <b>{html.escape(str(picked.get("plan")))}</b>'
+                       f' — {html.escape(str(picked.get("reason") or ""))}</div>')
+    lanes_section = (f'<section><b>Worker lanes</b> (plan-pick order){picked_html}'
+                     f'<div class="table-wrap"><table><thead><tr><th>Lane</th><th>Pool</th><th>Status</th>'
+                     f'<th>Used / limit</th><th>Pace</th><th>Reset</th><th>Skip / note</th></tr></thead>'
+                     f'<tbody>{lanes_rows}</tbody></table></div></section>') if snap["lanes"] else ""
+    skips_section = ""
+    if snap["skips"]:
+        skip_items = "".join(
+            f'<li><b>{html.escape(sk["lane"])}</b>: skipped until {html.escape(sk["until_text"])} '
+            f'({html.escape(sk["until_iso"])}) — {html.escape(sk["reason"])}</li>'
+            for sk in snap["skips"])
+        skips_section = f'<section><b>Manual skips</b> (lane-limits.json)<ul>{skip_items}</ul></section>'
+    resets = "".join(f"<li>Codex full reset, expires {html.escape(r['expires'])}</li>" for r in cfg.get("codex_resets", []))
     standalone = "".join(
         f'<section><b>{html.escape(a["label"])}</b> (separate plan, no ladder, use it up by its reset)<div class="muted">Login: '
         f'{html.escape(str(a["email"]))} on {html.escape(a["host"])}</div>{bar("Week", a["week"])}{bar("5 hours", a["five_hour"])}'
-        f'<div>{html.escape(a["note"] or "")}</div></section>' for a in s.get("accounts", []) if not a["in_ladder"])
+        f'<div>{html.escape(a["note"] or "")}</div></section>' for a in s.get("accounts", []) if not a.get("in_ladder"))
     claude_resets = "".join(f"<li>Claude (Valentin Yeo / Hypertask) full reset, expires {html.escape(r['expires'][:10])}</li>"
-                            for r in s["config"].get("claude_resets", []))
+                            for r in cfg.get("claude_resets", []))
     claude_resets += "".join(f"<li>{html.escape(a['label'])} Claude full reset, expires {html.escape(r['expires'][:10])}</li>"
                              for a in s.get("accounts", []) for r in a.get("resets", []))
-    fw = s["claude"].get("fable")
+    fw = claude.get("fable")
     if fw:
         standalone = (f'<section><b>Fable</b> (not extra: a share of the Claude week, max {fw.get("max_share_of_weekly")}%). '
                       f'Allowed as advisor in CLAUDE mode only.{bar("Fable", fw)}</section>') + standalone
-    advice = "".join(f"<li>{html.escape(a)}</li>" for a in s["advice"]) or "<li>Nothing to do.</li>"
+    resources = s.get("resources") if isinstance(s.get("resources"), dict) and "ram_free_gb" in s.get("resources", {}) else None
+    server_section = (
+        f'<section><b>Server</b> ({"TIGHT: new helpers paused" if resources.get("pressure") == "tight" else "ok"})'
+        f'<div class="muted">{html.escape(resources_line(resources))}</div>{resource_chart(now)}</section>'
+    ) if resources else ""
+    advice = "".join(f"<li>{html.escape(a)}</li>" for a in s.get("advice", [])) or "<li>Nothing to do.</li>"
+    mode = str(s.get("mode") or "unknown").upper()
+    why = str(s.get("why") or "")
+    override = str(s.get("override") or "auto")
+    floor_pct = cfg.get("claude_floor_percent", 15)
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>Token ladder</title>
 <meta http-equiv="refresh" content="300"><meta name="viewport" content="width=device-width">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/geist@1/dist/fonts/geist-sans/style.css">
-<style>body{{font-family:'Geist Sans',system-ui,sans-serif;background:#0a0a0a;color:#ededed;max-width:760px;margin:40px auto;padding:0 20px}}
-h1{{font-size:22px;margin:0 0 4px}}.muted{{color:#888}}.mode{{font-size:28px;font-weight:600;margin:20px 0 4px}}
-.row{{display:grid;grid-template-columns:140px 1fr 200px;gap:12px;align-items:center;margin:14px 0}}
-.track{{position:relative;height:14px;background:#222;border-radius:7px;overflow:hidden}}
+<style>body{{font-family:'Geist Sans',system-ui,sans-serif;background:#0a0a0a;color:#ededed;max-width:960px;margin:40px auto;padding:0 20px}}
+h1{{font-size:22px;margin:0 0 4px}}.muted{{color:#888}}.small{{font-size:13px}}.mode{{font-size:28px;font-weight:600;margin:20px 0 4px}}
+.row{{display:grid;grid-template-columns:140px 1fr 220px;gap:12px;align-items:center;margin:14px 0}}
+.track{{position:relative;height:14px;background:#222;border-radius:7px;overflow:hidden;margin:6px 0}}
 .fill{{height:100%;background:#3b82f6}}.fill.behind{{background:#f59e0b}}.fill.hot{{background:#ef4444}}
 .tick{{position:absolute;top:0;width:2px;height:100%;background:#fff}}.num{{font-size:13px;color:#aaa}}
-section{{border-top:1px solid #222;margin-top:24px;padding-top:12px}}</style></head><body>
-<h1>Token ladder</h1><div class="muted">Checked {when}. Updates every 5 minutes. White line = how much of the window has passed; a bar left of it is being underused.</div>
-<div class="mode">{s['mode'].upper()} mode</div><div class="muted">{html.escape(s['why'])}. Override: {s['override']}.</div>
-<section><b>{html.escape(s['config'].get('ladder_name', 'Ladder'))} ladder</b> (all non-Client projects, user valentin on the primary server and the mirror server)<div class="muted">Claude login: {html.escape(str(s['claude'].get('email')))} · Codex login: {html.escape(str(s['codex'].get('email')))}</div>{bar('Claude week', s['claude']['week'], s['claude'].get('error') or '')}{bar('Claude 5 hours', s['claude']['five_hour'])}
-{bar('Codex week', s['codex']['week'], s['codex'].get('error') or '')}{bar('Codex 5 hours', s['codex']['five_hour'], '(not reported for this plan)')}</section>
-<section><b>Server</b> ({'TIGHT: new helpers paused' if s['resources']['pressure'] == 'tight' else 'ok'})<div class="muted">{html.escape(resources_line(s['resources']))}</div>{resource_chart(s['ts'])}</section>
-{standalone}<section><b>Bonus resets</b> (pressed by Valentin)<ul>{resets}{claude_resets}</ul></section>
+section{{border-top:1px solid #222;margin-top:24px;padding-top:12px}}
+.card{{border:1px solid #222;border-radius:8px;padding:12px 14px;margin:12px 0;background:#111}}
+.card-head{{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-bottom:4px}}
+.kv{{display:flex;flex-wrap:wrap;gap:14px;font-size:13px;color:#ccc;margin-top:6px}}
+.note{{font-size:12px;color:#aaa;margin-top:4px}}
+.badge{{display:inline-block;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:600;letter-spacing:.02em}}
+.badge.ok{{background:#14532d;color:#86efac}}.badge.warn{{background:#78350f;color:#fde68a}}
+.badge.hot{{background:#7f1d1d;color:#fecaca}}.badge.info{{background:#1e3a8a;color:#bfdbfe}}
+.badge.muted{{background:#262626;color:#a3a3a3}}
+.table-wrap{{overflow-x:auto;margin-top:10px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th,td{{text-align:left;padding:8px 8px;border-bottom:1px solid #222;vertical-align:top}}
+th{{color:#888;font-weight:500}}</style></head><body>
+<h1>Token ladder</h1><div class="muted">Checked {html.escape(when)}. Updates every 5 minutes. White line = how much of the window has passed; a bar left of it is being underused.</div>
+<div class="mode">{html.escape(mode)} mode</div><div class="muted">{html.escape(why)}. Override: {html.escape(override)}.</div>
+<section><b>{html.escape(cfg.get('ladder_name', 'Ladder'))} ladder</b> (all non-Client projects, user valentin on the primary server and the mirror server)<div class="muted">Claude login: {html.escape(str(claude.get('email')))} · Codex login: {html.escape(str(codex.get('email')))}</div>{bar('Claude week', claude_week, claude.get('error') or '')}{bar('Claude 5 hours', claude_5h)}
+{bar('Codex week', codex_week, codex.get('error') or '')}{bar('Codex 5 hours', codex_5h, '(not reported for this plan)')}</section>
+<section><b>Plans and pools</b> (from plan-pick config, readers and lane-limits){plans_html}</section>
+{lanes_section}{skips_section}{server_section}{standalone}<section><b>Bonus resets</b> (pressed by Valentin)<ul>{resets}{claude_resets}</ul></section>
 <section><b>Global resets</b> (whenaireset.com, last 30 days): Codex {(s.get('global_resets') or {}).get('codex', {}).get('direct_30d', '?')}, Claude {(s.get('global_resets') or {}).get('claude', {}).get('direct_30d', '?')}. Frequent resets wipe unused room early, so the ladder treats that plan's week as shorter and burns it sooner.</section>
-<section><b>Codex credits</b> (used only after the weekly limit is hit): {html.escape(str(s['codex'].get('credits')))}<br><b>OpenRouter</b> (pay as you go, only with Valentin's yes): {orr}<br><b>Cursor</b>: reserved for the grok bot, not tracked yet.</section>
 <section><b>Advice</b><ul>{advice}</ul></section>
-<section class="muted">Claude keeps a {s['config']['claude_floor_percent']}% floor for orchestrator sessions. Repo: https://github.com/valentinyeo/token-ladder</section>
+<section class="muted">Claude keeps a {floor_pct}% floor for orchestrator sessions. Repo: https://github.com/valentinyeo/token-ladder</section>
 </body></html>"""
 
 
