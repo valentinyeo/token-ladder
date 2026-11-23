@@ -1266,6 +1266,16 @@ class ChatOnlyPoolTests(unittest.TestCase):
 class WorkerEnvTests(unittest.TestCase):
     def setUp(self):
         self.shims = str(Path(REPO).resolve() / "bin" / "worker-shims")
+        self.vstack_shims = os.path.expanduser("~/.local/state/vstack/worker-shims")
+
+    def test_path_starts_with_both_shim_folders(self):
+        env = pp.worker_env({"HOME": "/tmp/worker-home", "PATH": "/usr/bin:/bin"})
+        entries = env["PATH"].split(os.pathsep)
+        self.assertEqual(entries[:2], [self.shims, self.vstack_shims])
+
+    def test_path_holds_only_the_two_shim_folders_when_parent_path_is_empty(self):
+        env = pp.worker_env({"HOME": "/tmp/worker-home"})
+        self.assertEqual(env["PATH"].split(os.pathsep), [self.shims, self.vstack_shims])
 
     def test_env_drops_the_board_login_and_keeps_the_rest(self):
         env = pp.worker_env({"HOME": "/tmp/worker-home", "PATH": "/usr/bin:/bin",
@@ -1277,7 +1287,7 @@ class WorkerEnvTests(unittest.TestCase):
         self.assertNotIn("MULTIPROMPT_OTHER", env)
         self.assertEqual(env["HOME"], "/tmp/worker-home")
         self.assertEqual(env["PLAN_PICK_WORKER"], "1")
-        self.assertEqual(env["PATH"], self.shims + os.pathsep + "/usr/bin:/bin")
+        self.assertEqual(env["PATH"], os.pathsep.join([self.shims, self.vstack_shims, "/usr/bin:/bin"]))
 
     def test_shims_answer_before_the_real_board_cli(self):
         for name in ("ht", "hypertask"):

@@ -20,7 +20,8 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_PACE_WARN = 1.1
 DEFAULT_LIMITED_HOURS = 1.0
 DEFAULT_CREDIT_LIMITED_HOURS = 12.0
-WORKER_SHIMS = os.path.join(HERE, "worker-shims")
+WORKER_SHIMS = os.pathsep.join([os.path.join(HERE, "worker-shims"),
+                               os.path.expanduser("~/.local/state/vstack/worker-shims")])
 TAIL_CHARS = 20000
 ERROR_CHARS = 4000
 CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|credits?|funds|quota)|"
