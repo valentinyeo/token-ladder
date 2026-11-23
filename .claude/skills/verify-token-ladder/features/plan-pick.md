@@ -9,6 +9,7 @@ plan-pick chooses a worker lane from pool state, prints human or JSON plans, gat
 - `plans-list` lists configured lanes and the no-extra-cost rule.
 - `loop-interval` prints sleep seconds from Claude pace state.
 - `claude-helper` allows or refuses Sonnet helper use from pool pace.
+- `lane-ok` checks a named lane or vendor with no fallback or burn exception. Exit `0` allows it; exit `3` prints one refusal reason. `--cloud` checks the same shared subscription pool for a cloud launch. Cursor uses `grok`, Codex uses `codex`, Claude uses `claude`, Antigravity uses `google`, and credit lanes use their own balances.
 - `run-stub` runs a stub lane command end to end without real spend.
 - `prepaid-credit` uses live OpenCode credit or a balance anchor less recorded run costs for at most seven days, stops at $2, names the monthly renewal date once the floor is reached, and clears that floor lock on a later live read above the floor.
 - `burn` reports current-month recorded pi costs and the separate measured 30-day DeepSeek direct account total.
@@ -39,6 +40,7 @@ Preconditions:
 - **CommandCode fixture and refusal.** Run `timeout 180 python3 -m unittest discover -s tests -p test_commandcode.py -v`. Exit `0`. The fixture reader preserves 70 monthly credits and 14/35 window caps. A stub `gh` marks the brief's target PRIVATE, and `--run` uses the next lane even with CommandCode burn enabled; PUBLIC runs the CommandCode stub. No production model call occurs.
 - **Loop interval.** Run `bin/plan-pick --pools "$HOME/pools.json" --loop-interval --json` with pools `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.16}}`. Exit `0`. stdout JSON has `"seconds":10800` and `"reason":"claude pace 1.16x ahead"`.
 - **Claude helper refused.** Run `bin/plan-pick --pools "$HOME/pools.json" --claude-helper` with `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.8}}`. Exit `3`. stdout starts with `Claude helper: refused.`
+- **Lane gate.** Run `bin/plan-pick --pools "$HOME/pools.json" --lane-ok codex --cloud` with `{"codex":{"state":"ON","used_pct":40,"pace_ratio":0.5}}`. Exit `0`, stdout `codex: allowed`. Change the ratio to `1.5`. Exit `3`, stdout `codex: pace 1.50x is above 1.1x`, even if every other lane is unavailable. Run `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k LaneOkTests` for skip expiry, vendor mapping, credit floors, Claude and prepaid cases.
 - **Stub run.** In a temp dir, copy `bin/plan-pick`, write `config.json` with lanes `a` (`echo '429'; exit 1`) then `b` (`echo worker-done`), empty pools file, run `bin/plan-pick --pools "$HOME/pools.json" --run`. Exit `0`. stdout contains `worker-done`. stderr mentions `lane a hit a rate or usage limit`.
 - **Real antigravity run.** Once, with a scratch clone and a one-file brief, run `bin/plan-pick --run` on a config whose only lane is `antigravity`, with `PLAN_PICK_LAUNCHES` under the temp home. Exit `0` and the repository gains the file the brief asked for. This spends plan quota; do it once per change, never in a loop.
 

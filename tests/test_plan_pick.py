@@ -104,6 +104,24 @@ class LaneOkTests(unittest.TestCase):
         self.assertIn("unknown lane", reason)
         self.assertEqual(len(reason.splitlines()), 1)
 
+    def test_unreadable_pool_state_refuses_without_leaking_the_exception(self):
+        out = io.StringIO()
+        with mock.patch.object(pp, "read_pools", side_effect=OSError("private detail")), redirect_stdout(out):
+            code = pp.main(["--lane-ok", "cursor", "--cloud"])
+        self.assertEqual(code, 3)
+        self.assertEqual(out.getvalue(), "cursor: cannot read pool state\n")
+
+    def test_reason_stays_on_one_line(self):
+        code, reason = self.check_lane("cursor", {"grok": dict(pool("OFF"), note="used\nup")})
+        self.assertEqual(code, 3)
+        self.assertEqual(reason, "cursor: used up: used up")
+
+    def test_opencode_prepaid_can_run_after_included_allowance_is_exhausted(self):
+        state = dict(pool(), used_pct=100, funding="prepaid", credits_usd=2.01, credit_floor_usd=2)
+        self.assertEqual(self.check_lane("opencode", {"opencode": state})[0], 0)
+        state["credits_usd"] = 2
+        self.assertEqual(self.check_lane("opencode", {"opencode": state})[0], 3)
+
     def test_chat_only_pool_without_opt_in_refuses(self):
         cfg = {"lanes": [{"lane": "custom", "pool": "custom", "command": "unused"}]}
         code, reason = self.check_lane("custom", {"custom": dict(pool(), chat_only=True)}, cfg=cfg)
