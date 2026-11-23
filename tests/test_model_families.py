@@ -27,6 +27,8 @@ class ModelFamilyTests(unittest.TestCase):
             'z-ai/glm-5': 'zai',
             'zai/glm-5': 'zai',
             'glm-5': 'zai',
+            'zai/glm-5.3-flash': 'zai',
+            'vercel-ai-gateway/zai/glm-5.3-flash': 'zai',
             'google/gemini-2.5-flash': 'google',
             'gemini-2.5-flash': 'google',
             'anthropic/claude-sonnet': 'anthropic',
@@ -48,7 +50,41 @@ class ModelFamilyTests(unittest.TestCase):
     def test_all_current_lanes_have_known_families(self):
         lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text())
         self.assertEqual([model_family(lane['model']) for lane in lanes],
-                         ['deepseek', 'deepseek', 'deepseek', 'google', 'cursor'])
+                         ['deepseek', 'deepseek', 'zai', 'deepseek', 'google', 'cursor'])
+
+
+class ZaiJudgeLaneTests(unittest.TestCase):
+    def setUp(self):
+        self.lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text())
+
+    def lane(self):
+        return next(lane for lane in self.lanes if lane['name'] == 'vercel-ai-gateway-zai')
+
+    def test_judge_lane_sits_right_after_the_deepseek_gateway_lane(self):
+        names = [lane['name'] for lane in self.lanes]
+        self.assertEqual(names.index('vercel-ai-gateway-zai'),
+                         names.index('vercel-ai-gateway') + 1)
+
+    def test_judge_lane_uses_the_token_pass_gateway_key(self):
+        lane = self.lane()
+        self.assertEqual(lane['model'], 'zai/glm-5.3-flash')
+        self.assertEqual(lane['key_env'], 'AI_GATEWAY_API_KEY')
+        self.assertEqual(lane['url'], 'https://ai-gateway.vercel.sh/v1/chat/completions')
+        self.assertEqual(lane['gateway'], {'only': ['token-pass']})
+
+    def test_judge_lane_family_is_zai(self):
+        self.assertEqual(model_family(self.lane()['model']), 'zai')
+
+    def test_deepseek_authored_pr_is_judged_by_the_zai_lane(self):
+        kept = filter_lanes(self.lanes, {'deepseek'})
+        self.assertEqual(kept[0]['name'], 'vercel-ai-gateway-zai')
+        self.assertEqual(model_family(kept[0]['model']), 'zai')
+
+    def test_zai_authored_pr_excludes_the_zai_judge_lane(self):
+        kept = filter_lanes(self.lanes, {'zai'})
+        self.assertNotIn('vercel-ai-gateway-zai', [lane['name'] for lane in kept])
+        self.assertEqual([lane['name'] for lane in kept],
+                         ['opencode-go', 'vercel-ai-gateway', 'openrouter', 'google', 'cursor'])
 
 
 class AuthorFamilyTests(unittest.TestCase):
@@ -77,19 +113,20 @@ class LaneFilterTests(unittest.TestCase):
 
     def test_deepseek_excludes_every_provider_for_that_family(self):
         kept = filter_lanes(self.lanes, {'deepseek'})
-        self.assertEqual([lane['name'] for lane in kept], ['google', 'cursor'])
-        self.assertEqual(len(self.lanes), 5)
+        self.assertEqual([lane['name'] for lane in kept],
+                         ['vercel-ai-gateway-zai', 'google', 'cursor'])
+        self.assertEqual(len(self.lanes), 6)
 
     def test_multiple_authors_exclude_multiple_families(self):
         kept = filter_lanes(self.lanes, {'deepseek', 'google'})
-        self.assertEqual([lane['name'] for lane in kept], ['cursor'])
+        self.assertEqual([lane['name'] for lane in kept], ['vercel-ai-gateway-zai', 'cursor'])
 
     def test_no_exclusions_preserves_order_and_unknown_models(self):
         self.lanes.append({'name': 'future', 'model': 'unknown/model'})
         self.assertEqual(filter_lanes(self.lanes, set()), self.lanes)
 
     def test_all_excluded_is_empty(self):
-        self.assertEqual(filter_lanes(self.lanes, {'deepseek', 'google', 'cursor'}), [])
+        self.assertEqual(filter_lanes(self.lanes, {'deepseek', 'zai', 'google', 'cursor'}), [])
 
     def test_unknown_lane_fails_closed_when_excluding(self):
         with self.assertRaises(ValueError):
