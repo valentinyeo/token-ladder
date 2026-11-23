@@ -48,7 +48,7 @@ class ModelFamilyTests(unittest.TestCase):
     def test_all_current_lanes_have_known_families(self):
         lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text())
         self.assertEqual([model_family(lane['model']) for lane in lanes],
-                         ['deepseek', 'deepseek', 'deepseek', 'deepseek', 'google', 'cursor'])
+                         ['deepseek', 'deepseek', 'deepseek', 'google', 'cursor'])
 
 
 class AuthorFamilyTests(unittest.TestCase):
@@ -78,7 +78,7 @@ class LaneFilterTests(unittest.TestCase):
     def test_deepseek_excludes_every_provider_for_that_family(self):
         kept = filter_lanes(self.lanes, {'deepseek'})
         self.assertEqual([lane['name'] for lane in kept], ['google', 'cursor'])
-        self.assertEqual(len(self.lanes), 6)
+        self.assertEqual(len(self.lanes), 5)
 
     def test_multiple_authors_exclude_multiple_families(self):
         kept = filter_lanes(self.lanes, {'deepseek', 'google'})

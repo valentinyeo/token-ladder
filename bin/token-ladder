@@ -763,7 +763,7 @@ HELPERS = {
     "orchestrator": ("Orchestrators follow the pstack playbook and spawn their own workers. Spread workers fairly over every plan: "
                      "read ~/.local/state/pacing/allocation.json; shares.<plan>.runners is the fleet's worker slots per plan; "
                      "each of the four orchestrators takes an equal part; fill the plan furthest behind pace first "
-                     "(Claude subagents, Pi on DeepSeek via OpenCode Go or Vercel, Codex, Grok via cursor-agent), never Claude alone. "
+                     "(Claude subagents, Pi on DeepSeek via OpenCode Go Plus or Vercel, Codex, Grok via cursor-agent), never Claude alone. "
                      "Plans reserved for Valentin stay off. No model id containing 'fast', no router or automatic fallback. "
                      "No CI, builds, tests or AI review on this VPS; they run only on GitHub-hosted runners."),
 }

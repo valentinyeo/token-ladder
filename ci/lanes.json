@@ -25,12 +25,6 @@
     }
   },
   {
-    "name": "deepseek",
-    "key_env": "DEEPSEEK_API_KEY",
-    "url": "https://api.deepseek.com/chat/completions",
-    "model": "deepseek-flash"
-  },
-  {
     "name": "google",
     "key_env": "GEMINI_API_KEY",
     "url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",

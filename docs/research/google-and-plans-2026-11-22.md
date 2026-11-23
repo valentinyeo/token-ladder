@@ -1,12 +1,14 @@
 # Google tokens (Q3) and cheaper plans (Q5), 2026-11-22
 
+Account update, 2026-11-22 ~22:00Z: the dashboard shows $24.64 available prepaid credit, monthly 100% used, weekly 0%, and 5-hour 0%. Monthly 100% exhausts the included allowance. Valentin's later rule supersedes the earlier skip-all-extra-usage recommendation below: use held prepaid credit above $2, then wait until the 30 November renewal; auto top-up is OFF and must never be enabled. Prefer live credit; otherwise use a timestamped balance anchor less recorded OpenCode run costs for at most seven days, with a conservative $0.50 default per unknown-cost run. DeepSeek direct is retired at -$0.01, with no more top-ups. Its measured last-30-day cost was $59.93 for 8.11B tokens over 67,963 requests, about $7.40 per 1B tokens, ~98.7% cached. Earlier price comparisons below remain research history.
+
 Research only. No keys read or used, no spend, no config changed. All pages were read on 2026-11-22 unless a date is given. Prices are USD per 1M tokens. "Cached" means a cache-hit read of input. Earlier DeepSeek findings are in `deepseek-flash-prices-2026-11-22.md` and are not repeated.
 
 ## 1. Top line
 
 **Q3, Google: do not wire Google in as a worker lane. Wire it as a CI review judge only, on a paid, prepaid AI Studio key, model `gemini-3.5-flash-lite`.** Gemini costs 4 to 10 times more than DeepSeek Flash per worker run because our work is 98.7% cached reads and Google's cached price is 8 to 25 times DeepSeek's. A Google judge is still worth having because it is a different vendor than DeepSeek, so `plan-pick --not-vendor deepseek` has someone to hand reviews to. There are no usable free Gemini tokens for private code: the free tier trains on your data, and the Google Cloud trial credit no longer covers Gemini.
 
-**Q5, cheaper plans: no plan is clearly cheaper per real worker run than what we have.** OpenCode Go (about $0.003 per median run if the $100 DeepSeek allowance is fully used) and CommandCode GOAT (the same ratio, "up to") are the cheapest, and they tie. Vercel Token Pass is next (about $0.007). Everything else is the same price or worse, or forbids headless use. Add CommandCode GOAT only as extra capacity (a third monthly allowance), not as a saving.
+**Q5, cheaper plans: no plan is clearly cheaper per real worker run than what we have.** Plain OpenCode Go and CommandCode GOAT are about $0.003 per median run if their $100 allowances are fully used. Our plan is OpenCode Go Plus ($40/month, $200 DeepSeek allowance), about $0.007 per median run, like Vercel Token Pass. Valentin confirmed Go Plus; its included allowance is currently used up. Everything else is the same price or worse, or forbids headless use. Add CommandCode GOAT only as extra capacity (a third monthly allowance), not as a saving.
 
 ## 2. What a worker run costs (our measured mix)
 
@@ -21,7 +23,7 @@ Median run from the earlier research (769 sessions): 68K new input, 2.79M cached
 | Gemini 3.8 Flash (to double on 2027-01-01) | 0.75 | 0.075 | 3.75 | $0.35 (then $0.70) | 10.5x (21x) | $2.23 |
 | GLM 5.3 Flash (Z.ai, Vercel and Synthetic list) | 0.15 | 0.03 | 0.50 | $0.106 | 3.2x | $0.44 |
 | Synthetic subscription deduction rate, DeepSeek V4.1 Flash | 0.06 | 0.003 | 0.30 | $0.020 | 0.6x of list (but charged against a weekly credit) | $0.18 |
-| OpenCode Go effective, DeepSeek Flash ($100 for $10) | | | | about $0.003 | 0.1x | |
+| Our OpenCode Go Plus effective, DeepSeek Flash ($200 for $40) | | | | about $0.007 | 0.2x | |
 | CommandCode GOAT effective ("up to $100" for $10 plus fee) | | | | about $0.003 | 0.1x | |
 | Vercel Token Pass effective ($150 for $30) | | | | about $0.007 | 0.2x | |
 
@@ -116,8 +118,8 @@ Test used: (1) what the plan charges for a cache read, (2) whether the terms all
 
 | Plan | Price | Per median run for our mix | Monthly size vs fleet need | Terms for automated or headless use | Base URL | Verdict |
 |---|---|---|---|---|---|---|
-| **OpenCode Go** (we have it) | $10 | about $0.003 if the $100 DeepSeek allowance is used | $100 list = 30% of the fleet | Built for "OpenCode and other coding agents"; wants typical agent traffic, its own user agent and a stable `x-opencode-session` header; pi is on the supported list. Abuse monitored. Automated use not addressed directly. | `https://opencode.ai/inference/go` | Cheapest, keep as first. |
-| **OpenCode Go Plus** | $40 | **same ratio as Go** | Page says "roughly four times" Go's allowances, so $400 list. The earlier file said $200 (5x); the live page says four times, not resolved. | same | same | Buy only for capacity, not for a lower price per run. Per dollar it equals Go, not better. |
+| **OpenCode Go** (not our plan) | $10 | about $0.003 if the $100 DeepSeek allowance is used | $100 list = 30% of the fleet | Built for "OpenCode and other coding agents"; wants typical agent traffic, its own user agent and a stable `x-opencode-session` header; pi is on the supported list. Abuse monitored. Automated use not addressed directly. | `https://opencode.ai/inference/go` | Cheapest, keep as first. |
+| **OpenCode Go Plus** (we have it) | $40/month | about $0.007 if fully used | $200 DeepSeek allowance, confirmed by Valentin on 2026-11-22; not $400 | same | same | Included allowance is used up. Skip for workers; never use paid extra usage. |
 | **CommandCode GOAT** | $10 plus an unstated processing fee | about $0.003 if "up to $100" is delivered | $100 list. 5-hour cap up to $20, weekly cap up to $50 | API access is included and documented ("any OpenAI or Anthropic client or agent can use the API", headless mode page exists). No automation ban found; Legal page not read. | `https://api.commandcode.ai/provider/v1` (`/chat/completions`, `/responses`, `/messages`, `/models`). Bearer key from Studio. `/models` answers without a key. | Ties Go. Worth adding as a third allowance. DeepSeek ids it lists: `deepseek/deepseek-v4.1-flash` ("latest", snapshot not stated) and `-fast`, `-ultrafast` variants (do not use, priced higher). GLM-5.3 Flash also $100. Go tier ($1) has no API access. |
 | Vercel Token Pass (we have it) | $30 | about $0.007 | $150 list | ZDR, documented gateway | `https://ai-gateway.vercel.sh/v1` | Keep. Fix the model id first (see earlier file). |
 | Cursor (we have it) | plan | included models only | n/a | CLI login | n/a | Not a DeepSeek route. |
@@ -154,7 +156,7 @@ Other facts that matter for the choice:
 - Whether Valentin's Google tokens are a subscription, a free key or prepaid credit (see 3.1).
 - Terminal-Bench 4.0 Gemini score (read through a page summariser; matches the older 0910 DeepSeek figure, so it may be a mix-up). Artificial Analysis comparison page returned 404 and was not used.
 - Vals has no SWE-bench entry for DeepSeek V4.1 Flash; 88.8% is for V4 Flash 0731.
-- OpenCode Go Plus multiplier (four times on the live page, 5x in the earlier file) and per-model dollar allowances (shown only in the console).
+- OpenCode Go Plus is resolved for our account: Valentin confirmed $40/month and a $200 DeepSeek allowance. Do not infer its allowance from a marketing multiplier.
 - CommandCode: processing fee amount, Legal page terms, whether the `deepseek/deepseek-v4.1-flash` id is the 1017 snapshot, and whether GOAT meters the Gemini models.
 - Synthetic: weekly credit dollars per plan, infinite-mode eligibility, terms, base URL (secondhand).
 - Z.ai, Kimi, MiniMax: whether pi counts as an officially supported tool; MiniMax prices and base URL; Kimi USD prices.

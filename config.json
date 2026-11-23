@@ -1,7 +1,13 @@
 {
   "grok_stale_hours": 3,
-  "opencode_estimate_hours": 24,
-  "opencode_estimate_usd_per_mtok": 2.0,
+  "opencode_reader_command": ["python3", "~/projects/poteto-2-advisor/bin/opencode-read"],
+  "opencode_credit_floor_usd": 2,
+  "opencode_extra_usage": true,
+  "opencode_auto_topup": false,
+  "opencode_monthly_renewal": "2026-11-30T23:00:00Z",
+  "measured_burn": [{"lane": "deepseek", "as_of": "2026-11-22", "period_days": 30,
+                     "usd": 59.93, "tokens": 8110000000, "requests": 67963, "cached_pct": 98.7,
+                     "source": "Valentin, DeepSeek direct account measurement"}],
   "unknown_assumed_pct": 70,
   "pool_warn_pct": 80,
   "pace_warn_ratio": 1.1,
@@ -42,13 +48,6 @@
       "vendor": "deepseek",
       "pool": null,
       "command": "~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
-    },
-    {
-      "lane": "deepseek",
-      "credit": "deepseek",
-      "vendor": "deepseek",
-      "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider deepseek --model deepseek-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "codex",
@@ -103,16 +102,18 @@
       "vendor": "deepseek",
       "included_models": ["DeepSeek V4.1 Flash"],
       "runs_on": ["local"],
-      "extra_cost": "prepaid credit",
+      "extra_cost": "retired; balance -$0.01; no more top-ups",
       "source": "unknown"
     },
     {
-      "name": "OpenCode Go",
+      "name": "OpenCode Go Plus",
+      "monthly_price_usd": 40,
+      "included_allowance_usd": 200,
       "vendor": "opencode",
       "included_models": ["DeepSeek V4.1 Flash"],
       "runs_on": ["local"],
-      "extra_cost": "none until the monthly window is full, then prepaid credit with auto-recharge",
-      "source": "unknown"
+      "extra_cost": "held prepaid credit above $2 only; auto top-up OFF; never top up",
+      "source": "Valentin, 2026-11-22"
     },
     {
       "name": "Google Antigravity plan",

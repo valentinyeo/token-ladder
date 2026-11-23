@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import glob
 import json
+import math
 import os
 import re
 import subprocess
@@ -28,11 +30,6 @@ PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|auth
 PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
 FAST_FAIL_BEFORE_WORK_S = 30
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
-DEFAULT_OPENCODE_CREDIT_FLOOR = 6
-DEFAULT_OPENCODE_CREDIT_FRESH_HOURS = 2
-DEFAULT_OPENCODE_ESTIMATE_HOURS = 24
-DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK = 2.0
-OPENCODE_LANE_PROVIDER = "opencode-go"
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
 LAUNCHES = os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
@@ -41,8 +38,6 @@ PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
 DEFAULT_CREDIT_FLOOR_USD = 2.0
 DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
-DEFAULT_STALE_HOURS = 12
-DEFAULT_OPENCODE_MONTHLY_SLACK_PCT = 25
 DEFAULT_LOOP_BASE_SECONDS = 7200
 DEFAULT_LOOP_AHEAD_SECONDS = 10800
 DEFAULT_LOOP_FAR_AHEAD_SECONDS = 14400
@@ -60,7 +55,7 @@ def number(value):
 def skip_reason(pool, warn, no_pace=False):
     if not isinstance(pool, dict):
         return None
-    if pool.get("state") == "OFF":
+    if pool.get("state") == "OFF" or (pool.get("funding") != "prepaid" and (number(pool.get("used_pct")) or 0) >= 100):
         return "used up" + (f": {pool['note']}" if pool.get("note") else "")
     ratio = number(pool.get("pace_ratio"))
     if not no_pace and ratio is not None and ratio > warn:
@@ -305,8 +300,13 @@ def plans_from(cfg):
 def plan_line(plan, credit=None):
     models = ", ".join(str(model) for model in plan.get("included_models") or [])
     places = " and ".join(str(place) for place in plan.get("runs_on") or [])
-    line = (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}. "
-            f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.")
+    allowance = ""
+    if number(plan.get("included_allowance_usd")) is not None:
+        allowance = (f" ${plan['monthly_price_usd']:g}/month; "
+                     f"${plan['included_allowance_usd']:g} included allowance.")
+    state = f" Status: {plan['status']}. {plan['note']}." if plan.get("status") else ""
+    line = (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}.{allowance} "
+            f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.{state}")
     if plan.get("pool"):
         usage = plan.get("usage") or {}
         used, limit, pace = (number(usage.get(key)) for key in ("used", "limit", "pace_ratio"))
@@ -328,6 +328,7 @@ def plan_line(plan, credit=None):
         return line
     reset = f", resets {credit['resets_at']}" if credit.get("resets_at") else ""
     return f"{line} ${left:.2f} of ${allowance:g} left this cycle{reset}."
+
 
 
 def read_limits(path=LIMITS):
@@ -428,7 +429,8 @@ def unpack_run(result):
 def log_launch(path, lane, now, not_vendor):
     at = now if now is not None else time.time()
     line = {"at": at, "lane": lane,
-            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "not_vendor": not_vendor}
+            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "not_vendor": not_vendor,
+            "caller": os.environ.get("MULTIBOT_SESSION") or os.getcwd()}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a") as fh:
@@ -577,22 +579,30 @@ def read_credits(path=CREDITS):
     return data if isinstance(data, dict) else {}
 
 
+def save_credits(entries, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".write-lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_credits(path)
+        data.update(entries)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    return data
+
+
 def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers=BALANCES):
-    data = read_credits(path)
+    updates = {}
     for name in names:
         reader = readers.get(name)
         if not reader:
             continue
         try:
-            data[name] = dict(reading(reader, get, key), at=now)
+            updates[name] = dict(reading(reader, get, key), at=now)
         except Exception as exc:
             print(f"plan-pick: cannot read {name} credit: {type(exc).__name__}", file=sys.stderr)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, path)
-    return data
+    return save_credits(updates, path)
 
 
 def plan_credits(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
@@ -680,18 +690,6 @@ def history_rows(pacing_dir):
     return rows
 
 
-def short_window_pct(used):
-    for name in ("rolling", "5-hour"):
-        pct = number(used.get(name))
-        if pct is not None:
-            return pct
-    return None
-
-
-def monthly_slack_pct(cfg):
-    return number(cfg.get("opencode_monthly_slack_pct")) or DEFAULT_OPENCODE_MONTHLY_SLACK_PCT
-
-
 def parse_opencode_windows(raw):
     used = {}
     if not isinstance(raw, dict):
@@ -704,110 +702,251 @@ def parse_opencode_windows(raw):
     return used
 
 
-def monthly_allowance_exhausted(used, cfg):
-    monthly = number(used.get("monthly")) or 0
-    if monthly < 100:
-        return False
-    slack = monthly_slack_pct(cfg)
-    short = short_window_pct(used)
-    weekly = number(used.get("weekly"))
-    if short is not None and short < slack and weekly is not None and weekly < slack:
-        return False
-    return True
-
-
 def last_windows(pacing_dir):
     rows = [r for r in history_rows(pacing_dir) if isinstance(r.get("windows"), dict) and r["windows"]]
     if not rows:
         return None
     row = max(rows, key=lambda r: r["at"])
-    return {"at": row["at"], "used": parse_opencode_windows(row["windows"])}
+    return {"at": row["at"], "used": parse_opencode_windows(row["windows"]),
+            "resets_at": row.get("resets_at", {})}
 
 
-def last_credit(pacing_dir):
-    rows = [r for r in history_rows(pacing_dir) if number(r.get("credits_usd")) is not None]
-    return max(rows, key=lambda r: r["at"]) if rows else None
+def read_opencode(cfg):
+    command = cfg.get("opencode_reader_command") or []
+    if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
+        raise ValueError("OpenCode reader command missing")
+    command = [os.path.expanduser(arg) for arg in command]
+    reading = {}
+    try:
+        out = subprocess.run(command + ["--print"], capture_output=True, text=True, timeout=180, check=True)
+        usage = json.loads(out.stdout)
+        windows = usage["windows"]
+        reading = {"at": datetime.fromisoformat(usage["measured_at"].replace("Z", "+00:00")).timestamp(),
+                   "windows": {w["name"]: w["used"] for w in windows},
+                   "resets_at": {w["name"]: w.get("resets_at") for w in windows}}
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    try:
+        out = subprocess.run(command + ["--credits", "--print"], capture_output=True, text=True,
+                             timeout=180, check=True)
+        money = json.loads(out.stdout)
+        reading.update(credits_usd=money["credits_usd"], credits_at=money["at"])
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    return reading
 
 
-def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
-    stale_s = (number(cfg.get("opencode_stale_hours")) or DEFAULT_STALE_HOURS) * 3600
-    reading = last_windows(pacing_dir)
-    if not reading or now - reading["at"] > stale_s:
-        return {"state": "unknown", "note": "OpenCode usage reading missing or stale, assumed free"}
-    used = reading["used"]
-    for name in ("rolling", "5-hour", "weekly"):
-        if (number(used.get(name)) or 0) >= 100:
-            return {"state": "OFF", "note": f"OpenCode {name} window is full"}
-    if monthly_allowance_exhausted(used, cfg):
-        return opencode_credit_pool(now, cfg, pacing_dir, sessions)
-    if (number(used.get("monthly")) or 0) >= 100:
-        return {"state": "ON", "note": "OpenCode monthly meter reads full but shorter windows still have room"}
-    return {"state": "ON", "note": "OpenCode windows have room"}
-
-
-def lane_spend(since, sessions=PI_SESSIONS, provider=OPENCODE_LANE_PROVIDER,
-               rate=DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK):
-    total = 0.0
-    for path in glob.glob(os.path.join(sessions, "*", "*.jsonl")):
+def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launches_path=LAUNCHES):
+    plan = next((p for p in plans_from(cfg) if p.get("vendor") == "opencode"), {})
+    allowance = number(plan.get("included_allowance_usd"))
+    try:
+        reading = read_opencode(cfg)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        reading = None
+    now = time.time() if now is None else now
+    credit = number((reading or {}).get("credits_usd"))
+    credit_at = number((reading or {}).get("credits_at"))
+    live_credit = (credit is not None and math.isfinite(credit) and credit >= 0 and credit_at is not None
+                   and math.isfinite(credit_at) and 0 <= now - credit_at <= 60)
+    if live_credit:
+        save_credits({"opencode": {"usd": credit, "at": credit_at, "source": "OpenCode live console"}}, CREDITS)
+    live = bool(reading and reading.get("windows"))
+    reading = reading if live else last_windows(pacing_dir)
+    if not reading:
+        return {"state": "OFF", "note": "OpenCode live usage unavailable; never top up"}
+    used = parse_opencode_windows(reading.get("windows", reading.get("used")))
+    monthly = number(used.get("monthly"))
+    windows = ", ".join(f"{name} {used[name]:g}%" if number(used.get(name)) is not None else f"{name} unknown"
+                        for name in ("monthly", "weekly", "5-hour"))
+    result = {"state": "OFF", "used_pct": monthly, "windows": used, "note": windows,
+              "included_exhausted": monthly is not None and monthly >= 100}
+    renewal = (reading.get("resets_at") or {}).get("monthly")
+    if number(renewal) is None:
         try:
-            if os.path.getmtime(path) < since:
-                continue
-            with open(path, errors="replace") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            if provider not in line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            message = row.get("message") if isinstance(row, dict) else None
-            if not isinstance(message, dict) or message.get("provider") != provider:
+            renewal = datetime.fromisoformat(cfg["opencode_monthly_renewal"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError, TypeError):
+            renewal = None
+    result["resets_at"] = renewal
+    if monthly is not None and allowance is not None and allowance > 0:
+        result.update(used_usd=monthly * allowance / 100, included_allowance_usd=allowance)
+        result["note"] += f"; ${result['used_usd']:.2f} of ${allowance:.2f} included allowance"
+    if result["included_exhausted"]:
+        result["note"] += "; included allowance used up"
+    at = number(reading.get("at"))
+    if not live or at is None or not 0 <= now - at <= 300:
+        result["note"] += "; live usage unavailable or stale; never top up"
+        if not result["included_exhausted"]:
+            return result
+    if (monthly is None or not math.isfinite(monthly) or monthly < 0 or allowance is None
+            or not math.isfinite(allowance) or allowance <= 0):
+        result["note"] += "; allowance missing; never top up"
+        return result
+    if monthly < 100:
+        if any((number(used.get(name)) or 0) >= 100 for name in ("rolling", "5-hour", "weekly")):
+            result["note"] += "; window is full"
+        else:
+            result.update(state="ON", funding="included")
+        return result
+    if live_credit:
+        result["note"] += f"; live available credit ${credit:.2f}"
+    else:
+        anchor = read_credits(CREDITS).get("opencode")
+        anchor = anchor if isinstance(anchor, dict) else {}
+        credit, credit_at = number(anchor.get("usd")), number(anchor.get("at"))
+        if (credit is None or not math.isfinite(credit) or credit < 0 or credit_at is None
+                or not math.isfinite(credit_at) or not 0 <= now - credit_at <= 7 * 86400):
+            result["note"] += "; live credit unavailable; balance anchor missing, invalid or older than 7 days; never top up"
+            return result
+        spent, unknown = opencode_spend(credit_at, now, sessions, launches_path)
+        credit = max(0.0, round(credit - spent, 10))
+        stamp = datetime.fromtimestamp(credit_at, timezone.utc).isoformat()
+        result["note"] += (f"; anchored credit ${credit:.2f}: ${anchor['usd']:.2f} at {stamp}"
+                           f" ({anchor.get('source', 'unknown source')}) less ${spent:.2f} run costs")
+        if unknown:
+            result["note"] += f"; includes conservative $0.50 default for {unknown} run(s) with unknown cost"
+    floor = number(cfg.get("opencode_credit_floor_usd"))
+    floor = 2 if floor is None or not math.isfinite(floor) or floor < 0 else floor
+    result.update(credits_usd=credit, credit_floor_usd=floor)
+    result["note"] += f" (floor ${floor:g}); never top up"
+    if credit <= floor:
+        result.update(floor_reached=True)
+        result["note"] += "; skip until monthly renewal"
+    elif cfg.get("opencode_extra_usage") is not True or cfg.get("opencode_auto_topup") is not False:
+        result["note"] += "; prepaid usage requires Extra Usage on and auto top-up OFF"
+    elif number(renewal) is None or not math.isfinite(renewal) or renewal <= now:
+        result["note"] += "; monthly renewal needs a fresh reading"
+    else:
+        result.update(state="ON", funding="prepaid")
+        result["note"] += "; using held prepaid credit"
+    return result
+
+
+def jsonl_rows(path):
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    yield row
+    except OSError:
+        return
+
+
+def opencode_spend(since, now, sessions, launches_path):
+    launches = [row for row in jsonl_rows(launches_path)
+                if number(row.get("at")) is not None and row["at"] <= now]
+    launches.sort(key=lambda row: row["at"])
+    runs = {("launch", i): {"usd": 0.0, "messages": 0, "unknown": False}
+            for i, row in enumerate(launches) if row.get("lane") == "opencode" and row["at"] > since}
+    seen = set()
+    for path in sorted(glob.glob(os.path.join(sessions, "*", "*.jsonl"))):
+        cwd, session = None, path
+        for row in jsonl_rows(path):
+            if row.get("type") == "session":
+                cwd, session = row.get("cwd"), row.get("id") or path
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("provider") != "opencode-go" or message.get("role") != "assistant":
                 continue
             at = number(message.get("timestamp"))
-            if at is None or at / 1000 <= since:
+            if at is None or not since < at / 1000 <= now:
                 continue
-            usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-            cost = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
-            total += number(cost.get("total")) or (number(usage.get("totalTokens")) or 0) * rate / 1000000
-    return total
+            if row.get("id"):
+                identity = (row["id"], at)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            key = ("session", session)
+            for i in range(len(launches) - 1, -1, -1):
+                launch = launches[i]
+                if cwd and launch.get("cwd") == cwd and launch["at"] <= at / 1000:
+                    if launch.get("lane") == "opencode":
+                        key = ("launch", i)
+                    break
+            run = runs.setdefault(key, {"usd": 0.0, "messages": 0, "unknown": False})
+            run["messages"] += 1
+            usage = message.get("usage")
+            cost = usage.get("cost") if isinstance(usage, dict) else None
+            usd = number(cost.get("total")) if isinstance(cost, dict) else None
+            if usd is None or not math.isfinite(usd) or usd < 0:
+                run["unknown"] = True
+            else:
+                run["usd"] += usd
+    unknown = sum(run["unknown"] or run["messages"] == 0 for run in runs.values())
+    return sum(run["usd"] for run in runs.values()) + unknown * 0.50, unknown
 
 
-def estimated_credit(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
-    hours = number(cfg.get("opencode_estimate_hours")) or DEFAULT_OPENCODE_ESTIMATE_HOURS
-    base = last_credit(pacing_dir)
-    if not base or now - base["at"] > hours * 3600:
-        return None
-    rate = number(cfg.get("opencode_estimate_usd_per_mtok")) or DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK
-    spent = lane_spend(base["at"], sessions, rate=rate)
-    return {"credits_usd": max(0.0, base["credits_usd"] - spent), "base_usd": base["credits_usd"],
-            "base_at": base["at"], "spent_usd": spent}
+def burn_report(cfg, now=None, sessions=PI_SESSIONS, launches_path=LAUNCHES):
+    now = time.time() if now is None else now
+    month = datetime.fromtimestamp(now, timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start = month.timestamp()
+    providers = {"opencode-go": "opencode", "vercel-ai-gateway": "vercel", "openrouter-credit": "openrouter",
+                 "openai-codex": "codex"}
+    by_lane = {lane["lane"]: {"usd": None, "messages": 0, "unpriced_messages": 0, "launches": 0}
+               for lane in lanes_from(cfg)}
+    by_caller = {}
+
+    def entry(table, name):
+        return table.setdefault(name, {"usd": None, "messages": 0, "unpriced_messages": 0, "launches": 0})
+
+    seen = set()
+    for path in sorted(glob.glob(os.path.join(sessions, "*", "*.jsonl"))):
+        caller = "unknown caller"
+        for row in jsonl_rows(path):
+            if row.get("type") == "session":
+                caller = row.get("cwd") or "unknown caller"
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            at = number(message.get("timestamp"))
+            provider = message.get("provider")
+            if at is None or not start <= at / 1000 <= now or not isinstance(provider, str):
+                continue
+            if row.get("id"):
+                identity = (provider, row["id"], at)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            usage = message.get("usage")
+            cost = usage.get("cost") if isinstance(usage, dict) else None
+            usd = number(cost.get("total")) if isinstance(cost, dict) else None
+            for item in (entry(by_lane, providers.get(provider, provider)), entry(by_caller, caller)):
+                item["messages"] += 1
+                if usd is None:
+                    item["unpriced_messages"] += 1
+                else:
+                    item["usd"] = (item["usd"] or 0) + usd
+    for row in jsonl_rows(launches_path):
+        at = number(row.get("at"))
+        if at is None or not start <= at <= now or not row.get("lane"):
+            continue
+        caller = row.get("caller") or row.get("cwd") or "unknown caller"
+        entry(by_lane, row["lane"])["launches"] += 1
+        entry(by_caller, caller)["launches"] += 1
+    return {"month": month.strftime("%Y-%m"), "currency": "USD", "by_lane": by_lane, "by_caller": by_caller,
+            "measured": cfg.get("measured_burn", []),
+            "note": "Recorded pi message costs, not invoices or extra-usage charges; no token-rate estimates. "
+                    "Missing cost data is unknown. Callers use usage-store cwd or launch caller/cwd; "
+                    "chat names and directories are separate when logs cannot link them."}
 
 
-def opencode_credit_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
-    floor = number(cfg.get("opencode_credit_floor_usd")) or DEFAULT_OPENCODE_CREDIT_FLOOR
-    fresh_s = (number(cfg.get("opencode_credit_fresh_hours")) or DEFAULT_OPENCODE_CREDIT_FRESH_HOURS) * 3600
-    hours = number(cfg.get("opencode_estimate_hours")) or DEFAULT_OPENCODE_ESTIMATE_HOURS
-    row = last_credit(pacing_dir)
-    if row and now - row["at"] <= fresh_s:
-        credit = row["credits_usd"]
-        if credit < floor:
-            return {"state": "OFF", "note": f"OpenCode monthly window is full and credit ${credit:.2f} is under ${floor:g}"}
-        return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} credit (floor ${floor:g})"}
-    est = estimated_credit(now, cfg, pacing_dir, sessions)
-    if est is None:
-        return {"state": "OFF", "note": "OpenCode monthly window is full and no credit reading or estimate "
-                                         f"from the last {hours:g} hours"}
-    credit = est["credits_usd"]
-    proof = (f"${est['base_usd']:.2f} read {(now - est['base_at']) / 3600:.1f}h ago "
-             f"less ${est['spent_usd']:.2f} spend seen since")
-    if credit < floor:
-        return {"state": "OFF", "note": f"OpenCode monthly window is full and estimated credit ${credit:.2f} "
-                                         f"is under ${floor:g} ({proof})"}
-    return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} estimated credit: "
-                                     f"{proof} (floor ${floor:g})"}
+def burn_lines(report):
+    yield f"Burn {report['month']} UTC (USD)"
+    yield report["note"]
+    for item in report.get("measured", []):
+        per_billion = round(item["usd"] / (item["tokens"] / 1e9), 1)
+        yield (f"Measured {item['lane']} direct, {item['period_days']} days ending {item['as_of']}: "
+               f"${item['usd']:.2f} for {item['tokens'] / 1e9:.2f}B tokens over {item['requests']:,} requests; "
+               f"about ${per_billion:.2f} per 1B tokens; ~{item['cached_pct']:g}% cached. "
+               "Separate account measurement, not added to recorded pi costs.")
+    for title, key in (("Per lane", "by_lane"), ("Per caller", "by_caller")):
+        yield title
+        for name, item in sorted(report[key].items()):
+            usd = "unknown" if item["usd"] is None else f"${item['usd']:.4f}"
+            yield (f"  {name}: {usd}; {item['messages']} messages; "
+                   f"{item['unpriced_messages']} unpriced; {item['launches']} launches")
 
 
 def read_pools(source):
@@ -824,13 +963,18 @@ def read_pools(source):
 def with_opencode(pools, cfg, now=None):
     pools = pools if isinstance(pools, dict) else {}
     if "opencode" not in pools:
-        pools = dict(pools, opencode=opencode_pool(time.time() if now is None else now, cfg))
+        state = opencode_pool(now, cfg)
+        now = time.time() if now is None else now
+        if state.get("floor_reached") and (number(state.get("resets_at")) or 0) > now:
+            mark_limited("opencode", (state["resets_at"] - now) / 3600, now)
+        pools = dict(pools, opencode=state)
     return pools
 
 
 def main(argv):
     parser = argparse.ArgumentParser(prog="plan-pick", description="Pick the lane for the next background worker.")
     parser.add_argument("--json", action="store_true", help="print plan, command and reason as JSON")
+    parser.add_argument("--burn", action="store_true", help="report this month's recorded spend per lane and caller")
     parser.add_argument("--plans", action="store_true",
                         help="print what each subscription includes, where it runs and whether it costs extra")
     parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
@@ -846,15 +990,40 @@ def main(argv):
                         help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
                         help="read the credit balance of these lanes (all credit lanes when none) and store it")
+    parser.add_argument("--set-credit", nargs=2, metavar=("LANE", "USD"),
+                        help="record an OpenCode prepaid balance anchor without reading live state")
+    parser.add_argument("--credit-source", default="Valentin dashboard screenshot", help="balance anchor source")
+    parser.add_argument("--credit-at", help="balance anchor time in ISO 8601 with timezone (default: now UTC)")
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     args = parser.parse_args(argv)
     cfg = load_config()
+    if args.set_credit is not None:
+        lane, value = args.set_credit
+        try:
+            usd = float(value)
+            at = time.time()
+            if args.credit_at:
+                stamp = datetime.fromisoformat(args.credit_at.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    raise ValueError("timezone required")
+                at = stamp.timestamp()
+            if lane != "opencode" or not math.isfinite(usd) or usd < 0 or at > time.time() or not args.credit_source.strip():
+                raise ValueError("invalid anchor")
+        except (ValueError, OverflowError):
+            parser.error("--set-credit requires opencode, a finite nonnegative USD balance, a nonfuture timezone-aware time and a source")
+        save_credits({lane: {"usd": usd, "at": at, "source": args.credit_source}}, CREDITS)
+        print(f"Stored {lane} balance anchor at {datetime.fromtimestamp(at, timezone.utc).isoformat()} ({args.credit_source}).")
+        return 0
     if args.loop_interval:
         answer = loop_interval_answer(args.pools, cfg)
         if args.json:
             print(json.dumps(answer))
         else:
             print(f"{answer['seconds']} {answer['reason']}")
+        return 0
+    if args.burn:
+        report = burn_report(cfg)
+        print(json.dumps(report) if args.json else "\n".join(burn_lines(report)))
         return 0
     if args.plans:
         plans = plans_from(cfg)
@@ -866,6 +1035,13 @@ def main(argv):
         if not args.pools:
             pools = with_credits(pools, [lane for lane in lanes_from(cfg) if lane.get("credit") == "commandcode"], cfg)
         plans = [dict(plan, usage=pools.get(plan["pool"]) or {}) if plan.get("pool") else plan for plan in plans]
+        state = opencode_pool(None, cfg)
+        plans = [dict(plan, status=("included allowance used up; extra usage " + state["state"])
+                      if state.get("included_exhausted") else state["state"], note=state["note"],
+                      windows=state.get("windows", {}), credits_usd=state.get("credits_usd"),
+                      resets_at=state.get("resets_at"))
+                 if plan.get("vendor") == "opencode" else plan for plan in plans]
+
         if args.json:
             print(json.dumps(plans))
         else:
@@ -901,9 +1077,9 @@ def main(argv):
         print(f"Lane {args.limited} is skipped until {datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC.")
         return 0
     try:
-        pools = read_pools(args.pools)
+        pools = with_opencode(read_pools(args.pools), cfg)
         if not args.pools:
-            pools = with_credits(with_opencode(pools, cfg), lanes, cfg)
+            pools = with_credits(pools, lanes, cfg)
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
         return 1

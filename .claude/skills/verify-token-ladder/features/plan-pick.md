@@ -10,6 +10,8 @@ plan-pick chooses a worker lane from pool state, prints human or JSON plans, gat
 - `loop-interval` prints sleep seconds from Claude pace state.
 - `claude-helper` allows or refuses Sonnet helper use from pool pace.
 - `run-stub` runs a stub lane command end to end without real spend.
+- `prepaid-credit` uses live OpenCode credit or a balance anchor less recorded run costs for at most seven days, stops at $2, and waits until monthly renewal once the floor is reached.
+- `burn` reports current-month recorded pi costs and the separate measured 30-day DeepSeek direct account total.
 - `commandcode` reports weighted GOAT credit and refuses private or unknown repositories before launching pi.
 
 ## How to get to it (user POV)
@@ -34,6 +36,15 @@ Preconditions:
 - **Loop interval.** Run `bin/plan-pick --pools "$HOME/pools.json" --loop-interval --json` with pools `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.16}}`. Exit `0`. stdout JSON has `"seconds":10800` and `"reason":"claude pace 1.16x ahead"`.
 - **Claude helper refused.** Run `bin/plan-pick --pools "$HOME/pools.json" --claude-helper` with `{"claude":{"state":"ON","used_pct":40.0,"pace_ratio":1.8}}`. Exit `3`. stdout starts with `Claude helper: refused.`
 - **Stub run.** In a temp dir, copy `bin/plan-pick`, write `config.json` with lanes `a` (`echo '429'; exit 1`) then `b` (`echo worker-done`), empty pools file, run `bin/plan-pick --pools "$HOME/pools.json" --run`. Exit `0`. stdout contains `worker-done`. stderr mentions `lane a hit a rate or usage limit`.
+
+## Credit and retirement regression
+
+Run `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k PrepaidCreditTests`.
+Also run `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k AnchoredCreditTests` and `timeout 120 python3 -m unittest discover -s tests -p test_plan_pick.py -k test_set_credit_and_usage_logs_drive_selection_without_browser_credit`.
+These checks use isolated state and command stubs, never a real key or browser. They prove monthly 100% with weekly/5-hour 0% uses live credit or a stored anchor.
+They cover recorded run-cost deductions, the $0.50 unknown-run default, copied message deduplication, unmatched launches, the inclusive $2 floor, live anchor replacement, seven-day expiry, renewal hold, UTC/source recording, and preservation during background refresh.
+The CLI journey records an anchor, selects OpenCode without browser credit, adds pi costs, and selects Vercel once the balance drops below $2.
+The existing checks also cover read-only command flags, DeepSeek direct retirement, and the separate measured burn report.
 
 ## Gotchas
 

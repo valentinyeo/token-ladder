@@ -783,7 +783,7 @@ class LadderCallTests(unittest.TestCase):
         models = {lane['name']: lane['model'] for lane in lanes}
         self.assertEqual(models['vercel-ai-gateway'], 'deepseek/deepseek-v4.1-flash')
         self.assertEqual(models['openrouter'], 'deepseek/deepseek-v4.1-flash-1017')
-        self.assertEqual(models['deepseek'], 'deepseek-flash')
+        self.assertNotIn('deepseek', models)
 
     def test_lane_without_gateway_key_sends_no_provider_options(self):
         StubHandler.last_bodies = []
