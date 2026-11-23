@@ -39,6 +39,8 @@ LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
 LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
 EMERGENCY = os.path.expanduser("~/.local/state/token-ladder/claude-emergency.json")
+STATUS = os.path.expanduser("~/.local/state/token-ladder/status.json")
+CLAUDE_HELPER_STALE_SECONDS = 15 * 60
 PI = os.path.expanduser("~/.npm-global/bin/pi")
 PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
 DEFAULT_CREDIT_FLOOR_USD = 2.0
@@ -296,8 +298,9 @@ def set_emergency(until_text, reason, now=None, path=EMERGENCY):
     return data
 
 
-def read_emergency(now=None, path=EMERGENCY):
+def read_emergency(now=None, path=None):
     now = time.time() if now is None else now
+    path = EMERGENCY if path is None else path
     try:
         with open(path) as fh:
             data = json.load(fh)
@@ -313,27 +316,57 @@ def read_emergency(now=None, path=EMERGENCY):
     return {"until": data["until"], "reason": str(data.get("reason", ""))}
 
 
-def claude_helper(pools, warn=DEFAULT_PACE_WARN, now=None, path=EMERGENCY):
+def format_age(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, rem = divmod(minutes, 60)
+    return f"{hours}h{rem}m" if rem else f"{hours}h"
+
+
+def read_cached_claude_pool(path=None, now=None):
+    path = STATUS if path is None else path
+    now = time.time() if now is None else now
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}, None
+    if not isinstance(data, dict):
+        return {}, None
+    pools = data.get("pools")
+    claude = pools.get("claude") if isinstance(pools, dict) else None
+    if not isinstance(claude, dict):
+        return {}, None
+    ts = number(data.get("ts"))
+    age = max(0.0, now - ts) if ts is not None and math.isfinite(ts) else None
+    return {"claude": claude}, age
+
+
+def claude_helper(pools, warn=DEFAULT_PACE_WARN, now=None, path=None,
+                  reading_age=None, stale_seconds=CLAUDE_HELPER_STALE_SECONDS):
     pool = pools.get("claude") if isinstance(pools, dict) else None
+    stale = (f"; stale reading {format_age(reading_age)}"
+             if isinstance(pool, dict) and reading_age is not None and reading_age > stale_seconds else "")
     why = skip_reason(pool, warn, no_pace=True)
     if why:
-        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper"}
+        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper{stale}"}
     ratio = number(pool.get("pace_ratio")) if isinstance(pool, dict) else None
     emergency = read_emergency(now, path)
     if emergency:
         pace = "unknown" if ratio is None else f"{ratio:.2f}x"
         return {"allowed": True, "reason": f"emergency allowance until {emergency['until']} "
-                                           f"({emergency['reason']}); pace {pace}"}
+                                           f"({emergency['reason']}); pace {pace}{stale}"}
     why = skip_reason(pool, warn)
     if why:
-        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper"}
+        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper{stale}"}
     if not isinstance(pool, dict):
         note = "no Claude reading, assumed under pace"
     elif ratio is None:
         note = "pace unknown, not ahead"
     else:
         note = f"pace {ratio:.2f}x, within {warn:g}x"
-    return {"allowed": True, "reason": f"Claude is under its pace: {note}"}
+    return {"allowed": True, "reason": f"Claude is under its pace: {note}{stale}"}
 
 
 def loop_rule(cfg):
@@ -2331,6 +2364,22 @@ def main(argv):
         print("Claude emergency allowance removed." if data is None
               else f"Claude emergency allowance until {data['until']} ({data['reason']}).")
         return 0
+    if args.claude_helper:
+        if args.pools:
+            try:
+                pools = read_pools(args.pools)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
+                return 1
+            reading_age = None
+        else:
+            pools, reading_age = read_cached_claude_pool()
+        answer = claude_helper(pools, warn, reading_age=reading_age)
+        if args.json:
+            print(json.dumps(answer))
+        else:
+            print(f"Claude helper: {'allowed' if answer['allowed'] else 'refused'}. Why: {answer['reason']}.")
+        return 0 if answer["allowed"] else 3
     try:
         pools = with_opencode(read_pools(args.pools), cfg)
         if not args.pools:
@@ -2342,13 +2391,6 @@ def main(argv):
         print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
         return 1
     pools = with_antigravity_reserve(pools, cfg)
-    if args.claude_helper:
-        answer = claude_helper(pools, warn)
-        if args.json:
-            print(json.dumps(answer))
-        else:
-            print(f"Claude helper: {'allowed' if answer['allowed'] else 'refused'}. Why: {answer['reason']}.")
-        return 0 if answer["allowed"] else 3
     excluded = vendor_exclusions(args.not_vendor)
     if excluded:
         lanes = [lane for lane in lanes if not any(name in lane_names(lane) for name in excluded)]
