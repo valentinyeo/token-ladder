@@ -76,7 +76,7 @@
       "name": "Claude",
       "vendor": "anthropic",
       "included_models": ["Claude Opus 5.5", "Claude Sonnet 5.5", "Claude Haiku 5.5", "Claude Fable"],
-      "runs_on": ["local"],
+      "runs_on": ["local", "cloud"],
       "extra_cost": "none",
       "source": "unknown"
     },

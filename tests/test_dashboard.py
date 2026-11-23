@@ -181,6 +181,35 @@ class DashboardRendererTests(unittest.TestCase):
         ):
             self.assertIn(text, page)
 
+    def test_cloud_agents_badges_follow_plan_fixtures(self):
+        cfg = json.loads((FIXTURES / "dashboard-cloud-plans.json").read_text())
+        page = tl.render_dashboard(base_status(cfg=cfg, pools={}))
+        cards = page.split('<div class="card">')[1:]
+        for plan in cfg["plans"]:
+            with self.subTest(plan=plan["name"]):
+                card = next(card for card in cards if f'<b>{plan["name"]}</b>' in card)
+                self.assertEqual('<span class="badge info">Cloud agents</span>' in card,
+                                 plan["name"] in {"Cloud workshop", "Hybrid studio"})
+
+    def test_cloud_agents_badges_on_supported_plans(self):
+        cfg = tl.load_config()
+        page = tl.render_dashboard(base_status(cfg=cfg, pools={}))
+        cards = page.split('<div class="card">')[1:]
+        for plan in cfg["plans"]:
+            with self.subTest(plan=plan["name"]):
+                card = next(card for card in cards if f'<b>{plan["name"]}</b>' in card)
+                self.assertEqual('<span class="badge info">Cloud agents</span>' in card,
+                                 plan["name"] in {"Claude", "ChatGPT / Codex", "Cursor"})
+
+    def test_antigravity_cloud_agents_badge_requires_config_opt_in(self):
+        cfg = tl.load_config()
+        plan = next(plan for plan in cfg["plans"] if plan.get("pool") == "google")
+        plan["runs_on"] = ["local", "cloud"]
+        page = tl.render_dashboard(base_status(cfg=cfg, pools={}))
+        card = next(card for card in page.split('<div class="card">')[1:]
+                    if '<b>Google Antigravity plan</b>' in card)
+        self.assertIn('<span class="badge info">Cloud agents</span>', card)
+
     def test_grok_used_up_comes_from_grok_json_or_limits_never_hardcoded(self):
         self.write_state("grok.json", {
             "pct": 100,

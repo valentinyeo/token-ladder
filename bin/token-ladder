@@ -1435,6 +1435,8 @@ def render_dashboard(s):
         pace = _fmt_pace(usage)
         reset = _fmt_reset(item, now, pp)
         badges = [_badge(item["status"], item["status_kind"])]
+        if "cloud" in item.get("runs_on", []):
+            badges.append(_badge("Cloud agents", "info"))
         if item.get("shared_with_chats"):
             badges.append(_badge("shared with chats", "info"))
         if item.get("chat_only"):
