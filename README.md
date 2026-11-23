@@ -35,7 +35,7 @@ The Cursor lane runs first while its `first_until` time is in the future (`2026-
 | 1 | OpenCode Go | Plan windows, then prepaid credit |
 | 2 | Antigravity (`agy`) | Google Antigravity plan quota, burned fully by the lane |
 | 3 | Vercel Token Pass | Token Pass balance only |
-| 4 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week; public repos only |
+| 4 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week |
 | 5 | OpenRouter | Prepaid credit |
 | 6 | Codex | Subscription pool |
 | 7 | Cursor | Subscription pool; last after `first_until` |
@@ -62,9 +62,9 @@ The reader calls `https://api.commandcode.ai/alpha/billing/credits` and `/alpha/
 
 The pi lane loads `tools/pi-commandcode.mjs` and uses the [OpenAI-compatible Provider API](https://commandcode.ai/docs/provider). Set `COMMANDCODE_API_KEY` in the environment, or the launch command reads the `credential` field of 1Password item `Commando Code API Key` with `yeo-key`. No key belongs in `config.json` or a PR.
 
-The Provider API docs explicitly support agent clients and coding plans. However, the [terms](https://commandcode.ai/terms) prohibit automated website requests, and the [privacy policy](https://commandcode.ai/privacy) allows up to 30 days of prompt retention and does not guarantee upstream no-training without [ZDR](https://commandcode.ai/docs/resources/zdr). This lane conservatively allows **public repos only**. `gh repo view --json visibility` checks the brief's declared repository, or its GitHub URLs, before selection and launch. Private, internal and unknown visibility are refused, including burn overrides. With no brief, it checks the current repository; an existing brief with no identifiable repository is refused.
+The Provider API docs explicitly support agent clients and coding plans. However, the [terms](https://commandcode.ai/terms) prohibit automated website requests, and the [privacy policy](https://commandcode.ai/privacy) allows up to 30 days of prompt retention and does not guarantee upstream no-training without [ZDR](https://commandcode.ai/docs/resources/zdr). Valentin approved this lane for every job on 2026-11-23, including private and internal repositories and unknown visibility. Repository visibility does not restrict selection or launch, including burn overrides. The generic `public_only` guard remains available, but no configured lane enables it.
 
-A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and `deepseek/deepseek-v4.1-flash` on 2026-11-22. It supports chat judging technically, but is not in `ci/lanes.json`: that caller has no repository-visibility guard. A future guarded judge lane would need `COMMANDCODE_API_KEY`; no GitHub secret is set by this change.
+A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and `deepseek/deepseek-v4.1-flash` on 2026-11-22. It supports chat judging technically, but is not in `ci/lanes.json`. A future judge lane would need `COMMANDCODE_API_KEY`; no GitHub secret is set by this change.
 
 The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lane uses one upstream provider, so neither can fall to Baseten when its credit runs low.
 The gateway carries two lanes, both pinned to Token Pass: the DeepSeek lane and, right after it, a `zai/glm-5.3-flash` judge lane. The Token Pass already covers that model, so the judge adds no cost, and a DeepSeek-authored PR still has a judge from another family.
