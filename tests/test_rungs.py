@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from _load import REPO, load_bin
+from _load import REPO, load_bin, tl
 
 pp = load_bin("plan-pick")
 
@@ -33,7 +33,7 @@ class RungTests(unittest.TestCase):
         self.assertEqual(self.context()["rung_source"], "brief line")
         ctx = self.context("Do something\n")
         self.assertEqual((ctx["rung"], ctx["rung_source"]), ("medium", "default"))
-        for text in ("Rung: turbo\n", "Rung: light\nRung: hard\n"):
+        for text in ("Rung: turbo\n", "Rung:\n", "Rung: light extra\n", "Rung: light\nRung: hard\n"):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 self.context(text)
 
@@ -50,6 +50,14 @@ class RungTests(unittest.TestCase):
         self.assertEqual([l["lane"] for l in medium], [l["lane"] for l in self.lanes if l["lane"] != "vercel-zai"])
         for lane in light + medium + hard:
             self.assertIn(lane["model"], self.cfg["list_prices"])
+
+    def test_guard_allows_only_the_pinned_glm_flash_lane(self):
+        lane = next(l for l in self.lanes if l["lane"] == "vercel-zai")
+        self.assertIsNone(tl.bash_refusal(lane["command"], {}))
+        for command in ("pi --provider vercel-ai-gateway --model zai/glm-5.3-flash -p hi",
+                        lane["command"].replace("zai/glm-5.3-flash", "zai/glm-5.3"),
+                        lane["command"].replace("vercel-ai-gateway", "openrouter-credit")):
+            self.assertIsNotNone(tl.bash_refusal(command, {}))
 
     def test_limits_and_pace_climb_but_hard_waits(self):
         ctx = self.context()
@@ -135,6 +143,19 @@ class RungTests(unittest.TestCase):
         self.assertEqual(output.tokens, {"in": 30, "cached": 170, "out": 14})
         self.assertEqual(output.pr_url, "https://github.com/a/b/pull/31")
         self.assertIsNone(self.output([{"kind": "tool_result", "output": "PR 99"}]).pr_url)
+
+    def test_real_command_captures_usage_before_the_tail(self):
+        script = self.root / "worker.py"
+        script.write_text("import json\n"
+                          "print(json.dumps({'kind': 'turn_usage', 'usage': {'in_tokens': 20, 'cached': 80, 'output': 9}}))\n"
+                          "print('x' * 30000)\n"
+                          "print(json.dumps({'type': 'result', 'text': 'https://github.com/a/b/pull/31'}))\n")
+        with mock.patch.object(pp.sys, "stdout", io.StringIO()):
+            code, output = pp.run_command(f"{sys.executable} {script}")
+        self.assertEqual(code, 0)
+        self.assertNotIn("turn_usage", output)
+        self.assertEqual(output.tokens, {"in": 20, "cached": 80, "out": 9})
+        self.assertEqual(output.pr_url, "https://github.com/a/b/pull/31")
 
     def test_antigravity_multiline_json_and_missing_usage(self):
         record = {"response": "https://github.com/a/b/pull/31", "stats": {"models": {

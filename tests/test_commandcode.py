@@ -172,6 +172,7 @@ class CommandCodeTests(unittest.TestCase):
         pools = root / "pools.json"
         pools.write_text(json.dumps({"credit:commandcode": {"state": "ON"}}))
         for visibility in ("PRIVATE", "INTERNAL", "", "PUBLIC"):
+            (root / "brief.txt").write_text(f"Repo owner/{visibility.lower() or 'unknown'}-repo\n")
             env = dict(os.environ, HOME=str(root), PATH=str(root) + os.pathsep + os.environ.get("PATH", ""),
                        TOKEN_LADDER_LOCAL_CONFIG=str(cfg), TEST_VISIBILITY=visibility)
             out = subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--run", "--pools", str(pools)],

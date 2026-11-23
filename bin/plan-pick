@@ -719,6 +719,8 @@ def first_verdict(pr, cache_path, run=subprocess.run):
 def lease_ticket(path=None):
     if path:
         receipt = read_state(path)
+        if not receipt:
+            raise ValueError("lease receipt missing or empty")
         ticket = receipt.get("ticket_id") or receipt.get("ticket") or receipt.get("key")
         if ticket is None:
             ticket = os.path.basename(path).removesuffix(".json")
@@ -747,7 +749,7 @@ def rung_context(brief, launches_path, lease=None):
             text = fh.read()
     except FileNotFoundError:
         text = ""
-    matches = re.findall(r"(?m)^Rung:[ \t]*(\S+)[ \t]*$", text)
+    matches = re.findall(r"(?m)^Rung:[ \t]*([^\r\n]*?)[ \t]*\r?$", text)
     if matches and (len(matches) != 1 or matches[0] not in RUNGS):
         raise ValueError("brief needs one Rung: light|medium|hard line")
     rung = matches[0] if matches else "medium"
