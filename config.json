@@ -67,6 +67,7 @@
       "lane": "cursor",
       "vendor": "cursor",
       "pool": "grok",
+      "first_until": "2026-11-24T23:59:00Z",
       "command": "~/.local/bin/cursor-agent -p --force --output-format text --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
     }
   ],
@@ -156,8 +157,7 @@
     }
   ],
   "opencode_monthly_slack_pct": 25,
-  "antigravity_reserve_share_pct": 60,
-  "antigravity_max_daily_runs": 15,
+  "antigravity_reserve_share_pct": 100,
   "limited_hours": 1,
   "pool_off_pct": 95,
   "claude_floor_percent": 15,

@@ -28,16 +28,17 @@ While `until` is in the future, `plan-pick` runs that lane first and ignores its
 
 `plan-pick` runs a background worker on the first lane in `config.json` `lanes` that is free.
 
+The Cursor lane runs first while its `first_until` time is in the future (`2026-11-24T23:59:00Z`, when Valentin's Cursor plan ends). After that time the order is the table below.
+
 | Order | Lane | Included usage / credit |
 |---|---|---|
 | 1 | OpenCode Go | Plan windows, then prepaid credit |
-| 2 | Antigravity (`agy`) | Google Antigravity plan quota; shared with chats, so the lane keeps a reserve |
+| 2 | Antigravity (`agy`) | Google Antigravity plan quota, burned fully by the lane |
 | 3 | Vercel Token Pass | Token Pass balance only |
 | 4 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week; public repos only |
 | 5 | OpenRouter | Prepaid credit |
-| 6 | DeepSeek direct | Prepaid credit |
-| 7 | Codex | Subscription pool |
-| 8 | Cursor | Subscription pool |
+| 6 | Codex | Subscription pool |
+| 7 | Cursor | Subscription pool; last after `first_until` |
 
 ### Antigravity worker lane
 
@@ -49,7 +50,7 @@ Google documents this use. [Headless mode](https://antigravity.google/docs/cli/h
 
 No extra cost holds only while overages are off. [CLI AI credits](https://antigravity.google/docs/cli/credits/) says the `useG1Credits` setting and the **AI Credit Overages** setting decide whether exhausted quota spends purchased credits, so that setting must stay on **Never**. The lane never changes it and never buys credit.
 
-The lane keeps a reserve for the chats on the same plan. With a known daily limit, `plan-pick` skips the lane once today's count reaches `antigravity_reserve_share_pct` (default 60) of that limit. With no known limit it caps the lane at `antigravity_max_daily_runs` (default 15) launched runs per UTC day, counted from the `antigravity` entries in `~/.local/state/token-ladder/launches.jsonl`. Neither number is a quota reading: the local history cannot separate chats from workers.
+The lane burns the whole Antigravity quota by default. `antigravity_reserve_share_pct` is 100, so no daily limit is held back for chats, and there is no default per-day run cap. The lane stops only when today's newest quota line in `~/.gemini/antigravity-cli/cli.log` is a `RESOURCE_EXHAUSTED` or quota-exceeded error; then the next lane runs. Lower `antigravity_reserve_share_pct` below 100 to keep part of a known daily limit for chats, or set `antigravity_max_daily_runs` to cap launched runs per UTC day from the `antigravity` entries in `~/.local/state/token-ladder/launches.jsonl`. Neither number is a quota reading: the local history cannot separate chats from workers.
 
 A run that fails early on `RESOURCE_EXHAUSTED` or any quota error marks the lane limited for `limited_hours` and launches the next lane with the same fast-fail path as the other lanes. An `agy` quota error written to `cli.log` also marks the `google` pool OFF, so the next pick skips the lane without launching it.
 
@@ -74,7 +75,7 @@ Change the pin in `ci/lanes.json` and both paths follow.
 
 ## Google Antigravity usage
 
-`plan-pick --plans` shows the `google` pool as shared with chats, with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. The `antigravity` worker lane reads this pool and keeps the chat reserve described under [Antigravity worker lane](#antigravity-worker-lane).
+`plan-pick --plans` shows the `google` pool as shared with chats, with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. The `antigravity` worker lane reads this pool and burns it fully by default, as described under [Antigravity worker lane](#antigravity-worker-lane).
 
 The read-only fallback counts `timestamp` metadata in `~/.gemini/antigravity-cli/history.jsonl` from midnight UTC through now. These timestamps are milliseconds since the Unix epoch. The count covers local history entries, which can include slash commands, not model requests, tokens or quota consumption. Other devices, retries, tool calls and unrecorded chats are not counted. The reader never opens credential or token files, calls a quota endpoint, signs in, buys overages or runs an agent.
 

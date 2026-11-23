@@ -40,8 +40,8 @@ DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
 ANTIGRAVITY_LANE = "antigravity"
 ANTIGRAVITY_POOL = "google"
-DEFAULT_ANTIGRAVITY_RESERVE_SHARE_PCT = 60
-DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS = 15
+DEFAULT_ANTIGRAVITY_RESERVE_SHARE_PCT = 100
+DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS = None
 DEFAULT_LOOP_BASE_SECONDS = 7200
 DEFAULT_LOOP_AHEAD_SECONDS = 10800
 DEFAULT_LOOP_FAR_AHEAD_SECONDS = 14400
@@ -258,12 +258,37 @@ def load_config():
     return cfg
 
 
-def lanes_from(cfg):
+def lane_first_until(lane):
+    raw = lane.get("first_until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    try:
+        return stamp.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def lanes_with_first(lanes, now=None):
+    now = time.time() if now is None else now
+    front = [lane for lane in lanes if (lane_first_until(lane) or 0) > now]
+    if not front:
+        return lanes
+    return front + [lane for lane in lanes if lane not in front]
+
+
+def lanes_from(cfg, now=None):
     lanes = cfg.get("lanes")
     if not isinstance(lanes, list):
         return []
-    return [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
-            and isinstance(lane.get("command"), str)]
+    usable = [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
+              and isinstance(lane.get("command"), str)]
+    return lanes_with_first(usable, now)
 
 
 def with_repo_visibility(pools, lanes, brief="brief.txt", run=subprocess.run):
@@ -334,7 +359,7 @@ def plan_line(plan, credit=None):
         used, limit, pace = (number(usage.get(key)) for key in ("used", "limit", "pace_ratio"))
         line += f" Pool: {plan['pool']}."
         if plan.get("shared_with_chats"):
-            line += " Shared with chats, so worker runs keep a reserve."
+            line += " Shared with chats; the antigravity lane burns the full quota."
         line += f" Used: {used:g}" if used is not None else " Used: unknown"
         if usage.get("unit"):
             line += f" {usage['unit']}"
@@ -1053,12 +1078,12 @@ def antigravity_reserve(pool, cfg, ran):
     used, limit = number(pool.get("used")), number(pool.get("limit"))
     if limit is not None and limit > 0:
         share = reserve_share_pct(cfg)
-        if used is not None and used >= limit * share / 100:
-            return f"reserve for chats: {used:g} of {limit:g} today is at or past {share:g}%"
+        if share < 100 and used is not None and used >= limit * share / 100:
+            return f"daily limit: {used:g} of {limit:g} today is at or past {share:g}%"
         return None
     cap = max_daily_runs(cfg)
-    if ran >= cap:
-        return f"reserve for chats: {ran:g} worker runs today, daily cap {cap:g}"
+    if cap is not None and ran >= cap:
+        return f"daily cap: {ran:g} worker runs today, cap {cap:g}"
     return None
 
 

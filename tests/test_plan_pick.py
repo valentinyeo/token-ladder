@@ -982,12 +982,18 @@ class BurnTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
-    def test_shipped_lanes_follow_valentins_order(self):
+    def test_shipped_lanes_follow_valentins_order_after_cursor_ends(self):
         cfg = pp.load_config()
-        lanes = pp.lanes_from(cfg)
+        lanes = pp.lanes_from(cfg, tl.iso_to_ts("2026-11-25T00:00:00Z"))
         self.assertEqual([lane["lane"] for lane in lanes],
                          ["opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex", "cursor"])
         self.assertEqual(cfg["pace_warn_ratio"], pp.DEFAULT_PACE_WARN)
+
+    def test_cursor_first_until_its_plan_ends(self):
+        cfg = pp.load_config()
+        before = pp.lanes_from(cfg, tl.iso_to_ts("2026-11-24T12:00:00Z"))
+        self.assertEqual(before[0]["lane"], "cursor")
+        self.assertEqual(before[0]["first_until"], "2026-11-24T23:59:00Z")
 
     def test_shipped_commands_obey_the_model_rules(self):
         for lane in pp.lanes_from(pp.load_config()):
@@ -1145,18 +1151,25 @@ class CommandTests(unittest.TestCase):
                           " print(json.dumps({'measured_at': datetime.fromtimestamp(row['at'], timezone.utc).isoformat(), 'windows': [{'name': k, 'used': v} for k, v in row['windows'].items()]}))\n")
         self.local_config = str(Path(self.home, "local.json"))
         Path(self.local_config).write_text(json.dumps({"opencode_reader_command": [sys.executable, str(reader)]}))
+        lanes = [dict(lane) for lane in pp.load_config()["lanes"]]
+        for lane in lanes:
+            if lane["lane"] == "cursor":
+                lane["first_until"] = "2026-01-01T00:00:00Z"
+        self.ordered_config = str(Path(self.home, "ordered.json"))
+        Path(self.ordered_config).write_text(json.dumps({"opencode_reader_command": [sys.executable, str(reader)],
+                                                         "lanes": lanes}))
 
-    def cli(self, *args):
+    def cli(self, *args, config=None):
         return subprocess.run([sys.executable, str(Path(REPO) / "bin" / "plan-pick"), *args],
                               capture_output=True, text=True,
                               env={"HOME": self.home, "PATH": "/usr/bin:/bin",
                                    "PLAN_PICK_PACING_DIR": str(self.pacing),
-                                   "TOKEN_LADDER_LOCAL_CONFIG": self.local_config})
+                                   "TOKEN_LADDER_LOCAL_CONFIG": config or self.ordered_config})
 
-    def run_cli(self, pools, *args):
+    def run_cli(self, pools, *args, config=None):
         path = Path(self.home) / "pools.json"
         path.write_text(json.dumps(pools))
-        return self.cli("--pools", str(path), *args)
+        return self.cli("--pools", str(path), *args, config=config)
 
     def plan_not_from(self, vendor, earlier=(), *args):
         home = tempfile.mkdtemp()
@@ -1164,7 +1177,7 @@ class CommandTests(unittest.TestCase):
         pools.write_text("{}")
         env = {"HOME": home, "PATH": "/usr/bin:/bin",
                "PLAN_PICK_PACING_DIR": str(self.pacing),
-               "TOKEN_LADDER_LOCAL_CONFIG": self.local_config}
+               "TOKEN_LADDER_LOCAL_CONFIG": self.ordered_config}
         cmd = [sys.executable, str(Path(REPO) / "bin" / "plan-pick"), "--pools", str(pools)]
         for lane in earlier:
             subprocess.run(cmd + ["--limited", lane], capture_output=True, text=True, env=env)
@@ -1338,9 +1351,9 @@ class CommandTests(unittest.TestCase):
 
     def test_set_credit_and_usage_logs_drive_selection_without_browser_credit(self):
         now = datetime.now(timezone.utc).timestamp()
-        cfg = json.loads(Path(self.local_config).read_text())
+        cfg = json.loads(Path(self.ordered_config).read_text())
         cfg['opencode_monthly_renewal'] = datetime.fromtimestamp(now + 86400, timezone.utc).isoformat()
-        Path(self.local_config).write_text(json.dumps(cfg))
+        Path(self.ordered_config).write_text(json.dumps(cfg))
         (self.pacing / 'opencode-history.jsonl').write_text(json.dumps(
             {'at': now, 'windows': month_full_windows()}))
         stamp = datetime.fromtimestamp(now - 3600, timezone.utc).isoformat()
@@ -1416,7 +1429,7 @@ class CommandTests(unittest.TestCase):
                  "unit": "local history entries today (UTC)", "shared_with_chats": True}
         out = self.run_cli({"google": usage}, "--plans")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("Pool: google. Shared with chats, so worker runs keep a reserve.", out.stdout)
+        self.assertIn("Pool: google. Shared with chats; the antigravity lane burns the full quota.", out.stdout)
         self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown.", out.stdout)
         self.assertNotIn("Used up", out.stdout)
         plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
@@ -1436,7 +1449,7 @@ class CommandTests(unittest.TestCase):
     def test_plans_survives_unavailable_google_reading(self):
         out = self.cli("--plans", "--pools", "/nonexistent")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("Pool: google. Shared with chats, so worker runs keep a reserve. "
+        self.assertIn("Pool: google. Shared with chats; the antigravity lane burns the full quota. "
                       "Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
 
     def test_limited_unknown_lane_fails(self):

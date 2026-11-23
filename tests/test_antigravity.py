@@ -11,6 +11,7 @@ from _load import REPO, load_bin, tl
 pp = load_bin("plan-pick")
 
 NOW = tl.iso_to_ts("2026-11-22T12:00:00Z")
+AFTER_CURSOR = tl.iso_to_ts("2026-11-25T00:00:00Z")
 NEON = "gemini-4-neon-high"
 EXHAUSTED = ("E1122 09:05:00.123456      47 quota_manager.go:120] doRefreshQuota: refresh failed: "
              "rpc error: code = ResourceExhausted desc = quota exceeded for gemini-4-neon-high")
@@ -21,8 +22,8 @@ def google(used=None, limit=None, state="unknown"):
             "unit": "local history entries today (UTC)", "chat_only": False, "shared_with_chats": True}
 
 
-def lanes():
-    return pp.lanes_from(pp.load_config())
+def lanes(now=AFTER_CURSOR):
+    return pp.lanes_from(pp.load_config(), now)
 
 
 def lane_in_order(name):
@@ -42,6 +43,36 @@ class LaneOrderTests(unittest.TestCase):
         self.assertEqual(got["plan"], "antigravity")
         self.assertTrue(got["command"].endswith("</dev/null"))
         self.assertEqual(names[:2], ["opencode", "antigravity"])
+
+
+class CursorFirstTests(unittest.TestCase):
+    def order(self, now):
+        return [lane["lane"] for lane in pp.lanes_from(pp.load_config(), now)]
+
+    def test_cursor_is_first_the_day_before_its_plan_ends(self):
+        self.assertEqual(self.order(tl.iso_to_ts("2026-11-24T12:00:00Z")),
+                         ["cursor", "opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex"])
+
+    def test_cursor_is_last_the_day_after_its_plan_ends(self):
+        self.assertEqual(self.order(AFTER_CURSOR),
+                         ["opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex", "cursor"])
+
+    def test_the_end_date_comes_from_the_cursor_lane_config(self):
+        cursor = next(lane for lane in self.order_lanes(AFTER_CURSOR) if lane["lane"] == "cursor")
+        self.assertEqual(cursor["first_until"], "2026-11-24T23:59:00Z")
+        self.assertEqual(pp.lane_first_until(cursor), tl.iso_to_ts("2026-11-24T23:59:00Z"))
+
+    def test_the_pick_follows_the_same_clock(self):
+        self.assertEqual(self.pick_at(tl.iso_to_ts("2026-11-24T12:00:00Z")), "cursor")
+        self.assertEqual(self.pick_at(AFTER_CURSOR), "opencode")
+
+    def order_lanes(self, now):
+        return pp.lanes_from(pp.load_config(), now)
+
+    def pick_at(self, now):
+        lanes = self.order_lanes(now)
+        pools = {lane.get("pool") or lane["lane"]: {"state": "ON", "pace_ratio": 0.2} for lane in lanes}
+        return pp.pick(lanes, pools, {}, now)["plan"]
 
 
 class CommandShapeTests(unittest.TestCase):
@@ -85,39 +116,47 @@ class ReserveTests(unittest.TestCase):
         pools = pp.with_antigravity_reserve({"google": pool}, cfg or {}, NOW, self.launches)
         return pp.pick(lanes(), pools, {"opencode": NOW + 600}, NOW)
 
-    def test_skips_once_todays_known_limit_passes_the_chat_share(self):
-        self.assertEqual(self.pick(google(used=7, limit=10))["plan"], "vercel")
-        self.assertIn("reserve for chats", self.pick(google(used=7, limit=10))["reason"])
+    def test_the_default_burns_todays_whole_known_limit(self):
+        self.assertEqual(self.pick(google(used=7, limit=10))["plan"], "antigravity")
+        self.assertEqual(self.pick(google(used=10, limit=10))["plan"], "antigravity")
 
-    def test_stays_available_under_the_chat_share(self):
-        self.assertEqual(self.pick(google(used=5, limit=10))["plan"], "antigravity")
+    def test_a_lowered_share_still_keeps_room_for_chats(self):
+        got = self.pick(google(used=7, limit=10), {"antigravity_reserve_share_pct": 60})
+        self.assertEqual(got["plan"], "vercel")
+        self.assertIn("daily limit", got["reason"])
 
-    def test_share_is_configurable(self):
+    def test_a_share_under_the_used_count_keeps_the_lane(self):
         self.assertEqual(self.pick(google(used=7, limit=10), {"antigravity_reserve_share_pct": 80})["plan"],
                          "antigravity")
 
-    def test_unknown_limit_caps_todays_worker_runs(self):
-        self.write_launches(14)
-        self.assertEqual(self.pick(google(used=14))["plan"], "antigravity")
-        self.write_launches(15)
-        got = self.pick(google(used=15))
-        self.assertEqual(got["plan"], "vercel")
-        self.assertIn("daily cap 15", got["reason"])
+    def test_there_is_no_default_daily_run_cap(self):
+        self.write_launches(50)
+        self.assertEqual(self.pick(google(used=50))["plan"], "antigravity")
 
-    def test_unknown_limit_cap_is_configurable(self):
+    def test_a_configured_daily_run_cap_still_applies(self):
         self.write_launches(2)
         self.assertEqual(self.pick(google(used=2), {"antigravity_max_daily_runs": 3})["plan"], "antigravity")
-        self.assertEqual(self.pick(google(used=2), {"antigravity_max_daily_runs": 2})["plan"], "vercel")
+        got = self.pick(google(used=2), {"antigravity_max_daily_runs": 2})
+        self.assertEqual(got["plan"], "vercel")
+        self.assertIn("2 worker runs today, cap 2", got["reason"])
 
     def test_other_lanes_and_older_days_do_not_count(self):
         self.write_launches(20, lane="vercel")
         self.write_launches(20, at=NOW - 36 * 3600)
-        self.assertEqual(self.pick(google(used=20))["plan"], "antigravity")
+        self.assertEqual(self.pick(google(used=20), {"antigravity_max_daily_runs": 5})["plan"], "antigravity")
 
-    def test_absent_config_values_fall_back_to_the_defaults(self):
-        self.write_launches(15)
-        self.assertEqual(self.pick(google(used=15), {})["plan"], "vercel")
-        self.assertEqual(self.pick(google(used=15), {"antigravity_max_daily_runs": None})["plan"], "vercel")
+    def test_absent_or_null_config_values_keep_burning(self):
+        self.write_launches(50)
+        self.assertEqual(self.pick(google(used=50), {})["plan"], "antigravity")
+        self.assertEqual(self.pick(google(used=50), {"antigravity_max_daily_runs": None})["plan"], "antigravity")
+        self.assertEqual(self.pick(google(used=50), {"antigravity_reserve_share_pct": None})["plan"],
+                         "antigravity")
+
+    def test_the_shipped_defaults_burn_the_quota(self):
+        cfg = pp.load_config()
+        self.assertEqual(cfg["antigravity_reserve_share_pct"], 100)
+        self.assertNotIn("antigravity_max_daily_runs", cfg)
+        self.assertIsNone(pp.DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS)
 
     def test_a_used_up_reading_is_left_alone(self):
         pools = {"google": {"state": "OFF", "used": 3, "limit": 10, "used_up": True}}
