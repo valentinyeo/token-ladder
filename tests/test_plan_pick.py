@@ -1147,7 +1147,7 @@ class ConfigTests(unittest.TestCase):
         cfg = pp.load_config()
         lanes = pp.lanes_from(cfg, tl.iso_to_ts("2026-11-25T00:00:00Z"))
         self.assertEqual([lane["lane"] for lane in lanes],
-                         ["opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex", "cursor"])
+                         ["opencode", "antigravity", "vercel", "vercel-zai", "commandcode", "openrouter", "codex", "cursor"])
         self.assertEqual(cfg["pace_warn_ratio"], pp.DEFAULT_PACE_WARN)
 
     def test_cursor_first_until_its_plan_ends(self):
@@ -1164,7 +1164,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertNotIn("baseten", command)
                 self.assertNotRegex(command, r"deepseek\S*pro")
                 self.assertNotIn("claude", command)
-                self.assertIn(lane.get("vendor"), ("deepseek", "openai", "cursor", "google"))
+                self.assertIn(lane.get("vendor"), ("deepseek", "openai", "cursor", "google", "zai"))
                 self.assertIn(lane.get("credit"), (None, *pp.BALANCES))
                 self.assertTrue(command.endswith("</dev/null"), command)
                 self.assertIsNone(tl.bash_refusal(lane["command"], {}), lane["command"])
@@ -1203,7 +1203,7 @@ class PlansTests(unittest.TestCase):
         self.assertEqual(cursor["source"], "Valentin, 2026-11-20")
 
     def test_every_lane_vendor_has_a_plan(self):
-        vendors = {plan["vendor"] for plan in self.plans}
+        vendors = {vendor for plan in self.plans for vendor in (plan["vendor"], *plan.get("model_vendors", []))}
         for lane in pp.lanes_from(pp.load_config()):
             with self.subTest(lane=lane["lane"]):
                 self.assertIn(lane["vendor"], vendors)
@@ -1348,7 +1348,7 @@ class CommandTests(unittest.TestCase):
         out = self.run_cli({"codex": pool()}, "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
         got = json.loads(out.stdout)
-        self.assertEqual(sorted(got), ["command", "plan", "reason"])
+        self.assertEqual(sorted(got), ["command", "plan", "reason", "rung", "rung_reason", "rung_source"])
         self.assertEqual(got["plan"], "opencode")
 
     def test_limited_after_a_429_moves_the_pick_to_the_next_lane(self):

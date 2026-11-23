@@ -25,11 +25,12 @@
       "lane": "opencode",
       "vendor": "deepseek",
       "pool": "opencode",
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "antigravity",
       "vendor": "google",
+      "effort": "high",
       "pool": "google",
       "shared_with_chats": true,
       "print_timeout": "45m",
@@ -40,7 +41,14 @@
       "credit": "vercel",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "vercel-zai",
+      "credit": "vercel",
+      "vendor": "zai",
+      "pool": null,
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model zai/glm-5.3-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "commandcode",
@@ -48,27 +56,27 @@
       "vendor": "deepseek",
       "pool": null,
       "public_only": false,
-      "command": "COMMANDCODE_API_KEY=\"${COMMANDCODE_API_KEY:-$(~/.local/bin/yeo-key 'Commando Code API Key' credential)}\" ~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-commandcode.mjs --provider commandcode --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+      "command": "COMMANDCODE_API_KEY=\"${COMMANDCODE_API_KEY:-$(~/.local/bin/yeo-key 'Commando Code API Key' credential)}\" ~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-commandcode.mjs --provider commandcode --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "openrouter",
       "credit": "openrouter",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "codex",
       "vendor": "openai",
       "pool": "codex",
-      "command": "~/.local/bin/hax --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.local/bin/hax --json --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "cursor",
       "vendor": "cursor",
       "pool": "grok",
       "first_until": "2026-11-24T23:59:00Z",
-      "command": "~/.local/bin/cursor-agent -p --force --output-format text --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.local/bin/cursor-agent -p --force --output-format json --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
     }
   ],
   "plans": [
@@ -99,7 +107,8 @@
     {
       "name": "Vercel AI Gateway Token Pass",
       "vendor": "vercel",
-      "included_models": ["DeepSeek V4.1 Flash"],
+      "included_models": ["DeepSeek V4.1 Flash", "GLM 5.3 Flash"],
+      "model_vendors": ["deepseek", "zai"],
       "runs_on": ["local"],
       "extra_cost": "none until the pass credit is used",
       "source": "unknown",
@@ -200,5 +209,109 @@
       "valentinyeo/token-ladder"
     ],
     "claude": []
+  },
+  "rungs": {
+    "light": [
+      {
+        "lane": "opencode",
+        "effort": "low"
+      },
+      {
+        "lane": "vercel",
+        "effort": "low"
+      },
+      {
+        "lane": "commandcode",
+        "effort": "low"
+      },
+      {
+        "lane": "openrouter",
+        "effort": "low"
+      },
+      {
+        "lane": "vercel-zai",
+        "effort": "low"
+      }
+    ],
+    "medium": [
+      {
+        "lane": "opencode"
+      },
+      {
+        "lane": "antigravity"
+      },
+      {
+        "lane": "vercel"
+      },
+      {
+        "lane": "commandcode"
+      },
+      {
+        "lane": "openrouter"
+      },
+      {
+        "lane": "codex"
+      },
+      {
+        "lane": "cursor"
+      }
+    ],
+    "hard": [
+      {
+        "lane": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "high"
+      },
+      {
+        "lane": "antigravity",
+        "model": "gemini-4-neon-high"
+      }
+    ]
+  },
+  "list_prices": {
+    "deepseek-v4.1-flash": {
+      "in": 0.15,
+      "cached": 0.003,
+      "out": 0.6
+    },
+    "deepseek/deepseek-v4.1-flash": {
+      "in": 0.15,
+      "cached": 0.003,
+      "out": 0.6
+    },
+    "deepseek/deepseek-v4.1-flash-1017": {
+      "in": 0.15,
+      "cached": 0.003,
+      "out": 0.6
+    },
+    "zai/glm-5.3-flash": {
+      "in": 0.15,
+      "cached": 0.03,
+      "out": 0.5
+    },
+    "gpt-6.1-sol": {
+      "in": 2,
+      "cached": 0.1,
+      "out": 10
+    },
+    "gemini-4-neon-high": {
+      "in": 3,
+      "cached": 0.15,
+      "out": 15
+    },
+    "composer-2.5": {
+      "in": 0.5,
+      "cached": 0.05,
+      "out": 2.5
+    }
+  },
+  "list_price_unit": "USD per million tokens; input excludes cached reads; list-equivalent, not invoices",
+  "list_price_sources": {
+    "as_of": "2026-11-23",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "glm": "https://docs.z.ai/guides/overview/pricing",
+    "openai": "https://developers.openai.com/api/docs/pricing",
+    "google": "https://ai.google.dev/gemini-api/docs/pricing",
+    "cursor": "https://cursor.com/docs/models"
   }
 }

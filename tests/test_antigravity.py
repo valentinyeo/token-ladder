@@ -51,11 +51,11 @@ class CursorFirstTests(unittest.TestCase):
 
     def test_cursor_is_first_the_day_before_its_plan_ends(self):
         self.assertEqual(self.order(tl.iso_to_ts("2026-11-24T12:00:00Z")),
-                         ["cursor", "opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex"])
+                         ["cursor", "opencode", "antigravity", "vercel", "vercel-zai", "commandcode", "openrouter", "codex"])
 
     def test_cursor_is_last_the_day_after_its_plan_ends(self):
         self.assertEqual(self.order(AFTER_CURSOR),
-                         ["opencode", "antigravity", "vercel", "commandcode", "openrouter", "codex", "cursor"])
+                         ["opencode", "antigravity", "vercel", "vercel-zai", "commandcode", "openrouter", "codex", "cursor"])
 
     def test_the_end_date_comes_from_the_cursor_lane_config(self):
         cursor = next(lane for lane in self.order_lanes(AFTER_CURSOR) if lane["lane"] == "cursor")
