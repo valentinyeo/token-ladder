@@ -29,9 +29,9 @@ CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|cr
 RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _-]?exhausted|"
                         r"limit (reached|exceeded)|hit your limit", re.I)
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
-SHIM_REFUSAL = re.compile(r"BLOCKED by heavy-local-guard:[ \t]*([\w.+-]+)"
-                          r"|^[ \t]*([\w.+-]+) is not installed on this host[ \t]*$"
-                          r"|plan-pick worker:[ \t]*([^.\n]+)", re.M)
+SHIM_REFUSAL = re.compile(r"BLOCKED by heavy-local-guard:[ \t]*([A-Za-z][\w.+-]*)"
+                          r"|^[ \t]*([A-Za-z][\w.+-]*) is not installed on this host[ \t]*$"
+                          r"|plan-pick worker:[ \t]*([A-Za-z][^.\n]*)", re.M)
 PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
 MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
