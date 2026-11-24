@@ -952,7 +952,7 @@ class VisionTests(unittest.TestCase):
         self.assertIn('lane vercel-ai-gateway skipped: no vision', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
         self.assertEqual(len(StubHandler.last_bodies), 1)
-        self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][1]['type'], 'image_url')
+        self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][-1]['type'], 'image_url')
 
     def test_no_vision_lane_left_answers_nothing(self):
         port = self.stub()
@@ -990,7 +990,7 @@ class VisionTests(unittest.TestCase):
         self.assertIn('lane vercel-ai-gateway skipped: excluded family deepseek', result.stderr)
         self.assertIn('lane vercel-ai-gateway-zai answered', result.stderr)
         self.assertEqual(StubHandler.last_bodies[0]['model'], 'zai/glm-5.3-flash')
-        self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][1]['type'], 'image_url')
+        self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][-1]['type'], 'image_url')
 
     def test_lane_rejecting_images_falls_through(self):
         StubHandler.last_bodies = []
@@ -1036,7 +1036,7 @@ class VisionTests(unittest.TestCase):
         messages = StubHandler.last_bodies[-1]['messages']
         self.assertEqual(len(messages), 3)
         self.assertEqual(messages[-1]['role'], 'user')
-        self.assertEqual(messages[-1]['content'][1]['type'], 'image_url')
+        self.assertEqual(messages[-1]['content'][-1]['type'], 'image_url')
 
     def test_image_limits_reject_the_request(self):
         cases = []
@@ -1071,7 +1071,7 @@ class VisionTests(unittest.TestCase):
                 lanes_file=lanes_path,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(StubHandler.last_bodies[-1]['messages'][-1]['content']), 2)
+        self.assertEqual(len(StubHandler.last_bodies[-1]['messages'][-1]['content']), 3)
 
     def test_real_lanes_mark_the_vision_models(self):
         lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text(encoding='utf-8'))
