@@ -29,6 +29,9 @@ CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|cr
 RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _-]?exhausted|"
                         r"limit (reached|exceeded)|hit your limit", re.I)
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
+SHIM_REFUSAL = re.compile(r"BLOCKED by heavy-local-guard:[ \t]*([\w.+-]+)"
+                          r"|^[ \t]*([\w.+-]+) is not installed on this host[ \t]*$"
+                          r"|plan-pick worker:[ \t]*([^.\n]+)", re.M)
 PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
 MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
@@ -891,7 +894,9 @@ def run_command(command):
             tail = (tail + line)[-TAIL_CHARS:]
         code = proc.wait()
         proc.stdout.close()
-        return code, measured_output(output, tail)
+        streamed = measured_output(output, tail)
+        streamed.streamed = True
+        return code, streamed
 
 
 def run_worker(command):
@@ -909,6 +914,41 @@ def unpack_run(result):
     if len(result) == 2:
         return result[0], result[1], 0.0, False
     return result
+
+
+def reprint_output(tail):
+    if getattr(tail, "streamed", False) or not str(tail).strip():
+        return False
+    sys.stdout.write(str(tail).rstrip("\n") + "\n")
+    sys.stdout.flush()
+    return True
+
+
+def shim_refusal(tail):
+    match = SHIM_REFUSAL.search(str(tail))
+    if not match:
+        return None
+    if match.group(1):
+        return match.group(1)
+    if match.group(2):
+        return match.group(2)
+    return " ".join(match.group(3).split())
+
+
+def last_words(tail):
+    said = getattr(tail, "final", None)
+    lines = [line for line in str(said).splitlines() if line.strip()] if isinstance(said, str) else []
+    if not lines:
+        lines = [line for line in str(tail).splitlines() if line.strip()]
+    return " ".join(lines[-1].split())[:300] if lines else ""
+
+
+def attempt_line(lane, code, elapsed, pr_url, empty, words):
+    if pr_url:
+        return f"lane {lane} finished after {elapsed:.0f}s: {pr_url}"
+    what = "with no output at all" if empty else "with no pull request"
+    line = f"lane {lane} exited {code} after {elapsed:.0f}s {what}"
+    return line + (f"; last output: {words}" if words else "")
 
 
 def log_launch(path, lane, now, not_vendor, metadata=None):
@@ -957,8 +997,17 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
                         "model": lane["model"], "effort": lane["effort"]}
         log_launch(launches_path, result["plan"], now, not_vendor, metadata)
         code, tail, elapsed, work = unpack_run(runner(result["command"]))
+        reprint_output(tail)
         info = analyze_output(tail)
         error_line = info["error_line"]
+        pr_url = getattr(tail, "pr_url", None)
+        refused = None if pr_url else shim_refusal(tail)
+        if refused:
+            if rung:
+                launch_finish(launches_path, launch_id, rung, lane, code or 1, tail, cfg, now, refused=refused)
+            say(f"lane {result['plan']} stopped on a worker-shim refusal ({refused}); "
+                f"recorded as environment, no rung climb")
+            return 1
         fast = fast_fail_kind(code, tail, elapsed, work)
         kind = limit_kind(code, tail)
         if kind == "silent" and work and code == 0:
@@ -971,9 +1020,10 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         lane_failure = kind is not None or fast is not None
         if rung:
             launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now,
-                          lane_failure=lane_failure)
+                          lane_failure=lane_failure, silent=info["empty"])
         if kind is None:
             if fast is None:
+                say(attempt_line(result["plan"], code, elapsed, pr_url, info["empty"], last_words(tail)))
                 return effective_code
             tried.add(result["plan"])
             source = "fast-fail 4xx" if nonquota_http else "fast-fail"
@@ -1089,14 +1139,14 @@ def lease_ticket(path=None):
     return lease_ticket(min(candidates)[1]) if candidates else None
 
 
-def lane_limit_attempt(prior):
-    if prior.get("failure") == "lane":
+def no_climb_attempt(prior):
+    if prior.get("failure") in ("lane", "silent", "environment"):
         return True
     return prior.get("failure") != "work" and prior.get("exit_code") == 75
 
 
 def climb_reason(prior, cache_path):
-    if lane_limit_attempt(prior):
+    if no_climb_attempt(prior):
         return None
     if prior["exit_code"] != 0 or not prior.get("pr_url"):
         return "prior run failed"
@@ -1128,7 +1178,7 @@ def rung_context(brief, launches_path, lease=None):
            "ticket": ticket, "job": key, "state_path": state_path, "cache_path": cache_path,
            "rung_reason": f"rung {rung}"}
     prior = read_state(state_path).get(key)
-    if prior and not lane_limit_attempt(prior):
+    if prior and not no_climb_attempt(prior):
         reason = climb_reason(prior, cache_path)
         old = prior["rung"]
         next_index = min(RUNGS.index(old) + int(reason is not None), len(RUNGS) - 1)
@@ -1259,21 +1309,27 @@ def measured_output(fh, tail):
             pass
     output = RunOutput(tail)
     output.tokens = totals if found and not incomplete else None
+    output.final = final if isinstance(final, str) else ""
     prs = PR_URL.findall(final if isinstance(final, str) else "")
     output.pr_url = f"https://github.com/{prs[-1][0]}/pull/{prs[-1][1]}" if prs else None
     output.analysis = analyze_stream(fh)
     return output
 
 
-def attempt_failure(code, pr_url, lane_failure):
+def attempt_failure(code, pr_url, lane_failure, refused=None, silent=False):
+    if refused:
+        return "environment"
     if lane_failure and code != 0:
         return "lane"
+    if silent and not pr_url:
+        return "silent"
     if code != 0 or not pr_url:
         return "work"
     return None
 
 
-def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_failure=False):
+def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_failure=False,
+                  refused=None, silent=False):
     tokens = getattr(output, "tokens", None)
     price = cfg.get("list_prices", {}).get(lane.get("model"), {})
     cost = None
@@ -1283,7 +1339,9 @@ def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_
     finish = {"event": "finish", "launch_id": launch_id, "finished_at": time.time() if now is None else now,
               "exit_code": code, "pr_url": pr_url, "tokens": tokens,
               "cost_usd": cost, "cost_basis": "list-equivalent",
-              "failure": attempt_failure(code, pr_url, lane_failure)}
+              "failure": attempt_failure(code, pr_url, lane_failure, refused=refused, silent=silent)}
+    if refused:
+        finish["refused"] = refused
     append_launch(path, finish)
     attempt = dict(finish, rung=ctx["rung"])
     update_state(ctx["state_path"], ctx["job"], attempt)
@@ -2344,7 +2402,7 @@ def main(argv):
                         help="skip lanes from VENDOR; repeat the flag or pass a comma list, so a review "
                              "comes from a different vendor than every author")
     parser.add_argument("--run", action="store_true",
-                        help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane")
+                        help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane; print the lane's output and what it did, and record a worker-shim refusal as environment")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
                         help="read the credit balance of these lanes (all credit lanes when none) and store it")
     parser.add_argument("--set-credit", nargs=2, metavar=("LANE", "USD"),

@@ -1,3 +1,4 @@
+import contextlib
 import io
 import json
 import subprocess
@@ -303,6 +304,69 @@ class LaneHealthTests(unittest.TestCase):
         finishes = [row for row in rows if row.get("event") == "finish"]
         self.assertEqual([row["exit_code"] for row in finishes], [1, 0])
         self.assertEqual(pp.read_limits(self.path)["opencode"]["source"], "429")
+
+
+class EarlyGiveUpTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.limits = str(self.root / "limits.json")
+        self.log = str(self.root / "launches.jsonl")
+        self.brief = self.root / "brief.txt"
+        self.brief.write_text("Rung: medium\n")
+        self.ctx = pp.rung_context(str(self.brief), self.log)
+        self.cfg = pp.load_config()
+        self.lanes = pp.lanes_from(self.cfg)
+
+    def fixture(self, name):
+        text = (Path(REPO) / "tests" / "fixtures" / name).read_text()
+        return pp.measured_output(io.StringIO(text), text)
+
+    def run_once(self, tail, work=False, code=0):
+        said = []
+        with contextlib.redirect_stdout(io.StringIO()) as printed:
+            result = pp.run_lanes(self.lanes, {}, self.cfg, 1.1,
+                                  runner=mock.Mock(return_value=(code, tail, 42.0, work)),
+                                  limits_path=self.limits, now=NOW, say=said.append,
+                                  launches_path=self.log, rung=self.ctx)
+        state = json.loads((Path(self.log).parent / "rung-attempts.json").read_text())[self.ctx["job"]]
+        return result, state, said, printed.getvalue()
+
+    def test_worker_shim_refusal_is_recorded_as_environment_with_its_command(self):
+        code, state, said, printed = self.run_once(self.fixture("worker-shim-refusal.jsonl"))
+        self.assertEqual(code, 1)
+        self.assertEqual((state["failure"], state["refused"]), ("environment", "gradle"))
+        self.assertTrue(any("worker-shim refusal (gradle)" in line for line in said), said)
+        self.assertEqual(pp.read_limits(self.limits), {})
+        self.assertIn("BLOCKED by heavy-local-guard: gradle", printed)
+        after = pp.rung_context(str(self.brief), self.log)
+        self.assertEqual((after["rung"], after["rung_source"]), ("medium", "brief line"))
+        self.assertNotIn("climb", after["rung_reason"])
+
+    def test_exit_zero_with_no_answer_is_a_silent_lane_fault_not_work(self):
+        code, state, said, _ = self.run_once(self.fixture("worker-no-answer.jsonl"), work=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(state["failure"], "silent")
+        after = pp.rung_context(str(self.brief), self.log)
+        self.assertEqual((after["rung"], after["rung_source"]), ("medium", "brief line"))
+
+    def test_lane_output_nothing_streamed_is_printed_for_the_caller(self):
+        output = pp.RunOutput("worker said hi")
+        output.streamed = False
+        output.pr_url = None
+        output.tokens = None
+        _, _, said, printed = self.run_once(output)
+        self.assertEqual(printed.strip(), "worker said hi")
+        self.assertTrue(any("no pull request" in line for line in said), said)
+
+    def test_lane_output_already_streamed_is_not_printed_twice(self):
+        output = pp.RunOutput("worker said hi")
+        output.streamed = True
+        output.pr_url = None
+        output.tokens = None
+        _, _, _, printed = self.run_once(output)
+        self.assertEqual(printed, "")
 
 
 if __name__ == "__main__":
