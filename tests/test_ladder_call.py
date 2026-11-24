@@ -872,6 +872,237 @@ class LadderCallTests(unittest.TestCase):
         self.assertIn('timeout', result.stderr)
 
 
+def png_file(directory, name, size=0):
+    path = Path(directory) / name
+    path.write_bytes(b'\x89PNG\r\n\x1a\n' + b'\0' * size)
+    return str(path)
+
+
+VISION_OK = {'choices': [{'message': {'content': 'PASS'}}]}
+
+
+def write_vision_lanes(port, lanes):
+    written = []
+    for lane in lanes:
+        lane = dict(lane, key_env=lane.get('key_env', 'AI_GATEWAY_API_KEY'))
+        lane.setdefault('url', f'http://127.0.0.1:{port}/v1/chat/completions')
+        lane.setdefault('model', 'deepseek/deepseek-v4.1-flash')
+        written.append(lane)
+    fh = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+    json.dump(written, fh)
+    fh.close()
+    return fh.name
+
+
+MICRO = 1024 * 1024
+
+
+class VisionTests(unittest.TestCase):
+    def stub(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({'/v1/chat/completions': (200, VISION_OK, None)})
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return port
+
+    def test_images_attach_to_the_last_user_message(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [{'name': 'vercel-ai-gateway', 'vision': True}])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            first = png_file(tmp, 'journey-1.png', 16)
+            second = png_file(tmp, 'journey-2.jpg', 16)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k'},
+                {'messages': [
+                    {'role': 'system', 'content': 'judge'},
+                    {'role': 'user', 'content': 'Review the journey.'},
+                ]},
+                lanes_file=lanes_path,
+                args=('--images', f'{first},{second}'),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('ladder-call: attaching 2 image(s)', result.stderr)
+        body = StubHandler.last_bodies[-1]
+        self.assertEqual(body['messages'][0]['content'], 'judge')
+        content = body['messages'][1]['content']
+        self.assertEqual(content[0], {'type': 'text', 'text': 'Review the journey.'})
+        self.assertTrue(content[1]['text'].startswith('Attached images, in this order: journey-1.png, journey-2.jpg'))
+        self.assertEqual(content[2]['type'], 'image_url')
+        self.assertTrue(content[2]['image_url']['url'].startswith('data:image/png;base64,'))
+        self.assertTrue(content[3]['image_url']['url'].startswith('data:image/jpeg;base64,'))
+        self.assertEqual(len(body['messages']), 2)
+
+    def test_text_only_lane_skipped_with_no_vision(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [
+            {'name': 'vercel-ai-gateway'},
+            {'name': 'opencode-go', 'key_env': 'OPENCODE_API_KEY', 'vision': True},
+        ])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k', 'OPENCODE_API_KEY': 'k2'},
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+                lanes_file=lanes_path,
+                args=('--images', image),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: no vision', result.stderr)
+        self.assertIn('lane opencode-go answered', result.stderr)
+        self.assertEqual(len(StubHandler.last_bodies), 1)
+        self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][1]['type'], 'image_url')
+
+    def test_no_vision_lane_left_answers_nothing(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [{'name': 'vercel-ai-gateway'}])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k'},
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+                lanes_file=lanes_path,
+                args=('--images', image),
+            )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('skipped: no vision', result.stderr)
+        self.assertIn('no lane answered', result.stderr)
+        self.assertEqual(StubHandler.last_bodies, [])
+
+    def test_images_survive_family_exclusion(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [
+            {'name': 'vercel-ai-gateway', 'model': 'deepseek/deepseek-v4.1-flash', 'vision': True},
+            {'name': 'vercel-ai-gateway-zai', 'model': 'zai/glm-5.3-flash', 'vision': True},
+        ])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k'},
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+                lanes_file=lanes_path,
+                args=('--images', image, '--exclude-families', 'deepseek'),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: excluded family deepseek', result.stderr)
+        self.assertIn('lane vercel-ai-gateway-zai answered', result.stderr)
+        self.assertEqual(StubHandler.last_bodies[0]['model'], 'zai/glm-5.3-flash')
+        self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][1]['type'], 'image_url')
+
+    def test_lane_rejecting_images_falls_through(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/reject': (400, {'error': 'unknown variant image_url'}, None),
+            '/accept': (200, VISION_OK, None),
+        })
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        lanes_path = write_vision_lanes(port, [
+            {'name': 'vercel-ai-gateway', 'url': f'http://127.0.0.1:{port}/reject', 'vision': True},
+            {'name': 'opencode-go', 'key_env': 'OPENCODE_API_KEY', 'url': f'http://127.0.0.1:{port}/accept', 'vision': True},
+        ])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k', 'OPENCODE_API_KEY': 'k2'},
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+                lanes_file=lanes_path,
+                args=('--images', image),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: 400 with images', result.stderr)
+        self.assertIn('lane opencode-go answered', result.stderr)
+
+    def test_image_only_turn_appended_after_non_user_message(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [{'name': 'vercel-ai-gateway', 'vision': True}])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k'},
+                {'messages': [
+                    {'role': 'user', 'content': '   '},
+                    {'role': 'assistant', 'content': 'ok'},
+                ]},
+                lanes_file=lanes_path,
+                args=('--images', image),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        messages = StubHandler.last_bodies[-1]['messages']
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[-1]['role'], 'user')
+        self.assertEqual(messages[-1]['content'][1]['type'], 'image_url')
+
+    def test_image_limits_reject_the_request(self):
+        cases = []
+        with tempfile.TemporaryDirectory() as tmp:
+            too_many = ','.join(png_file(tmp, f'shot-{index}.png', 4) for index in range(9))
+            cases.append((too_many, '9 images given, at most 8 fit'))
+            cases.append((png_file(tmp, 'huge.png', 2 * MICRO), 'per-image cap'))
+            total = ','.join(png_file(tmp, f'big-{index}.png', MICRO + MICRO // 2) for index in range(5))
+            cases.append((total, 'byte cap'))
+            cases.append((png_file(tmp, 'animation.gif', 4), 'not a .png, .jpg or .jpeg file'))
+            cases.append((str(Path(tmp) / 'absent.png'), 'not a file'))
+            for images, expected in cases:
+                with self.subTest(expected=expected):
+                    result = ladder_call(
+                        {'AI_GATEWAY_API_KEY': 'k'},
+                        {'messages': [{'role': 'user', 'content': 'hi'}]},
+                        args=('--images', images),
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, result.stderr)
+                    self.assertEqual(result.stdout, '')
+
+    def test_images_come_from_the_env_for_actions(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [{'name': 'vercel-ai-gateway', 'vision': True}])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_IMAGES': image + '\n'},
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+                lanes_file=lanes_path,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(StubHandler.last_bodies[-1]['messages'][-1]['content']), 2)
+
+    def test_real_lanes_mark_the_vision_models(self):
+        lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text(encoding='utf-8'))
+        vision = {lane['name'] for lane in lanes if lane.get('vision')}
+        self.assertEqual(
+            vision,
+            {'opencode-go', 'vercel-ai-gateway', 'vercel-ai-gateway-zai', 'openrouter', 'google'},
+        )
+        cursor = [lane for lane in lanes if lane['name'] == 'cursor'][0]
+        self.assertFalse(cursor.get('vision'))
+
+    def test_action_passes_images_to_ladder(self):
+        action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
+        self.assertIn('  images:', action_yml)
+        self.assertIn('IMAGES: ${{ inputs.images }}', action_yml)
+        self.assertIn('--images "$IMAGES"', action_yml)
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items() if not k.endswith('_API_KEY')}
+            env['RUNNER_TEMP'] = tmp
+            env['GITHUB_OUTPUT'] = os.path.join(tmp, 'output')
+            env['IMAGES'] = str(Path(tmp) / 'missing.png')
+            request = Path(tmp) / 'request.json'
+            request.write_text('{"messages": []}', encoding='utf-8')
+            env['REQUEST_FILE'] = str(request)
+            script = Path(tmp) / 'step.sh'
+            script.write_text(action_run_script().replace('${{ inputs.images }}', '${IMAGES}'), encoding='utf-8')
+            result = subprocess.run(['bash', str(script)], capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('not a file', result.stderr)
+
+
 class LintDirectModelCallsTests(unittest.TestCase):
     def test_flags_multiprompt_android_verifier_line(self):
         with tempfile.TemporaryDirectory() as tmp:
