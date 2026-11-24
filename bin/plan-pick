@@ -37,6 +37,10 @@ MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
 PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
 FAST_FAIL_BEFORE_WORK_S = 30
+FAST_FAIL_4XX_SOURCE = "fast-fail 4xx"
+FAST_FAIL_4XX_KEY_SUFFIX = ":fast-fail-4xx"
+FAST_FAIL_REPEAT_WINDOW_S = 3600
+DEFAULT_FAST_FAIL_REPEAT_MINUTES = 60
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
 LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
@@ -563,6 +567,9 @@ def live_limits(path, now):
         elif (number(val) or 0) > now:
             out[key] = val
     for key, val in raw.items():
+        if key.endswith(FAST_FAIL_4XX_KEY_SUFFIX) and now - (number(val) or 0) <= FAST_FAIL_REPEAT_WINDOW_S:
+            out[key] = val
+    for key, val in raw.items():
         if key.endswith(":reason") and isinstance(val, str) and val.strip():
             base = key[:-len(":reason")]
             if base in out:
@@ -576,10 +583,25 @@ def redact_error(text):
     return re.sub(r"\b(?:sk-|ghp_|gho_)[\w\-]+", "[REDACTED]", text)
 
 
-def mark_limited(lane, hours, now=None, path=LIMITS, reason=None, source="manual", error_line=""):
+def fast_fail_key(lane):
+    return f"{lane}{FAST_FAIL_4XX_KEY_SUFFIX}"
+
+
+def repeated_fast_fail(limits, lane, now):
+    last = number(limits.get(fast_fail_key(lane)))
+    return last is not None and 0 <= now - last <= FAST_FAIL_REPEAT_WINDOW_S
+
+
+def mark_limited(lane, hours, now=None, path=LIMITS, reason=None, source="manual", error_line="",
+                 repeat_minutes=None):
     now = time.time() if now is None else now
     limits = live_limits(path, now)
     until = now + hours * 3600
+    if source == FAST_FAIL_4XX_SOURCE:
+        if repeated_fast_fail(limits, lane, now):
+            repeat = DEFAULT_FAST_FAIL_REPEAT_MINUTES if repeat_minutes is None else repeat_minutes
+            until = now + (number(repeat) or DEFAULT_FAST_FAIL_REPEAT_MINUTES) * 60
+        limits[fast_fail_key(lane)] = now
     limits[lane] = {"until": until, "reason": redact_error((reason or "").strip() or "manual skip"),
                     "source": source, "error_line": redact_error(error_line)}
     limits.pop(f"{lane}:reason", None)
@@ -969,10 +991,12 @@ def log_launch(path, lane, now, not_vendor, metadata=None):
 def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, now=None, say=None,
               launches_path=LAUNCHES, not_vendor=None, burn=None, rung=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
+    now = time.time() if now is None else now
     hours = {"rate": (number(cfg.get("rate_limited_minutes")) or 5) / 60,
              "silent": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
              "credit": number(cfg.get("credit_limited_hours")) or DEFAULT_CREDIT_LIMITED_HOURS,
              "blocked": (number(cfg.get("fast_fail_minutes")) or 5) / 60}
+    repeat_minutes = number(cfg.get("fast_fail_repeat_minutes")) or DEFAULT_FAST_FAIL_REPEAT_MINUTES
     why = {"rate": "hit a rate or usage limit", "credit": "is out of credit", "silent": "exited with no output",
            "blocked": "was blocked by the provider's bot challenge"}
     tried = set()
@@ -1026,16 +1050,22 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
                 say(attempt_line(result["plan"], code, elapsed, pr_url, info["empty"], last_words(tail)))
                 return effective_code
             tried.add(result["plan"])
-            source = "fast-fail 4xx" if nonquota_http else "fast-fail"
-            mark_limited(result["plan"], (number(cfg.get("fast_fail_minutes")) or 5) / 60,
-                         now, limits_path, reason=fast, source=source, error_line=error_line)
-            say(f"skipped lane {result['plan']}: {fast} (exit {code})")
+            source = FAST_FAIL_4XX_SOURCE if nonquota_http else "fast-fail"
+            one_off = (number(cfg.get("fast_fail_minutes")) or 5) / 60
+            until = mark_limited(result["plan"], one_off, now, limits_path, reason=fast, source=source,
+                                 error_line=error_line, repeat_minutes=repeat_minutes)
+            line = f"skipped lane {result['plan']}: {fast} (exit {code})"
+            if until - now > one_off * 3600 + 1:
+                line += (f"; it failed this way before, so parked for {repeat_minutes:g} min until "
+                         f"{until_text(until, now)}")
+            say(line)
             continue
         tried.add(result["plan"])
         source = ("429" if re.search(r"\b429\b", error_line) else
-                  "fast-fail 4xx" if kind == "blocked" else "silent exit" if kind == "silent" else "quota error")
+                  FAST_FAIL_4XX_SOURCE if kind == "blocked" else "silent exit" if kind == "silent" else "quota error")
         until = mark_limited(result["plan"], hours[kind], now, limits_path,
-                             reason=why[kind], source=source, error_line=error_line)
+                             reason=why[kind], source=source, error_line=error_line,
+                             repeat_minutes=repeat_minutes)
         say(f"lane {result['plan']} {why[kind]} (exit {code}); skipped until "
             f"{datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC, trying the next lane")
 

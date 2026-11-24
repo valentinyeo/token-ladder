@@ -561,6 +561,42 @@ class RunTests(unittest.TestCase):
         self.assertEqual(pp.read_limits(self.limits)["opencode"]["until"], T + 300)
         self.assertTrue(any("skipped lane opencode: model request was rejected" in line for line in self.said), self.said)
 
+    def go_at(self, outcomes, now):
+        said = []
+
+        def runner(command):
+            self.ran.append(command)
+            return outcomes[command]
+        return pp.run_lanes(LANES, {}, {}, 1.1, runner, self.limits, now, said.append,
+                            launches_path=str(self.launches)), said
+
+    def test_second_4xx_fast_fail_on_one_lane_parks_it_for_an_hour(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        self.go({"run opencode": (1, msg), "run vercel": (0, "done")})
+        code, said = self.go_at({"run opencode": (1, msg), "run vercel": (0, "done")}, T + 301)
+        self.assertEqual(code, 0)
+        under = pp.read_limits(self.limits)["opencode"]
+        self.assertEqual(under["until"], T + 301 + 3600)
+        self.assertEqual(under["source"], "fast-fail 4xx")
+        line = next(text for text in said if text.startswith("skipped lane opencode"))
+        self.assertIn("parked for 60 min", line)
+
+    def test_single_4xx_fast_fail_stays_at_five_minutes(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        self.go({"run opencode": (1, msg), "run vercel": (0, "done")})
+        self.assertEqual(pp.read_limits(self.limits)["opencode"]["until"], T + 300)
+        self.assertNotIn("parked for", " ".join(self.said))
+
+    def test_4xx_fast_fail_an_hour_old_only_counts_once(self):
+        msg = '400 {"error":{"message":"The model request was rejected."}}'
+        Path(self.limits).write_text(json.dumps({"opencode": {"until": T + 300, "source": "fast-fail 4xx"},
+                                                "opencode:fast-fail-4xx": T}))
+        code, _ = self.go_at({"run opencode": (1, msg), "run vercel": (0, "done")}, T + 3700)
+        self.assertEqual(code, 0)
+        limits = pp.read_limits(self.limits)
+        self.assertEqual(limits["opencode"]["until"], T + 3700 + 300)
+        self.assertEqual(limits["opencode:fast-fail-4xx"], T + 3700)
+
     def test_failure_after_work_does_not_fall_through(self):
         msg = '400 {"error":{"message":"The model request was rejected."}}'
         self.assertEqual(self.go({"run opencode": (1, msg, 5.0, True)}), 1)
