@@ -61,7 +61,7 @@ jobs:
           test "${{ steps.ladder2.outputs.lane }}" = opencode-go
           test "${{ steps.ladder.outputs.answer-file }}" != "${{ steps.ladder2.outputs.answer-file }}"
           grep -q action-ok "${{ steps.ladder2.outputs.answer-file }}"
-      - name: Prepare image request
+      - name: Write a journey screenshot
         run: |
           set -euo pipefail
           printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=' | base64 -d > /tmp/ladder-shot.png
