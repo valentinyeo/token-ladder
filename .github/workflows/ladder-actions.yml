@@ -68,3 +68,102 @@ jobs:
       - name: Stop stub server
         if: always()
         run: kill "${{ steps.stub.outputs.pid }}" 2>/dev/null || true
+
+  agent-action:
+    name: ladder agent composite action
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Start streaming stub provider
+        id: stub
+        run: |
+          set -euo pipefail
+          python3 ci/ladder-agent-stub-server.py /tmp/agent-requests.jsonl > /tmp/agent-stub-port &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          for _ in $(seq 1 50); do
+            if [ -s /tmp/agent-stub-port ]; then break; fi
+            sleep 0.1
+          done
+          base="http://127.0.0.1:$(cat /tmp/agent-stub-port)"
+          for lane in OPENCODE_GO VERCEL_AI_GATEWAY VERCEL_AI_GATEWAY_ZAI OPENROUTER; do
+            slug="$(echo "$lane" | tr '[:upper:]_' '[:lower:]-')"
+            echo "LADDER_AGENT_URL_${lane}=${base}/${slug}/chat/completions" >> "$GITHUB_ENV"
+          done
+          mkdir -p /tmp/agent-work
+      - name: Agent with tools and a child agent
+        id: agent
+        uses: ./.github/actions/ladder-agent
+        env:
+          OPENCODE_API_KEY: stub-oc
+          AI_GATEWAY_API_KEY: stub-gw
+          OPENROUTER_API_KEY: stub-or
+        with:
+          prompt: 'main-task $(touch /tmp/agent-prompt-injected)'
+          working-directory: /tmp/agent-work
+          timeout-seconds: '60'
+      - name: Assert real pi journey and routing pins
+        env:
+          LANE: ${{ steps.agent.outputs.lane }}
+          MODEL: ${{ steps.agent.outputs.model }}
+          CODE: ${{ steps.agent.outputs.exit-code }}
+          ANSWER: ${{ steps.agent.outputs.answer-file }}
+        run: |
+          set -euo pipefail
+          test "$LANE" = openrouter
+          test "$MODEL" = deepseek/deepseek-v4.1-flash-1017
+          test "$CODE" = 0
+          test "$(cat "$ANSWER")" = agent-ok
+          test "$(cat /tmp/agent-work/agent-marker.txt)" = tools-work
+          test "$(cat /tmp/agent-work/child-answer.txt)" = child-ok
+          test ! -e /tmp/agent-prompt-injected
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          requests = [json.loads(line) for line in Path('/tmp/agent-requests.jsonl').read_text().splitlines()]
+          paths = [request['path'].split('/')[1] for request in requests]
+          assert paths[:3] == ['opencode-go', 'vercel-ai-gateway', 'vercel-ai-gateway-zai'], paths
+          assert paths[3:] == ['openrouter'] * 4, paths
+          for request in requests:
+              body = request['body']
+              if request['path'].startswith('/vercel'):
+                  assert body['providerOptions']['gateway']['only'] == ['token-pass'], body
+              if request['path'].startswith('/openrouter'):
+                  assert body['provider'] == {'only': ['StreamLake'], 'allow_fallbacks': False}, body
+                  assert body['model'] == 'deepseek/deepseek-v4.1-flash-1017', body
+          PY
+      - name: Exclude author families
+        id: excluded
+        uses: ./.github/actions/ladder-agent
+        env:
+          OPENCODE_API_KEY: stub-oc
+          AI_GATEWAY_API_KEY: stub-gw
+          OPENROUTER_API_KEY: stub-or
+        with:
+          prompt: glm-task
+          working-directory: /tmp/agent-work
+          exclude-families: deepseek,openai
+          timeout-seconds: '60'
+      - name: Assert exclusion and separate answer files
+        env:
+          LANE: ${{ steps.excluded.outputs.lane }}
+          CODE: ${{ steps.excluded.outputs.exit-code }}
+          ANSWER: ${{ steps.excluded.outputs.answer-file }}
+          FIRST_ANSWER: ${{ steps.agent.outputs.answer-file }}
+        run: |
+          set -euo pipefail
+          test "$LANE" = vercel-ai-gateway-zai
+          test "$CODE" = 0
+          test "$(cat "$ANSWER")" = glm-ok
+          test "$ANSWER" != "$FIRST_ANSWER"
+          test "$(cat "$FIRST_ANSWER")" = agent-ok
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          requests = [json.loads(line) for line in Path('/tmp/agent-requests.jsonl').read_text().splitlines()]
+          assert len(requests) == 8, len(requests)
+          assert requests[-1]['body']['model'] == 'zai/glm-5.3-flash', requests[-1]
+          PY
+      - name: Stop agent stub server
+        if: always()
+        run: kill "${{ steps.stub.outputs.pid }}" 2>/dev/null || true
