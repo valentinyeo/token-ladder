@@ -61,6 +61,26 @@ jobs:
           test "${{ steps.ladder2.outputs.lane }}" = opencode-go
           test "${{ steps.ladder.outputs.answer-file }}" != "${{ steps.ladder2.outputs.answer-file }}"
           grep -q action-ok "${{ steps.ladder2.outputs.answer-file }}"
+      - name: Write a journey screenshot
+        run: |
+          set -euo pipefail
+          printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNgAAIAAAUAAen63NgAAAAASUVORK5CYII=' | base64 -d > /tmp/ladder-shot.png
+      - name: ladder-call action with images
+        id: ladder3
+        uses: ./.github/actions/ladder-call
+        env:
+          AI_GATEWAY_API_KEY: stub-gw
+          OPENCODE_API_KEY: stub-oc
+        with:
+          request-file: /tmp/ladder-request.json
+          purpose: ci-actions-images
+          images: /tmp/ladder-shot.png
+      - name: assert the image call attaches the file and answers
+        run: |
+          set -euo pipefail
+          test "${{ steps.ladder3.outputs.lane }}" = opencode-go
+          grep -q action-ok "${{ steps.ladder3.outputs.answer-file }}"
+          grep -ql 'attaching 1 image' "$RUNNER_TEMP"/ladder-call-*.log
       - name: lint-direct-model-calls action
         uses: ./.github/actions/lint-direct-model-calls
         with:

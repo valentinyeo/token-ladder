@@ -549,6 +549,48 @@ The plan-pick Vercel pi extension sends `providerOptions.gateway.tags` with `cal
 Raw directory names and brief text are never tagged.
 Provider pins remain unchanged, and non-Vercel lanes receive no new reporting tags.
 
+### Images
+
+A check that has to look at screenshots passes them through the same action. `images`
+takes a comma- or newline-separated list of `.png`, `.jpg` or `.jpeg` files: at most 8,
+2 MiB each and 6 MiB in total. `ci/ladder-call --images` and `LADDER_CALL_IMAGES` take
+the same list. A list over either cap, a file that is not a PNG or JPEG, or a path
+that is not a file exits `2` before any lane is called.
+
+Each file becomes an OpenAI-style `image_url` part holding a `data:` URL, merged into the
+last user message of the request. Only lanes marked `"vision": true` in `ci/lanes.json`
+receive an image request. Every other lane is skipped with `no vision`, and family
+exclusion runs before that, so an excluded vision lane is never called.
+
+Marked lanes, from each provider's own model list on 2026-11-24:
+
+| Lane | Model | Why it can take images |
+|---|---|---|
+| `opencode-go` | `deepseek-v4.1-flash` | `image/jpeg`, `image/png`, `image/gif`, `image/webp` input |
+| `vercel-ai-gateway` | `deepseek/deepseek-v4.1-flash` | `text, image, pdf` input, `vision` tag |
+| `vercel-ai-gateway-zai` | `zai/glm-5.3-flash` | `text, image, video` input, `vision` tag |
+| `openrouter` | `deepseek/deepseek-v4.1-flash-1017` | model is `text+image->text`; StreamLake publishes no endpoint flag |
+| `google` | `gemini-2.5-flash` | OpenAI-compatibility docs show `image_url` data URLs |
+
+`cursor` is not marked: that lane hands `cursor-agent` one text prompt and has no way to
+pass a file, so it reads as `no vision` even in a lanes file that marks it.
+
+A lane that answers an image request with `400`, `415` or `422` is skipped with
+`<code> with images` and the next lane runs, because that answer says the lane cannot read
+the image. A `400` on a request without images still stops the run.
+
+```yaml
+      - uses: valentinyeo/token-ladder/.github/actions/ladder-call@main
+        env:
+          AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+        with:
+          request-file: request.json
+          purpose: journey-verifier
+          images: |
+            artifacts/journey-1.png
+            artifacts/journey-2.png
+```
+
 `ci/lint-direct-model-calls` scans `.github/` and `tools/` for direct provider
 URLs, direct reads of model API key env vars in code, and repo-local model
 fallback (HTTP `402`/`429` or credit handling in the same file as a model key

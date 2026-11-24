@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -14,6 +15,11 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
 SKIP_HTTP = {401, 402, 403, 404, 408, 425, 429}
+IMAGE_SKIP_HTTP = {400, 415, 422}
+IMAGE_MEDIA = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
+MAX_IMAGES = 8
+MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_TOTAL_BYTES = 6 * 1024 * 1024
 CURSOR_RATE_MARKERS = (
     'rate limit',
     'rate_limit',
@@ -41,6 +47,72 @@ def timeout_seconds():
 def lanes_path():
     override = os.environ.get('LADDER_CALL_LANES')
     return Path(override) if override else DEFAULT_LANES
+
+
+def image_paths(raw):
+    return [part.strip() for part in re.split(r'[,\n]', raw or '') if part.strip()]
+
+
+def load_images(raw):
+    paths = image_paths(raw)
+    if len(paths) > MAX_IMAGES:
+        raise ValueError(f'{len(paths)} images given, at most {MAX_IMAGES} fit')
+    images = []
+    total = 0
+    for value in paths:
+        path = Path(value)
+        media = IMAGE_MEDIA.get(path.suffix.lower())
+        if not media:
+            raise ValueError(f'{value}: not a .png, .jpg or .jpeg file')
+        if not path.is_file():
+            raise ValueError(f'{value}: not a file')
+        size = path.stat().st_size
+        if size > MAX_IMAGE_BYTES:
+            raise ValueError(f'{value}: {size} bytes is over the {MAX_IMAGE_BYTES} byte per-image cap')
+        total += size
+        if total > MAX_TOTAL_BYTES:
+            raise ValueError(f'images total {total} bytes, over the {MAX_TOTAL_BYTES} byte cap')
+        encoded = base64.b64encode(path.read_bytes()).decode()
+        images.append({'name': path.name, 'url': f'data:{media};base64,{encoded}'})
+    return images
+
+
+def image_note(images):
+    names = ', '.join(image['name'] for image in images)
+    return f'Attached images, in this order: {names}. Judges that need them: read the screenshots.'
+
+
+def image_content(images):
+    parts = [{'type': 'text', 'text': image_note(images)}]
+    parts.extend(
+        {'type': 'image_url', 'image_url': {'url': image['url']}} for image in images
+    )
+    return parts
+
+
+def with_images(body, images):
+    if not images:
+        return body
+    payload = dict(body)
+    messages = list(payload.get('messages') or [])
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        if isinstance(content, list):
+            messages[index] = dict(message, content=content + image_content(images))
+            payload['messages'] = messages
+            return payload
+        if isinstance(content, str) and content.strip():
+            merged = [{'type': 'text', 'text': content}] + image_content(images)
+            messages[index] = dict(message, content=merged)
+            payload['messages'] = messages
+            return payload
+        break
+    messages.append({'role': 'user', 'content': image_content(images)})
+    payload['messages'] = messages
+    return payload
 
 
 def lane_url(lane):
@@ -256,12 +328,14 @@ def decide_request(answer):
     }
 
 
-def attempt_lane(lane, key, body):
+def attempt_lane(lane, key, body, images=False):
     try:
         if lane.get('kind') == 'cursor':
             return call_cursor_lane(lane, key, body)
         return call_lane(lane, key, body), None
     except urllib.error.HTTPError as exc:
+        if images and exc.code in IMAGE_SKIP_HTTP:
+            return None, f'{exc.code} with images'
         if exc.code in SKIP_HTTP or exc.code >= 500:
             return None, skip_reason(lane, exc=exc)
         print(
@@ -280,6 +354,8 @@ def main():
     parser.add_argument('--purpose', required=True)
     parser.add_argument('--require-verdict', action='store_true')
     parser.add_argument('--exclude-families', default='', help='Comma-separated model families to skip')
+    parser.add_argument('--images', default=os.environ.get('LADDER_CALL_IMAGES', ''),
+                        help='Comma- or newline-separated PNG/JPEG paths to send as image parts')
     args = parser.parse_args()
     require_verdict = args.require_verdict or os.environ.get('LADDER_CALL_REQUIRE_VERDICT') == '1'
     try:
@@ -287,6 +363,13 @@ def main():
     except json.JSONDecodeError:
         print('ladder-call: invalid JSON on stdin', file=sys.stderr)
         raise SystemExit(2)
+    try:
+        images = load_images(args.images)
+    except (ValueError, OSError) as exc:
+        print(f'ladder-call: {exc}', file=sys.stderr)
+        raise SystemExit(2)
+    if images:
+        print(f'ladder-call: attaching {len(images)} image(s)', file=sys.stderr)
     lanes = load_lanes()
     try:
         excluded = {model_family(family) for family in args.exclude_families.split(',') if family.strip()}
@@ -305,7 +388,10 @@ def main():
         if not key:
             log_skip(lane['name'], 'no key')
             continue
-        result, reason = attempt_lane(lane, key, body)
+        if images and (lane.get('kind') == 'cursor' or not lane.get('vision')):
+            log_skip(lane['name'], 'no vision')
+            continue
+        result, reason = attempt_lane(lane, key, with_images(body, images), images=bool(images))
         if reason:
             log_skip(lane['name'], reason)
             continue

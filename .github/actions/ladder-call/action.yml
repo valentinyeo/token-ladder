@@ -19,6 +19,10 @@ inputs:
     description: Comma-separated model families whose lanes must not be called.
     required: false
     default: ''
+  images:
+    description: Comma- or newline-separated PNG/JPEG paths to send as image parts. Up to 8 files, 2 MiB each and 6 MiB in total. Only lanes marked vision-capable receive them.
+    required: false
+    default: ''
 outputs:
   answer-file:
     description: Path to the provider response JSON.
@@ -47,6 +51,7 @@ runs:
       shell: bash
       env:
         EXCLUDE_FAMILIES: ${{ inputs.exclude-families }}
+        IMAGES: ${{ inputs.images }}
         LADDER_CALL_CALLER: ${{ inputs.caller }}
         LADDER_CALL_PR: ${{ github.event.pull_request.number }}
         GEMINI_API_KEY: ${{ env.GEMINI_API_KEY }}
@@ -62,6 +67,9 @@ runs:
         answer="${RUNNER_TEMP}/ladder-call-answer-${tag}.json"
         log="${RUNNER_TEMP}/ladder-call-${tag}.log"
         args=(--purpose "${{ inputs.purpose }}" --exclude-families "${EXCLUDE_FAMILIES:-}")
+        if [ -n "${IMAGES:-}" ]; then
+          args+=(--images "$IMAGES")
+        fi
         if [ "${{ inputs.require-verdict }}" = "true" ]; then
           args+=(--require-verdict)
         fi
