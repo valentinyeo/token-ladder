@@ -565,3 +565,51 @@ The reusable action is
 `CLAUDE_CODE_OAUTH_TOKEN` / `CODEX_AUTH_JSON` reads under `.github/` and `tools/`,
 lists GitHub secret names per repo, and prints a tab-separated table including
 whether each repo already references `ladder-call`.
+
+## Adding the scan to a repo
+
+Any repo can run this scan on its own pull requests, so a new direct call fails
+that repo's checks instead of waiting for the next inventory run.
+`docs/direct-calls-2026-11-24.md` records where the scan stands across the repos.
+
+1. Add the step after `actions/checkout`. The step scans the workspace, so the
+   checkout must come first.
+
+   ```yaml
+         - uses: actions/checkout@v4
+         - name: No direct model calls
+           uses: valentinyeo/token-ladder/.github/actions/lint-direct-model-calls@main
+   ```
+
+2. Point it at another directory with the `repo` input. It defaults to `.`:
+
+   ```yaml
+           with:
+             repo: services/worker
+   ```
+
+3. Allow one file that must keep a provider URL. Put a reason and an end date
+   in `.github/ladder-call-allow`, one line per file:
+
+   ```text
+   tools/credits.py:reads provider balances only:2027-01-31
+   ```
+
+   An expired line fails the check, as does a line without a date.
+
+4. Run it locally before pushing. From the repo you want to check:
+
+   ```sh
+   python3 ../token-ladder/ci/lint-direct-model-calls .
+   ```
+
+   From a directory outside both repos:
+
+   ```sh
+   ci/lint-direct-model-calls /path/to/repo
+   ```
+
+The action runs `ci/lint-direct-model-calls`, not `ci/scan-repos`. It reads
+`.github/` and `tools/` only, so a call in application code underneath `src/`
+stays invisible. `@main` means a change here reaches every repo on its next run;
+pin a commit SHA if a repo needs a fixed version.
