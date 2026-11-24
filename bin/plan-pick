@@ -832,6 +832,42 @@ def repo_work_mark(cwd):
     return proc.stdout if proc.returncode == 0 else None
 
 
+def git_line(args, cwd):
+    try:
+        proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+    except Exception:
+        return None
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
+def checkout_root(path=HERE):
+    top = git_line(["rev-parse", "--show-toplevel"], path)
+    return os.path.realpath(top) if top else None
+
+
+def own_checkout_warning(root=None, branch=None, path=sys.stderr):
+    root = checkout_root() if root is None else root
+    if not root:
+        return None
+    where = git_line(["rev-parse", "--abbrev-ref", "HEAD"], root) if branch is None else branch
+    if where == "main":
+        return None
+    state = "a detached HEAD" if where in (None, "HEAD") else f"branch {where}"
+    line = f"plan-pick: its own checkout {root} is on {state}, not main; the live ladder copy runs that"
+    print(line, file=path, flush=True)
+    return line
+
+
+def own_checkout_run_refusal(cwd=None, root=None):
+    root = checkout_root() if root is None else root
+    if not root:
+        return None
+    here = os.path.realpath(cwd or os.getcwd())
+    if here != root and not here.startswith(root + os.sep):
+        return None
+    return f"plan-pick: --run refuses to launch inside plan-pick's own checkout {root}"
+
+
 def worker_env(environ):
     env = {name: value for name, value in environ.items()
            if name != "HT_TOKEN" and not name.startswith("HYPERTASK_")
@@ -2318,6 +2354,13 @@ def main(argv):
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     parser.add_argument("--reason", help="optional reason recorded with --limited in lane-limits.json")
     args = parser.parse_args(argv)
+    root = checkout_root()
+    own_checkout_warning(root)
+    if args.run:
+        refusal = own_checkout_run_refusal(root=root)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 2
     if args.cloud and not args.lane_ok:
         parser.error("--cloud requires --lane-ok")
     cfg = load_config()

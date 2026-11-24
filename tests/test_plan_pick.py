@@ -1935,5 +1935,95 @@ class LogLaunchTests(unittest.TestCase):
             self.assertEqual(buf.getvalue(), "")
 
 
+class OwnCheckoutTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "token-ladder"
+        (self.repo / "bin").mkdir(parents=True)
+        (self.repo / "bin" / "plan-pick").write_text(Path(REPO, "bin/plan-pick").read_text())
+        (self.repo / "config.json").write_text(json.dumps({"lanes": [{"lane": "solo", "command": "echo ran-solo"}]}))
+        self.git("init", "-q", "-b", "main")
+        self.git("add", ".")
+        self.git("commit", "-qm", "base")
+        self.home = self.root / "home"
+        (self.home / ".local/state/token-ladder").mkdir(parents=True)
+        self.pools = self.root / "pools.json"
+        self.pools.write_text("{}")
+        self.outside = self.root / "work"
+        self.outside.mkdir()
+
+    def git(self, *args):
+        subprocess.run(["git", "-C", str(self.repo), "-c", "user.name=T",
+                        "-c", "user.email=1+t@users.noreply.github.com", *args], check=True, capture_output=True)
+
+    def cli(self, *args, cwd=None, binary=None):
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin",
+               "TOKEN_LADDER_LOCAL_CONFIG": str(self.root / "missing.json")}
+        return subprocess.run([sys.executable, str(binary or self.repo / "bin" / "plan-pick"),
+                               "--pools", str(self.pools), *args],
+                              cwd=str(cwd or self.root), capture_output=True, text=True, env=env, timeout=30)
+
+    def warnings(self, stderr):
+        return [line for line in stderr.splitlines() if "not main" in line]
+
+    def test_run_refuses_inside_its_own_checkout(self):
+        for cwd in (self.repo, self.repo / "bin"):
+            out = self.cli("--run", cwd=cwd)
+            self.assertEqual(out.returncode, 2, out.stderr)
+            self.assertEqual(out.stdout, "")
+            self.assertEqual(len(out.stderr.strip().splitlines()), 1, out.stderr)
+            self.assertIn("plan-pick: --run refuses", out.stderr)
+            self.assertIn(str(self.repo.resolve()), out.stderr)
+            self.assertNotIn("ran-solo", out.stdout)
+
+    def test_run_outside_the_checkout_still_launches(self):
+        out = self.cli("--run", cwd=self.outside)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("ran-solo", out.stdout)
+
+    def test_run_from_a_sibling_copy_of_the_repo_is_not_its_own_checkout(self):
+        other = self.root / "other-repo"
+        (other / "bin").mkdir(parents=True)
+        (other / "bin" / "plan-pick").write_text(Path(REPO, "bin/plan-pick").read_text())
+        (other / "config.json").write_text(json.dumps({"lanes": [{"lane": "solo", "command": "echo ran-solo"}]}))
+        subprocess.run(["git", "-C", str(other), "init", "-q", "-b", "main"], check=True, capture_output=True)
+        out = self.cli("--run", cwd=self.repo)
+        self.assertEqual(out.returncode, 2, out.stderr)
+        out = self.cli("--lane-ok", "solo", cwd=self.repo, binary=other / "bin" / "plan-pick")
+        self.assertNotEqual(out.returncode, 2, out.stderr)
+
+    def test_off_main_checkout_warns_once_on_every_call(self):
+        self.git("checkout", "-q", "-b", "ceo/VSTA-194")
+        for args in (("--lane-ok", "solo"), ("--json",), ()):
+            out = self.cli(*args)
+            lines = self.warnings(out.stderr)
+            self.assertEqual(len(lines), 1, out.stderr)
+            self.assertIn("ceo/VSTA-194", lines[0])
+            self.assertTrue(lines[0].startswith("plan-pick: its own checkout "), lines[0])
+
+    def test_main_checkout_says_nothing(self):
+        out = self.cli("--lane-ok", "solo")
+        self.assertEqual(self.warnings(out.stderr), [], out.stderr)
+
+    def test_detached_head_counts_as_off_main(self):
+        self.git("checkout", "-q", "--detach", "HEAD")
+        out = self.cli("--json")
+        lines = self.warnings(out.stderr)
+        self.assertEqual(len(lines), 1, out.stderr)
+        self.assertIn("detached HEAD", lines[0])
+
+    def test_checkout_without_git_stays_quiet(self):
+        plain = self.root / "plain"
+        (plain / "bin").mkdir(parents=True)
+        (plain / "bin" / "plan-pick").write_text(Path(REPO, "bin/plan-pick").read_text())
+        (plain / "config.json").write_text(json.dumps({"lanes": []}))
+        out = self.cli("--json", binary=plain / "bin" / "plan-pick")
+        self.assertEqual(self.warnings(out.stderr), [], out.stderr)
+        out = self.cli("--run", cwd=plain, binary=plain / "bin" / "plan-pick")
+        self.assertNotEqual(out.returncode, 2, out.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
