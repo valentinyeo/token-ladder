@@ -954,6 +954,25 @@ class VisionTests(unittest.TestCase):
         self.assertEqual(len(StubHandler.last_bodies), 1)
         self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][-1]['type'], 'image_url')
 
+    def test_cursor_lane_never_receives_images(self):
+        port = self.stub()
+        lanes_path = write_vision_lanes(port, [
+            {'name': 'cursor', 'key_env': 'CURSOR_API_KEY', 'kind': 'cursor', 'model': 'composer-2.5', 'vision': True},
+            {'name': 'vercel-ai-gateway', 'vision': True},
+        ])
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        with tempfile.TemporaryDirectory() as tmp:
+            image = png_file(tmp, 'shot.png', 8)
+            result = ladder_call(
+                {'CURSOR_API_KEY': 'c', 'AI_GATEWAY_API_KEY': 'k'},
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+                lanes_file=lanes_path,
+                args=('--images', image),
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane cursor skipped: no vision', result.stderr)
+        self.assertIn('lane vercel-ai-gateway answered', result.stderr)
+
     def test_no_vision_lane_left_answers_nothing(self):
         port = self.stub()
         lanes_path = write_vision_lanes(port, [{'name': 'vercel-ai-gateway'}])
@@ -976,18 +995,21 @@ class VisionTests(unittest.TestCase):
         lanes_path = write_vision_lanes(port, [
             {'name': 'vercel-ai-gateway', 'model': 'deepseek/deepseek-v4.1-flash', 'vision': True},
             {'name': 'vercel-ai-gateway-zai', 'model': 'zai/glm-5.3-flash', 'vision': True},
+            {'name': 'google', 'key_env': 'GEMINI_API_KEY', 'model': 'gemini-2.5-flash'},
         ])
         self.addCleanup(lambda: os.unlink(lanes_path))
         with tempfile.TemporaryDirectory() as tmp:
             image = png_file(tmp, 'shot.png', 8)
             result = ladder_call(
-                {'AI_GATEWAY_API_KEY': 'k'},
+                {'AI_GATEWAY_API_KEY': 'k', 'GEMINI_API_KEY': 'g'},
                 {'messages': [{'role': 'user', 'content': 'hi'}]},
                 lanes_file=lanes_path,
-                args=('--images', image, '--exclude-families', 'deepseek'),
+                args=('--images', image, '--exclude-families', 'deepseek,google'),
             )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('lane vercel-ai-gateway skipped: excluded family deepseek', result.stderr)
+        self.assertIn('lane google skipped: excluded family google', result.stderr)
+        self.assertNotIn('no vision', result.stderr)
         self.assertIn('lane vercel-ai-gateway-zai answered', result.stderr)
         self.assertEqual(StubHandler.last_bodies[0]['model'], 'zai/glm-5.3-flash')
         self.assertEqual(StubHandler.last_bodies[0]['messages'][-1]['content'][-1]['type'], 'image_url')

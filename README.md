@@ -573,7 +573,7 @@ Marked lanes, from each provider's own model list on 2026-11-24:
 | `google` | `gemini-2.5-flash` | OpenAI-compatibility docs show `image_url` data URLs |
 
 `cursor` is not marked: that lane hands `cursor-agent` one text prompt and has no way to
-pass a file.
+pass a file, so it reads as `no vision` even in a lanes file that marks it.
 
 A lane that answers an image request with `400`, `415` or `422` is skipped with
 `<code> with images` and the next lane runs, because that answer says the lane cannot read
