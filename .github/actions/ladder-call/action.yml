@@ -7,6 +7,18 @@ inputs:
   purpose:
     description: Short label for logs.
     required: true
+  caller:
+    description: Job slug for the caller=<repo>-<job> gateway tag. Defaults to github.job. No secrets or user data.
+    required: false
+    default: ''
+  require-verdict:
+    description: Skip a lane whose answer holds no PASS, PASS+NOTES or FAIL verdict.
+    required: false
+    default: 'false'
+  exclude-families:
+    description: Comma-separated model families whose lanes must not be called.
+    required: false
+    default: ''
 outputs:
   answer-file:
     description: Path to the provider response JSON.
@@ -17,20 +29,43 @@ outputs:
 runs:
   using: composite
   steps:
+    - name: Install cursor-agent
+      shell: bash
+      run: |
+        set -euo pipefail
+        if command -v cursor-agent >/dev/null 2>&1; then
+          exit 0
+        fi
+        if [ -x "$HOME/.local/bin/cursor-agent" ]; then
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          exit 0
+        fi
+        curl -fsSL https://cursor.com/install | bash
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
     - name: ladder-call
       id: run
       shell: bash
       env:
+        EXCLUDE_FAMILIES: ${{ inputs.exclude-families }}
+        LADDER_CALL_CALLER: ${{ inputs.caller }}
+        LADDER_CALL_PR: ${{ github.event.pull_request.number }}
+        GEMINI_API_KEY: ${{ env.GEMINI_API_KEY }}
+        CURSOR_API_KEY: ${{ env.CURSOR_API_KEY }}
         AI_GATEWAY_API_KEY: ${{ env.AI_GATEWAY_API_KEY }}
         OPENCODE_API_KEY: ${{ env.OPENCODE_API_KEY }}
         DEEPSEEK_API_KEY: ${{ env.DEEPSEEK_API_KEY }}
         OPENROUTER_API_KEY: ${{ env.OPENROUTER_API_KEY }}
       run: |
         set -euo pipefail
+        export PATH="$HOME/.local/bin:${PATH}"
         tag="$(printf '%s' "${{ inputs.purpose }}-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}-$$-${RANDOM}" | sha256sum | cut -c1-12)"
         answer="${RUNNER_TEMP}/ladder-call-answer-${tag}.json"
         log="${RUNNER_TEMP}/ladder-call-${tag}.log"
-        if ! "${{ github.action_path }}/run" --purpose "${{ inputs.purpose }}" \
+        args=(--purpose "${{ inputs.purpose }}" --exclude-families "${EXCLUDE_FAMILIES:-}")
+        if [ "${{ inputs.require-verdict }}" = "true" ]; then
+          args+=(--require-verdict)
+        fi
+        if ! "${{ github.action_path }}/run" "${args[@]}" \
           < "${{ inputs.request-file }}" > "$answer" 2> "$log"; then
           cat "$log" >&2
           exit 1

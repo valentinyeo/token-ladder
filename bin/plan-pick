@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
 import argparse
+import fcntl
 import glob
+import hashlib
 import json
+import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import time
+import tempfile
+import uuid
 import urllib.request
 from datetime import datetime, timezone
 
@@ -14,29 +20,36 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 DEFAULT_PACE_WARN = 1.1
 DEFAULT_LIMITED_HOURS = 1.0
 DEFAULT_CREDIT_LIMITED_HOURS = 12.0
-WORKER_SHIMS = os.path.join(HERE, "worker-shims")
+WORKER_SHIMS = os.pathsep.join([os.path.join(HERE, "worker-shims"),
+                               os.path.expanduser("~/.local/state/vstack/worker-shims")])
 TAIL_CHARS = 20000
 ERROR_CHARS = 4000
 CREDIT_ERROR = re.compile(r"\b402\b|payment required|insufficient[ _](balance|credits?|funds|quota)|"
                           r"out of credits?|credit balance|exceeded your current quota|no credits? (left|remaining)", re.I)
-RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _]exhausted|"
+RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|quota|resource[ _-]?exhausted|"
                         r"limit (reached|exceeded)|hit your limit", re.I)
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
+PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
+MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
+PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
+PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
+FAST_FAIL_BEFORE_WORK_S = 30
 PACING_DIR = os.environ.get("PLAN_PICK_PACING_DIR") or os.path.expanduser("~/.local/state/pacing")
-DEFAULT_OPENCODE_CREDIT_FLOOR = 6
-DEFAULT_OPENCODE_CREDIT_FRESH_HOURS = 2
-DEFAULT_OPENCODE_ESTIMATE_HOURS = 24
-DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK = 2.0
-OPENCODE_LANE_PROVIDER = "opencode-go"
 LIMITS = os.path.expanduser("~/.local/state/token-ladder/lane-limits.json")
-LAUNCHES = os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
+LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/state/token-ladder/launches.jsonl")
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
+EMERGENCY = os.path.expanduser("~/.local/state/token-ladder/claude-emergency.json")
+STATUS = os.path.expanduser("~/.local/state/token-ladder/status.json")
+CLAUDE_HELPER_STALE_SECONDS = 15 * 60
 PI = os.path.expanduser("~/.npm-global/bin/pi")
 PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
 DEFAULT_CREDIT_FLOOR_USD = 2.0
 DEFAULT_CREDIT_REFRESH_MINUTES = 30
 DEFAULT_CREDIT_STALE_HOURS = 6
-DEFAULT_STALE_HOURS = 12
+ANTIGRAVITY_LANE = "antigravity"
+ANTIGRAVITY_POOL = "google"
+DEFAULT_ANTIGRAVITY_RESERVE_SHARE_PCT = 100
+DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS = None
 DEFAULT_LOOP_BASE_SECONDS = 7200
 DEFAULT_LOOP_AHEAD_SECONDS = 10800
 DEFAULT_LOOP_FAR_AHEAD_SECONDS = 14400
@@ -54,7 +67,9 @@ def number(value):
 def skip_reason(pool, warn, no_pace=False):
     if not isinstance(pool, dict):
         return None
-    if pool.get("state") == "OFF":
+    if pool.get("credit_unknown"):
+        return "credit unknown" + (f": {pool['note']}" if pool.get("note") else "")
+    if pool.get("state") == "OFF" or (pool.get("funding") != "prepaid" and (number(pool.get("used_pct")) or 0) >= 100):
         return "used up" + (f": {pool['note']}" if pool.get("note") else "")
     ratio = number(pool.get("pace_ratio"))
     if not no_pace and ratio is not None and ratio > warn:
@@ -114,7 +129,100 @@ def lanes_with_burn(lanes, burn):
     return head + tail
 
 
-def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None):
+def until_text(until, now):
+    stamp = datetime.fromtimestamp(until, timezone.utc)
+    today = datetime.fromtimestamp(now, timezone.utc).date()
+    return (f"{stamp:%H:%M}" if stamp.date() == today else f"{stamp:%Y-%m-%d %H:%M}") + " UTC"
+
+
+def parse_limit(limits, name, now):
+    if not isinstance(limits, dict) or not isinstance(name, str) or not name:
+        return None
+    raw = limits.get(name)
+    until, reason, explicit = None, None, False
+    if isinstance(raw, dict):
+        val = raw.get("until")
+        until = number(val)
+        if until is None and isinstance(val, str):
+            try:
+                stamp = datetime.fromisoformat(val.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=timezone.utc)
+                until = stamp.timestamp()
+            except (ValueError, TypeError, OverflowError):
+                until = None
+        if isinstance(raw.get("reason"), str) and raw["reason"].strip():
+            reason = raw["reason"].strip()
+            explicit = True
+    else:
+        until = number(raw)
+        if until is not None:
+            raw_reason = limits.get(f"{name}:reason")
+            if isinstance(raw_reason, str) and raw_reason.strip():
+                reason = raw_reason.strip()
+                explicit = True
+            elif number(limits.get(f"{name}:floor")) == until:
+                reason = "credit floor reached"
+                explicit = True
+    if until is None or not math.isfinite(until) or until <= now:
+        return None
+    if not reason:
+        reason = "manual skip (lane-limits)" if until - now > 24 * 3600 else "limited (lane-limits)"
+    return {
+        "lane": name,
+        "until": until,
+        "until_iso": datetime.fromtimestamp(until, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "until_text": until_text(until, now),
+        "reason": reason,
+        "explicit_reason": explicit,
+        "source": raw.get("source") if isinstance(raw, dict) else None,
+        "error_line": raw.get("error_line") if isinstance(raw, dict) else None,
+    }
+
+
+def limit_note(skip):
+    return "; ".join(str(skip[key]) for key in ("reason", "source", "error_line") if skip.get(key))
+
+
+def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
+    name = lane["lane"]
+    pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+    if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
+        return "chat-only pool, never workers"
+    skip = parse_limit(limits, name, now)
+    if skip is not None:
+        return f"limited until {skip['until_text']}"
+    return skip_reason(pool, warn, no_pace)
+
+
+def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=None, cfg=None):
+    now = time.time() if now is None else now
+    spec = {"anthropic": "claude", "openai": "codex", "google": "antigravity"}.get(spec, spec)
+    lane = next((lane for lane in lanes if lane["lane"] == spec), None)
+    if lane is None:
+        lane = next((lane for lane in lanes if spec in lane_names(lane)), None)
+    configured = lane is not None
+    if lane is None and spec == "claude":
+        lane = {"lane": "claude", "pool": "claude", "shared_with_chats": True}
+    if lane is None:
+        return {"allowed": False, "reason": f"unknown lane or vendor {spec}"}
+    if rung and cfg and configured:
+        allowed = {item["lane"] for item in rung_lanes(lanes, cfg, rung["rung"])}
+        if lane["lane"] not in allowed:
+            return {"allowed": False,
+                    "reason": f"{lane['lane']}: not in rung {rung['rung']} ({rung['rung_reason']})"}
+    pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+    why = lane_skip_reason(lane, pools, limits, now, warn)
+    if not why and lane.get("credit") and not isinstance(pool, dict):
+        why = "credit unknown"
+    if not why and isinstance(pool, dict):
+        credit, floor = number(pool.get("credits_usd")), number(pool.get("credit_floor_usd"))
+        if credit is not None and floor is not None and credit <= floor:
+            why = f"credit ${credit:g} is at or below floor ${floor:g}"
+    return {"allowed": not why, "reason": f"{lane['lane']}: {why or 'allowed'}"}
+
+
+def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None, strict_pace=False):
     pools = pools if isinstance(pools, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
     now = time.time() if now is None else now
@@ -122,12 +230,12 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
     for lane in lanes:
         name = lane["lane"]
         pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
-        until = number(limits.get(name))
-        if until is not None and until > now:
-            skipped[name] = f"limited until {datetime.fromtimestamp(until, timezone.utc):%H:%M} UTC"
-            continue
         no_pace = burn is not None and name == burn["lane"]
-        why = skip_reason(pool, warn, no_pace)
+        skip = parse_limit(limits, name, now)
+        if skip is not None:
+            why = f"limited until {skip['until_text']}" + (f" ({limit_note(skip)})" if skip["explicit_reason"] else "")
+        else:
+            why = lane_skip_reason(lane, pools, limits, now, warn, no_pace)
         if why:
             skipped[name] = why
             if why.startswith("pace"):
@@ -141,14 +249,25 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
         if skipped:
             reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
         return {"plan": name, "command": lane["command"], "reason": reason}
-    if not ahead:
-        reason = "every lane is used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
-        frees = {name: number(limits.get(name)) for name in skipped if (number(limits.get(name)) or 0) > now}
+    codex = pools.get("codex")
+    codex_ahead = isinstance(codex, dict) and (number(codex.get("pace_ratio")) or 0) > 1.3
+    frees = {}
+    for lane in lanes:
+        name = lane["lane"]
+        skip = parse_limit(limits, name, now)
+        pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+        if skip and (not codex_ahead or (not skip_reason(pool, warn, no_pace=True) and not (
+                isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats")))):
+            frees[name] = skip["until"]
+    if not ahead or strict_pace or (codex_ahead and frees):
+        reason = "every lane is ahead of pace, used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
         next_free = None
         if frees:
             lane_name = min(frees, key=frees.get)
             next_free = {"lane": lane_name, "at": frees[lane_name]}
-            reason += (f"; {lane_name} frees at {datetime.fromtimestamp(frees[lane_name], timezone.utc):%H:%M} UTC,"
+            if codex_ahead:
+                reason += f"; Codex pace {codex['pace_ratio']:.2f}x is above 1.3x"
+            reason += (f"; {lane_name} frees at {until_text(frees[lane_name], now)},"
                        " so wait for it and run plan-pick --run again")
         else:
             reason += "; wait for the next plan reset"
@@ -161,18 +280,99 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None)
             + (f"; skipped {others}" if others else "")}
 
 
-def claude_helper(pools, warn=DEFAULT_PACE_WARN):
+def parse_until(text):
+    stamp = datetime.fromisoformat(text.strip().replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("needs a time zone, for example 2026-11-23T23:59:00Z")
+    return stamp
+
+
+def set_emergency(until_text, reason, now=None, path=EMERGENCY):
+    now = time.time() if now is None else now
+    if until_text.strip().lower() == "off":
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        return None
+    until = parse_until(until_text)
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError("needs --reason")
+    data = {"until": until.isoformat(), "reason": reason.strip(),
+            "set_at": datetime.fromtimestamp(now, timezone.utc).isoformat()}
+    write_limits(data, path)
+    return data
+
+
+def read_emergency(now=None, path=None):
+    now = time.time() if now is None else now
+    path = EMERGENCY if path is None else path
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        until = parse_until(data["until"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if until.timestamp() <= now:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    return {"until": data["until"], "reason": str(data.get("reason", ""))}
+
+
+def format_age(seconds):
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, rem = divmod(minutes, 60)
+    return f"{hours}h{rem}m" if rem else f"{hours}h"
+
+
+def read_cached_claude_pool(path=None, now=None):
+    path = STATUS if path is None else path
+    now = time.time() if now is None else now
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}, None
+    if not isinstance(data, dict):
+        return {}, None
+    pools = data.get("pools")
+    claude = pools.get("claude") if isinstance(pools, dict) else None
+    if not isinstance(claude, dict):
+        return {}, None
+    ts = number(data.get("ts"))
+    age = max(0.0, now - ts) if ts is not None and math.isfinite(ts) else None
+    return {"claude": claude}, age
+
+
+def claude_helper(pools, warn=DEFAULT_PACE_WARN, now=None, path=None,
+                  reading_age=None, stale_seconds=CLAUDE_HELPER_STALE_SECONDS):
     pool = pools.get("claude") if isinstance(pools, dict) else None
+    stale = (f"; stale reading {format_age(reading_age)}"
+             if isinstance(pool, dict) and reading_age is not None and reading_age > stale_seconds else "")
+    why = skip_reason(pool, warn, no_pace=True)
+    if why:
+        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper{stale}"}
+    ratio = number(pool.get("pace_ratio")) if isinstance(pool, dict) else None
+    emergency = read_emergency(now, path)
+    if emergency:
+        pace = "unknown" if ratio is None else f"{ratio:.2f}x"
+        return {"allowed": True, "reason": f"emergency allowance until {emergency['until']} "
+                                           f"({emergency['reason']}); pace {pace}{stale}"}
     why = skip_reason(pool, warn)
     if why:
-        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper"}
+        return {"allowed": False, "reason": f"Claude is {why}, so no Claude helper{stale}"}
     if not isinstance(pool, dict):
         note = "no Claude reading, assumed under pace"
-    elif number(pool.get("pace_ratio")) is None:
+    elif ratio is None:
         note = "pace unknown, not ahead"
     else:
-        note = f"pace {pool['pace_ratio']:.2f}x, within {warn:g}x"
-    return {"allowed": True, "reason": f"Claude is under its pace: {note}"}
+        note = f"pace {ratio:.2f}x, within {warn:g}x"
+    return {"allowed": True, "reason": f"Claude is under its pace: {note}{stale}"}
 
 
 def loop_rule(cfg):
@@ -242,12 +442,52 @@ def load_config():
     return cfg
 
 
-def lanes_from(cfg):
+def lane_first_until(lane):
+    raw = lane.get("first_until")
+    if not isinstance(raw, str):
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    try:
+        return stamp.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def lanes_with_first(lanes, now=None):
+    now = time.time() if now is None else now
+    front = [lane for lane in lanes if (lane_first_until(lane) or 0) > now]
+    if not front:
+        return lanes
+    return front + [lane for lane in lanes if lane not in front]
+
+
+def lanes_from(cfg, now=None):
     lanes = cfg.get("lanes")
     if not isinstance(lanes, list):
         return []
-    return [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
-            and isinstance(lane.get("command"), str)]
+    usable = [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
+              and isinstance(lane.get("command"), str)]
+    return lanes_with_first(usable, now)
+
+
+def lane_names(lane):
+    names = (lane.get("lane"), lane.get("vendor"), lane.get("credit"))
+    return {name.lower() for name in names if isinstance(name, str)}
+
+
+def vendor_exclusions(values):
+    names = []
+    for value in values or []:
+        for part in value.split(","):
+            name = part.strip().lower()
+            if name and name not in names:
+                names.append(name)
+    return names
 
 
 def plans_from(cfg):
@@ -257,11 +497,38 @@ def plans_from(cfg):
     return [plan for plan in plans if isinstance(plan, dict) and isinstance(plan.get("name"), str)]
 
 
-def plan_line(plan):
+def plan_line(plan, credit=None):
     models = ", ".join(str(model) for model in plan.get("included_models") or [])
     places = " and ".join(str(place) for place in plan.get("runs_on") or [])
-    return (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}. "
-            f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.")
+    allowance = ""
+    if number(plan.get("included_allowance_usd")) is not None:
+        allowance = (f" ${plan['monthly_price_usd']:g}/month; "
+                     f"${plan['included_allowance_usd']:g} included allowance.")
+    state = f" Status: {plan['status']}. {plan['note']}." if plan.get("status") else ""
+    line = (f"{plan['name']} ({plan.get('vendor')}): {models}. Runs on {places}.{allowance} "
+            f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.{state}")
+    if plan.get("pool"):
+        usage = plan.get("usage") or {}
+        used, limit, pace = (number(usage.get(key)) for key in ("used", "limit", "pace_ratio"))
+        line += f" Pool: {plan['pool']}."
+        if plan.get("shared_with_chats"):
+            line += " Shared with chats; the antigravity lane burns the full quota."
+        line += f" Used: {used:g}" if used is not None else " Used: unknown"
+        if usage.get("unit"):
+            line += f" {usage['unit']}"
+        line += f". Limit: {limit:g}" if limit is not None else ". Limit: unknown"
+        line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
+        if usage.get("used_up") and usage.get("used_up_at"):
+            line += f" Used up at {usage['used_up_at']}."
+        if usage.get("note"):
+            line += f" {usage['note']}."
+    allowance = number(plan.get("usd_per_cycle"))
+    left = number((credit or {}).get("usd"))
+    if allowance is None or left is None:
+        return line
+    reset = f", resets {credit['resets_at']}" if credit.get("resets_at") else ""
+    return f"{line} ${left:.2f} of ${allowance:g} left this cycle{reset}."
+
 
 
 def read_limits(path=LIMITS):
@@ -273,31 +540,296 @@ def read_limits(path=LIMITS):
     return data if isinstance(data, dict) else {}
 
 
-def mark_limited(lane, hours, now=None, path=LIMITS):
-    now = time.time() if now is None else now
-    limits = {k: v for k, v in read_limits(path).items() if (number(v) or 0) > now}
-    limits[lane] = now + hours * 3600
+def write_limits(limits, path=LIMITS):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(limits, fh)
     os.replace(tmp, path)
-    return limits[lane]
+
+
+def live_limits(path, now):
+    raw = read_limits(path)
+    out = {}
+    for key, val in raw.items():
+        if key.endswith(":reason"):
+            continue
+        if isinstance(val, dict):
+            if parse_limit(raw, key, now) is not None:
+                out[key] = val
+        elif (number(val) or 0) > now:
+            out[key] = val
+    for key, val in raw.items():
+        if key.endswith(":reason") and isinstance(val, str) and val.strip():
+            base = key[:-len(":reason")]
+            if base in out:
+                out[key] = val.strip()
+    return out
+
+
+def redact_error(text):
+    text = re.sub(r"(?i)(bearer\s+)[\w.\-]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)((?:api[_-]?key|access[_-]?token|credential)[\"'\s:=]+)[^\s\"',}]+", r"\1[REDACTED]", text)
+    return re.sub(r"\b(?:sk-|ghp_|gho_)[\w\-]+", "[REDACTED]", text)
+
+
+def mark_limited(lane, hours, now=None, path=LIMITS, reason=None, source="manual", error_line=""):
+    now = time.time() if now is None else now
+    limits = live_limits(path, now)
+    until = now + hours * 3600
+    limits[lane] = {"until": until, "reason": redact_error((reason or "").strip() or "manual skip"),
+                    "source": source, "error_line": redact_error(error_line)}
+    limits.pop(f"{lane}:reason", None)
+    limits.pop(f"{lane}:floor", None)
+    write_limits(limits, path)
+    return until
+
+
+def mark_floor_lock(lane, until, now, path=LIMITS):
+    limits = live_limits(path, now)
+    limits[lane] = {"until": until, "reason": "credit floor reached", "source": "quota error", "error_line": ""}
+    limits.pop(f"{lane}:reason", None)
+    limits[f"{lane}:floor"] = until
+    write_limits(limits, path)
+    return until
+
+
+def clear_floor_lock(lane, now, path=LIMITS):
+    limits = live_limits(path, now)
+    until = number(limits.pop(f"{lane}:floor", None))
+    if until is None:
+        return
+    skip = parse_limit(limits, lane, now)
+    if skip and skip["until"] == until:
+        limits.pop(lane, None)
+    write_limits(limits, path)
+
+
+PI_EVENT_TYPES = {
+    "session", "agent_start", "turn_start", "message_start", "message_update",
+    "message_end", "turn_end", "agent_end", "auto_retry_start", "auto_retry_end",
+    "agent_settled", "tool_execution_start", "tool_execution_end", "entry_appended",
+}
+
+
+def error_text(value):
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        if "short_error" in value:
+            message = "print_timeout" if value.get("reason") == "print_timeout" else value["short_error"]
+            return str(value.get("status", "")) + ": " + str(message)
+        return json.dumps(value, separators=(",", ":"))
+    return ""
+
+
+def message_text(message):
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        return "\n".join(part.get("text", "") for part in content
+                         if isinstance(part, dict) and isinstance(part.get("text"), str)).strip()
+    return ""
+
+
+def inspect_record(data):
+    if not isinstance(data, dict):
+        return None
+    kind = data.get("type") or data.get("kind")
+    if data.get("status") == "ERROR":
+        return "error", error_text(data.get("error")) or "ERROR", False
+    if kind == "auto_retry_end":
+        if data.get("success") is False:
+            return "error", error_text(data.get("finalError") or data.get("error")
+                                       or data.get("errorMessage")) or "auto_retry_end failed", False
+        if data.get("success") is True:
+            return "ok", None, False
+        return "harness", None, False
+    if kind == "agent_end":
+        messages = data.get("messages")
+        if isinstance(messages, list):
+            assistants = [m for m in messages if isinstance(m, dict) and m.get("role") == "assistant"]
+            if assistants:
+                last = assistants[-1]
+                if last.get("stopReason") == "error":
+                    return "error", error_text(last.get("errorMessage") or last.get("error")) or 'stopReason":"error"', False
+                answered = last.get("stopReason") != "toolUse" and bool(message_text(last))
+                return "ok", None, answered
+        return "harness", None, False
+    if kind in ("message_end", "turn_end"):
+        msg = data.get("message")
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            if msg.get("stopReason") == "error":
+                return "error", error_text(msg.get("errorMessage") or msg.get("error")) or 'stopReason":"error"', False
+            if msg.get("stopReason") is not None or message_text(msg):
+                answered = msg.get("stopReason") != "toolUse" and bool(message_text(msg))
+                return "ok", None, answered
+        return "harness", None, False
+    if kind == "agent_settled":
+        if data.get("aborted") is True:
+            return "aborted", "agent aborted", False
+        return "harness", None, False
+    if kind == "result":
+        if data.get("is_error") is True or data.get("subtype") == "error" or data.get("status") == "error":
+            return "error", error_text(data.get("error") or data.get("errorMessage") or data.get("result")
+                                       or data.get("text") or data.get("message")) or "result error", False
+        text = data.get("text") if isinstance(data.get("text"), str) else data.get("result") if isinstance(data.get("result"), str) else ""
+        return "ok", None, bool(text.strip())
+    if kind == "error":
+        return "error", error_text(data.get("error") or data.get("errorMessage") or data.get("message") or data) or "error", False
+    if kind in PI_EVENT_TYPES:
+        return "harness", None, False
+    if "response" in data and ("status" in data or "stats" in data):
+        resp = data.get("response")
+        return "ok", None, bool(isinstance(resp, str) and resp.strip())
+    if data.get("error") and kind is None and data.get("status") in (None, "ERROR", "error") and data.get("is_error") is not False:
+        return "error", error_text(data.get("error")), False
+    return None
+
+
+def analyze_lines(lines, full_reader=None):
+    last_error = None
+    saw_harness = False
+    has_answer = False
+    last_nonempty = ""
+    fallback_error = ""
+    saw_json_record = False
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        last_nonempty = line
+        if line.startswith("AGY_ERROR: "):
+            try:
+                err = json.loads(line[len("AGY_ERROR: "):])
+                text = error_text(err)
+                if text:
+                    last_error = text
+                    saw_harness = True
+                    saw_json_record = True
+                    continue
+            except (ValueError, AttributeError):
+                pass
+        if line.startswith("{"):
+            try:
+                data = json.loads(line)
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                saw_json_record = True
+                verdict = inspect_record(data)
+                if verdict is not None:
+                    state, text, answered = verdict
+                    saw_harness = True
+                    if state == "error":
+                        last_error = text
+                        has_answer = False
+                    elif state == "aborted":
+                        if last_error is None:
+                            last_error = text
+                        has_answer = False
+                    elif state == "ok":
+                        last_error = None
+                        if answered:
+                            has_answer = True
+                continue
+        if (CREDIT_ERROR.search(line) or BLOCKED_ERROR.search(line) or RATE_ERROR.search(line)
+                or MODEL_REJECTED.search(line) or PROVIDER_AUTH.search(line) or PROVIDER_HTTP.search(line)):
+            fallback_error = line
+    if not saw_json_record and full_reader is not None:
+        data = full_reader()
+        if isinstance(data, dict):
+            verdict = inspect_record(data)
+            if verdict is not None:
+                state, text, answered = verdict
+                saw_harness = True
+                if state == "error":
+                    last_error = text
+                    has_answer = False
+                elif state == "ok":
+                    last_error = None
+                    has_answer = answered
+    empty = (not last_nonempty) or (saw_harness and last_error is None and not has_answer)
+    if last_error is not None:
+        line = last_error[-ERROR_CHARS:]
+    elif fallback_error and (not saw_harness or empty):
+        line = fallback_error[-ERROR_CHARS:]
+    else:
+        line = last_nonempty[-ERROR_CHARS:]
+    return {"error": last_error[-ERROR_CHARS:] if last_error is not None else None,
+            "empty": empty, "error_line": line}
+
+
+def analyze_stream(fh):
+    def read_full():
+        fh.seek(0)
+        try:
+            return json.load(fh)
+        except ValueError:
+            return None
+
+    fh.seek(0)
+    return analyze_lines(fh, full_reader=read_full)
+
+
+def analyze_output(tail):
+    cached = getattr(tail, "analysis", None)
+    if cached is not None:
+        return cached
+
+    def read_full():
+        stripped = tail.strip()
+        if not stripped.startswith("{"):
+            return None
+        try:
+            return json.loads(stripped)
+        except ValueError:
+            return None
+
+    return analyze_lines(tail.splitlines(), full_reader=read_full)
+
+
+def provider_error(tail):
+    return analyze_output(tail)["error_line"]
 
 
 def limit_kind(code, tail):
-    if code == 0:
-        return None
-    tail = tail[-ERROR_CHARS:]
-    if CREDIT_ERROR.search(tail):
-        return "credit"
-    if BLOCKED_ERROR.search(tail):
-        return "blocked"
-    if RATE_ERROR.search(tail):
-        return "rate"
-    if not tail.strip():
-        return "silent"
+    info = analyze_output(tail)
+    text = info["error"] if info["error"] is not None else info["error_line"]
+    if info["error"] is not None or code != 0 or info["empty"]:
+        if CREDIT_ERROR.search(text):
+            return "credit"
+        if BLOCKED_ERROR.search(text):
+            return "blocked"
+        if RATE_ERROR.search(text):
+            return "rate"
+        if info["empty"]:
+            return "silent"
     return None
+
+
+def fast_fail_kind(code, tail, elapsed, work):
+    info = analyze_output(tail)
+    if (code == 0 and info["error"] is None) or work or elapsed >= FAST_FAIL_BEFORE_WORK_S:
+        return None
+    text = (info["error"] if info["error"] is not None else info["error_line"])[-ERROR_CHARS:]
+    if MODEL_REJECTED.search(text):
+        return "model request was rejected"
+    if PROVIDER_AUTH.search(text):
+        return "provider auth error"
+    if PROVIDER_HTTP.search(text):
+        return "provider HTTP error"
+    if PI_AGENT_FAST.search(text) or info["error"] is not None:
+        return "agent error before work"
+    return None
+
+
+def repo_work_mark(cwd):
+    proc = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=5)
+    return proc.stdout if proc.returncode == 0 else None
 
 
 def worker_env(environ):
@@ -315,54 +847,508 @@ def run_command(command):
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace",
                             env=worker_env(os.environ))
     tail = ""
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
-        tail = (tail + line)[-TAIL_CHARS:]
-    return proc.wait(), tail
+    with tempfile.TemporaryFile(mode="w+t") as output:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            output.write(line)
+            tail = (tail + line)[-TAIL_CHARS:]
+        code = proc.wait()
+        proc.stdout.close()
+        return code, measured_output(output, tail)
 
 
-def log_launch(path, lane, now, not_vendor):
+def run_worker(command):
+    cwd = os.getcwd()
+    before = repo_work_mark(cwd)
+    start = time.time()
+    code, tail = run_command(command)
+    elapsed = time.time() - start
+    after = repo_work_mark(cwd)
+    work = before is not None and before != after
+    return code, tail, elapsed, work
+
+
+def unpack_run(result):
+    if len(result) == 2:
+        return result[0], result[1], 0.0, False
+    return result
+
+
+def log_launch(path, lane, now, not_vendor, metadata=None):
     at = now if now is not None else time.time()
     line = {"at": at, "lane": lane,
-            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "not_vendor": not_vendor}
+            "session": os.environ.get("CLAUDE_CODE_SESSION_ID"), "cwd": os.getcwd(), "not_vendor": not_vendor,
+            "caller": os.environ.get("MULTIBOT_SESSION") or os.getcwd()}
+    if metadata:
+        line.update(metadata)
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a") as fh:
-            fh.write(json.dumps(line) + "\n")
+        append_launch(path, line)
     except OSError as exc:
         print(f"plan-pick: launch log not written: {exc}", file=sys.stderr)
         return
     if lane is not None:
         stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"Pacer launch: {lane} {stamp}", file=sys.stderr)
-def run_lanes(lanes, pools, cfg, warn, runner=run_command, limits_path=LIMITS, now=None, say=None,
-              launches_path=LAUNCHES, not_vendor=None, burn=None):
+def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, now=None, say=None,
+              launches_path=LAUNCHES, not_vendor=None, burn=None, rung=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
-    hours = {"rate": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
+    hours = {"rate": (number(cfg.get("rate_limited_minutes")) or 5) / 60,
              "silent": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
              "credit": number(cfg.get("credit_limited_hours")) or DEFAULT_CREDIT_LIMITED_HOURS,
-             "blocked": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS}
+             "blocked": (number(cfg.get("fast_fail_minutes")) or 5) / 60}
     why = {"rate": "hit a rate or usage limit", "credit": "is out of credit", "silent": "exited with no output",
            "blocked": "was blocked by the provider's bot challenge"}
     tried = set()
     while True:
-        result = pick([lane for lane in lanes if lane["lane"] not in tried], pools,
-                      read_limits(limits_path), now, warn, burn)
+        available = [lane for lane in lanes if lane["lane"] not in tried]
+        if rung:
+            result, rung, eligible = pick_rung(available, pools, cfg, rung, read_limits(limits_path), warn, now)
+        else:
+            result = pick(available, pools, read_limits(limits_path), now, warn, burn)
         if not result["command"]:
             log_launch(launches_path, None, now, not_vendor)
+            record_no_lane(rung, now)
             say(f"no lane left, nothing ran. {result['reason']}")
-            return 4
+            return 75
         say(f"lane {result['plan']}: {result['reason']}")
-        log_launch(launches_path, result["plan"], now, not_vendor)
-        code, tail = runner(result["command"])
+        launch_id = uuid.uuid4().hex
+        metadata = None
+        if rung:
+            lane = next(lane for lane in eligible if lane["lane"] == result["plan"])
+            metadata = {"event": "start", "launch_id": launch_id,
+                        **{key: rung[key] for key in ("rung", "rung_source", "ticket", "job")},
+                        "model": lane["model"], "effort": lane["effort"]}
+        log_launch(launches_path, result["plan"], now, not_vendor, metadata)
+        code, tail, elapsed, work = unpack_run(runner(result["command"]))
+        info = analyze_output(tail)
+        error_line = info["error_line"]
+        fast = fast_fail_kind(code, tail, elapsed, work)
         kind = limit_kind(code, tail)
+        if kind == "silent" and work and code == 0:
+            kind = None
+        status = re.search(r"(?:^\s*|HTTP\s+|statusCode[\"':\s]+)(4\d{2})\b", error_line, re.I)
+        nonquota_http = status and status[1] not in ("402", "429")
+        if fast and nonquota_http and kind != "blocked":
+            kind = None
+        effective_code = 1 if code == 0 and (kind is not None or fast is not None or info["error"] is not None) else code
+        lane_failure = kind is not None or fast is not None
+        if rung:
+            launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now,
+                          lane_failure=lane_failure)
         if kind is None:
-            return code
+            if fast is None:
+                return effective_code
+            tried.add(result["plan"])
+            source = "fast-fail 4xx" if nonquota_http else "fast-fail"
+            mark_limited(result["plan"], (number(cfg.get("fast_fail_minutes")) or 5) / 60,
+                         now, limits_path, reason=fast, source=source, error_line=error_line)
+            say(f"skipped lane {result['plan']}: {fast} (exit {code})")
+            continue
         tried.add(result["plan"])
-        until = mark_limited(result["plan"], hours[kind], now, limits_path)
+        source = ("429" if re.search(r"\b429\b", error_line) else
+                  "fast-fail 4xx" if kind == "blocked" else "silent exit" if kind == "silent" else "quota error")
+        until = mark_limited(result["plan"], hours[kind], now, limits_path,
+                             reason=why[kind], source=source, error_line=error_line)
         say(f"lane {result['plan']} {why[kind]} (exit {code}); skipped until "
             f"{datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC, trying the next lane")
+
+
+RUNGS = ("light", "medium", "hard")
+PR_URL = re.compile(r"https://github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)")
+
+
+def read_state(path):
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            raise ValueError(f"invalid state: {path}")
+        return data
+    except FileNotFoundError:
+        return {}
+
+
+def update_state(path, key, value):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path + ".lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_state(path)
+        data[key] = value
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+
+
+def parse_pages(stdout):
+    pages, decoder, index = [], json.JSONDecoder(), 0
+    while index < len(stdout):
+        while index < len(stdout) and stdout[index] in " \t\r\n":
+            index += 1
+        if index >= len(stdout):
+            break
+        page, index = decoder.raw_decode(stdout, index)
+        pages.append(page)
+    return [comment for page in pages if isinstance(page, list)
+            for comment in page if isinstance(comment, dict)]
+
+
+def first_verdict(pr, cache_path, run=subprocess.run):
+    match = PR_URL.fullmatch(pr or "")
+    if not match:
+        return None
+    cached = read_state(cache_path).get(pr)
+    if cached in ("PASS", "FAIL"):
+        return cached
+    repo, num = match.groups()
+    proc = run(["gh", "api", "--paginate",
+                f"repos/{repo}/issues/{num}/comments?per_page=100"],
+               capture_output=True, text=True, timeout=60)
+    if proc.returncode:
+        raise ValueError(f"cannot read verifier comments for {repo}#{num}")
+    try:
+        comments = parse_pages(proc.stdout)
+    except ValueError as exc:
+        raise ValueError(f"cannot read verifier comments for {repo}#{num}: {exc}")
+    comments.sort(key=lambda c: (c.get("created_at", ""), c.get("id", 0)))
+    for comment in comments:
+        body = comment.get("body", "")
+        if not re.search(r"Verifier model:|<!--\s*pstack-verifier", body, re.I):
+            continue
+        body = re.sub(r"(?ms)^```.*?^```[^\n]*", "", body)
+        verdicts = re.findall(r"(?im)^[ \t]*(?:\#{1,6}[ \t]+)?(?:\*\*)?(?:VERDICT:[ \t]*)?"
+                              r"(PASS(?:\+NOTES)?|FAIL)(?:\*\*)?[ \t]*$", body)
+        if verdicts:
+            verdict = "FAIL" if verdicts[-1].upper() == "FAIL" else "PASS"
+            update_state(cache_path, pr, verdict)
+            return verdict
+    return None
+
+
+def lease_ticket(path=None):
+    if path:
+        receipt = read_state(path)
+        if not receipt:
+            raise ValueError("lease receipt missing or empty")
+        ticket = receipt.get("ticket_id") or receipt.get("ticket") or receipt.get("key")
+        if ticket is None:
+            ticket = os.path.basename(path).removesuffix(".json")
+        if isinstance(ticket, bool) or not isinstance(ticket, (str, int)):
+            raise ValueError("lease needs a ticket id")
+        return str(ticket)
+    ancestors, pid = [], os.getpid()
+    while pid > 1 and pid not in ancestors:
+        ancestors.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as fh:
+                pid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    candidates = []
+    for filename in glob.glob(os.path.expanduser("~/.local/state/fleet/leases/*.json")):
+        receipt = read_state(filename)
+        if receipt.get("pid") in ancestors and receipt.get("host") == socket.gethostname():
+            candidates.append((ancestors.index(receipt["pid"]), filename))
+    return lease_ticket(min(candidates)[1]) if candidates else None
+
+
+def lane_limit_attempt(prior):
+    if prior.get("failure") == "lane":
+        return True
+    return prior.get("failure") != "work" and prior.get("exit_code") == 75
+
+
+def climb_reason(prior, cache_path):
+    if lane_limit_attempt(prior):
+        return None
+    if prior["exit_code"] != 0 or not prior.get("pr_url"):
+        return "prior run failed"
+    try:
+        verdict = first_verdict(prior.get("pr_url"), cache_path)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        print(f"plan-pick: {exc}; verdict unknown, no climb", file=sys.stderr)
+        return None
+    if verdict == "FAIL":
+        return f"prior FAIL on PR {prior['pr_url'].rsplit('/', 1)[-1]}"
+    return None
+
+
+def rung_context(brief, launches_path, lease=None):
+    try:
+        with open(brief) as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        text = ""
+    matches = re.findall(r"(?m)^Rung:[ \t]*([^\r\n]*?)[ \t]*\r?$", text)
+    if matches and (len(matches) != 1 or matches[0] not in RUNGS):
+        raise ValueError("brief needs one Rung: light|medium|hard line")
+    rung = matches[0] if matches else "medium"
+    ticket = lease_ticket(lease)
+    key = "ticket:" + ticket if ticket else "brief:" + hashlib.sha256(text.encode()).hexdigest()
+    state_path = os.path.join(os.path.dirname(launches_path), "rung-attempts.json")
+    cache_path = os.path.join(os.path.dirname(launches_path), "verifier-cache.json")
+    ctx = {"rung": rung, "rung_source": "brief line" if matches else "default",
+           "ticket": ticket, "job": key, "state_path": state_path, "cache_path": cache_path,
+           "rung_reason": f"rung {rung}"}
+    prior = read_state(state_path).get(key)
+    if prior and not lane_limit_attempt(prior):
+        reason = climb_reason(prior, cache_path)
+        old = prior["rung"]
+        next_index = min(RUNGS.index(old) + int(reason is not None), len(RUNGS) - 1)
+        chosen = RUNGS[max(RUNGS.index(rung), next_index)]
+        if reason is not None or chosen != rung:
+            ctx.update(rung=chosen, rung_source="climb",
+                       rung_reason=f"rung {old} -> {chosen} ({reason or 'prior climb'})")
+    return ctx
+
+
+def rung_lanes(lanes, cfg, rung):
+    by_name = {lane["lane"]: lane for lane in lanes}
+    selected = []
+    for override in cfg["rungs"][rung]:
+        name = override["lane"]
+        if name not in by_name:
+            continue
+        lane = dict(by_name[name])
+        command = lane["command"]
+        for field, flag in (("model", "model"), ("effort", "thinking" if "--thinking" in command else "effort")):
+            if field in override:
+                value = override[field]
+                if not re.fullmatch(r"[\w./:+-]+", value):
+                    raise ValueError(f"invalid {field} in rung {rung}")
+                command, count = re.subn(r"--" + flag + r"(?:=|\s+)[\w./:+-]+", "--" + flag + " " + value, command)
+                if count != 1:
+                    raise ValueError(f"lane {name} cannot override {field}")
+                lane[field] = value
+        lane["command"] = command
+        if "model" not in lane:
+            model = re.search(r"--model(?:=|\s+)([\w./:+-]+)", command)
+            lane["model"] = model[1] if model else None
+        if "effort" not in lane:
+            effort = re.search(r"--(?:effort|thinking)(?:=|\s+)([\w-]+)", command)
+            lane["effort"] = effort[1] if effort else "model-default"
+        selected.append(lane)
+    return lanes_with_first(selected) if rung == "medium" else selected
+
+
+def pick_rung(lanes, pools, cfg, ctx, limits, warn, now=None):
+    ctx = dict(ctx)
+    initial = ctx["rung"]
+    while True:
+        eligible = rung_lanes(lanes, cfg, ctx["rung"])
+        result = pick(eligible, pools, limits, now, warn, strict_pace=True)
+        if result["command"] or ctx["rung"] == "hard":
+            result.update({key: ctx[key] for key in ("rung", "rung_source", "rung_reason")})
+            result["reason"] = ctx["rung_reason"] + "; " + result["reason"]
+            return result, ctx, eligible
+        ctx["rung"] = RUNGS[RUNGS.index(ctx["rung"]) + 1]
+        ctx["rung_source"] = "climb"
+        ctx["rung_reason"] = f"rung {initial} -> {ctx['rung']} (no room)"
+
+
+class RunOutput(str):
+    pass
+
+
+def output_usage(record):
+    kind = record.get("kind") or record.get("type")
+    if kind == "turn_usage":
+        usage = record.get("usage", {})
+        values = (usage.get("in_tokens"), usage.get("cached"), usage.get("output"))
+        if values[0] is None and number(usage.get("input")) is not None and number(values[1]) is not None:
+            values = (usage["input"] - values[1], values[1], values[2])
+    elif kind == "message_end" and record.get("message", {}).get("role") == "assistant":
+        usage = record["message"].get("usage", {})
+        values = (usage.get("input"), usage.get("cacheRead"), usage.get("output"))
+    elif kind == "result" and isinstance(record.get("usage"), dict):
+        usage = record["usage"]
+        cached = usage.get("cache_read_input_tokens", usage.get("cached_tokens", 0))
+        incoming = usage.get("input_tokens")
+        values = (incoming, cached, usage.get("output_tokens"))
+    elif isinstance(record.get("stats", {}).get("models"), dict):
+        values = [0, 0, 0]
+        for model in record["stats"]["models"].values():
+            tokens = model.get("tokens", {})
+            cached = tokens.get("cached", 0)
+            incoming = tokens.get("input", tokens.get("prompt"))
+            outgoing = tokens.get("candidates")
+            if number(incoming) is None or number(outgoing) is None:
+                return None
+            values[0] += incoming - cached
+            values[1] += cached
+            values[2] += outgoing + tokens.get("thoughts", 0)
+    else:
+        return None
+    if not all(number(v) is not None and math.isfinite(v) and v >= 0 for v in values):
+        return None
+    return dict(zip(("in", "cached", "out"), values))
+
+
+def measured_output(fh, tail):
+    totals, found, incomplete, final = {"in": 0, "cached": 0, "out": 0}, False, False, ""
+    fh.seek(0)
+    for line in fh:
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        usage = output_usage(record)
+        kind = record.get("kind") or record.get("type")
+        if usage is None and (kind == "turn_usage" or
+                              (kind == "message_end" and record.get("message", {}).get("role") == "assistant")):
+            incomplete = True
+        if usage:
+            found = True
+            for key in totals:
+                totals[key] += usage[key]
+        if record.get("type") == "result" or "stats" in record:
+            final = record.get("text", record.get("result", record.get("response", "")))
+        elif record.get("type") == "message_end":
+            message = record.get("message", {})
+            if message.get("role") == "assistant":
+                final = "\n".join(part.get("text", "") for part in message.get("content", []) if isinstance(part, dict))
+    if not found:
+        fh.seek(0)
+        try:
+            record = json.load(fh)
+            if isinstance(record, dict):
+                usage = output_usage(record)
+                if usage:
+                    totals, found = usage, True
+                final = record.get("result", record.get("response", ""))
+        except ValueError:
+            pass
+    output = RunOutput(tail)
+    output.tokens = totals if found and not incomplete else None
+    prs = PR_URL.findall(final if isinstance(final, str) else "")
+    output.pr_url = f"https://github.com/{prs[-1][0]}/pull/{prs[-1][1]}" if prs else None
+    output.analysis = analyze_stream(fh)
+    return output
+
+
+def attempt_failure(code, pr_url, lane_failure):
+    if lane_failure and code != 0:
+        return "lane"
+    if code != 0 or not pr_url:
+        return "work"
+    return None
+
+
+def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_failure=False):
+    tokens = getattr(output, "tokens", None)
+    price = cfg.get("list_prices", {}).get(lane.get("model"), {})
+    cost = None
+    if tokens is not None and all(number(price.get(k)) is not None for k in tokens):
+        cost = sum(tokens[k] * price[k] for k in tokens) / 1_000_000
+    pr_url = getattr(output, "pr_url", None)
+    finish = {"event": "finish", "launch_id": launch_id, "finished_at": time.time() if now is None else now,
+              "exit_code": code, "pr_url": pr_url, "tokens": tokens,
+              "cost_usd": cost, "cost_basis": "list-equivalent",
+              "failure": attempt_failure(code, pr_url, lane_failure)}
+    append_launch(path, finish)
+    attempt = dict(finish, rung=ctx["rung"])
+    update_state(ctx["state_path"], ctx["job"], attempt)
+
+
+def record_no_lane(ctx, now=None):
+    if not ctx:
+        return
+    prior = read_state(ctx["state_path"]).get(ctx["job"])
+    if prior and prior.get("failure") == "work":
+        return
+    update_state(ctx["state_path"], ctx["job"], {
+        "event": "finish", "exit_code": 75, "pr_url": None, "failure": "lane",
+        "rung": ctx["rung"], "finished_at": time.time() if now is None else now})
+
+
+def append_launch(path, row):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "a") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        fh.write(json.dumps(row) + "\n")
+
+
+def rung_report(path=LAUNCHES, last=50, verdict_reader=None):
+    cache = os.path.join(os.path.dirname(path), "verifier-cache.json")
+    verdict_reader = verdict_reader or (lambda pr: first_verdict(pr, cache))
+    starts, finished, errors, legacy, unfinished = {}, [], 0, 0, 0
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("not a record")
+                except ValueError:
+                    errors += 1
+                    continue
+                if row.get("event") == "finish":
+                    start = starts.get(row.get("launch_id"))
+                    if start is None:
+                        errors += 1
+                    else:
+                        finished.append(dict(start, **row))
+                elif row.get("launch_id"):
+                    starts[row["launch_id"]] = row
+                elif row.get("lane") is not None:
+                    legacy += 1
+    except FileNotFoundError:
+        pass
+    unfinished = len(set(starts) - {row["launch_id"] for row in finished})
+    jobs = sorted(finished, key=lambda row: row["finished_at"])[-last:]
+    groups, passes, unknowns, missing_cost, hard_failed, total = {}, 0, 0, 0, 0, 0.0
+    for row in jobs:
+        failed = row.get("exit_code") != 0 or not row.get("pr_url")
+        verdict = None
+        if row.get("pr_url"):
+            try:
+                verdict = verdict_reader(row["pr_url"])
+            except (OSError, ValueError, subprocess.SubprocessError):
+                errors += 1
+        if failed:
+            errors += 1
+        passed = not failed and verdict == "PASS"
+        known = failed or verdict is not None
+        cost = number(row.get("cost_usd"))
+        if cost is not None and (not math.isfinite(cost) or cost < 0):
+            cost = None
+            errors += 1
+        passes += int(passed)
+        unknowns += int(not known or cost is None)
+        missing_cost += int(cost is None)
+        total += cost or 0
+        hard_failed += int(row.get("rung") == "hard" and (failed or verdict == "FAIL"))
+        key = (row.get("rung", "unknown"), row.get("model") or "unknown")
+        group = groups.setdefault(key, {"jobs": 0, "passes": 0, "known": 0, "costs": []})
+        group["jobs"] += 1
+        group["passes"] += int(passed)
+        group["known"] += int(known)
+        if cost is not None:
+            group["costs"].append(cost)
+    return {"jobs": len(jobs), "passes": passes, "unknowns": unknowns, "errors": errors,
+            "legacy_missing_finish": legacy, "unfinished": unfinished, "hard_failed": hard_failed,
+            "missing_cost": missing_cost, "total_known_cost_usd": total,
+            "cost_per_first_pass": total / passes if passes and not missing_cost else None,
+            "groups": [{"rung": rung, "model": model, **group} for (rung, model), group in sorted(groups.items())]}
+
+
+def rung_report_lines(report):
+    metric = report["cost_per_first_pass"]
+    value = f"${metric:.6f}" if metric is not None else "unavailable"
+    yield (f"cost per first-pass job = {value} (list-equivalent); jobs={report['jobs']} passes={report['passes']} "
+           f"unknowns={report['unknowns']} errors={report['errors']}; missing_cost={report['missing_cost']} "
+           f"legacy_missing_finish={report['legacy_missing_finish']} unfinished={report['unfinished']} "
+           f"hard_failed={report['hard_failed']}")
+    yield "rung model jobs first-pass (known reviews/run failures) average cost (list-equivalent)"
+    for group in report["groups"]:
+        rate = f"{group['passes'] / group['known']:.1%}" if group["known"] else "unknown"
+        costs = group["costs"]
+        average = f"${sum(costs) / len(costs):.6f}" if costs else "unknown"
+        yield (f"{group['rung']} {group['model']} {group['jobs']} {rate} "
+               f"({group['passes']}/{group['known']}) {average} (priced={len(costs)})")
 
 
 def http_json(url, key):
@@ -372,6 +1358,12 @@ def http_json(url, key):
 
 
 def pi_key(provider):
+    if provider == "commandcode":
+        if os.environ.get("COMMANDCODE_API_KEY"):
+            return os.environ["COMMANDCODE_API_KEY"]
+        out = subprocess.run([os.path.expanduser("~/.local/bin/yeo-key"), "Commando Code API Key", "credential"],
+                             capture_output=True, text=True, timeout=60)
+        return out.stdout.strip() if out.returncode == 0 else ""
     out = subprocess.run([PI, "auth", "print-api-key", "--provider", provider],
                          capture_output=True, text=True, timeout=60)
     return out.stdout.strip() if out.returncode == 0 else ""
@@ -383,7 +1375,8 @@ def balance_deepseek(get, key):
 
 
 def balance_vercel(get, key):
-    return float(get("https://ai-gateway.vercel.sh/v1/credits", key("vercel-ai-gateway"))["token_pass"]["remaining"])
+    token_pass = get("https://ai-gateway.vercel.sh/v1/credits", key("vercel-ai-gateway"))["token_pass"]
+    return {"usd": float(token_pass["remaining"]), "resets_at": token_pass.get("resets_at")}
 
 
 def balance_openrouter(get, key):
@@ -394,7 +1387,68 @@ def balance_openrouter(get, key):
     return left if remaining is None else min(left, remaining)
 
 
-BALANCES = {"deepseek": balance_deepseek, "vercel": balance_vercel, "openrouter": balance_openrouter}
+def balance_commandcode(get, key):
+    k = key("commandcode")
+    data = get("https://api.commandcode.ai/alpha/billing/credits", k)
+    subscription = get("https://api.commandcode.ai/alpha/billing/subscriptions", k)["data"]
+    if subscription["planId"] != "individual-goat" or subscription["status"] != "active":
+        raise ValueError("CommandCode GOAT subscription is not active")
+    credits = data["credits"]["monthlyCredits"]
+    windows = data["windowLimits"]
+    if number(credits) is None or credits < 0:
+        raise ValueError("invalid CommandCode monthly credits")
+    for name in ("fiveHour", "weekly"):
+        window = windows[name]
+        if any(number(window[field]) is None for field in ("used", "cap", "resetAt")):
+            raise ValueError("invalid CommandCode window")
+        if window["used"] < 0 or window["cap"] <= 0 or window["resetAt"] < 0:
+            raise ValueError("invalid CommandCode window")
+        if window["resetAt"] == 0 and (window["used"] != 0 or window.get("exceeded")):
+            raise ValueError("invalid CommandCode idle window")
+    return {"credits": credits, "windows": windows,
+            "period_start": datetime.fromisoformat(subscription["currentPeriodStart"].replace("Z", "+00:00")).timestamp(),
+            "period_end": datetime.fromisoformat(subscription["currentPeriodEnd"].replace("Z", "+00:00")).timestamp()}
+
+
+def commandcode_pool(entry, now, cfg):
+    try:
+        stale_s = (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+        if not entry or now - entry["at"] > stale_s or now >= entry["period_end"]:
+            return {"state": "OFF", "note": "CommandCode credit reading missing or stale"}
+        credits = entry["credits"]
+        start, end = entry["period_start"], entry["period_end"]
+        used = max(0, 70 - credits)
+        elapsed = max(0, min(1, (now - start) / (end - start))) if end > start else 0
+        pace = used / 70 / elapsed if elapsed > 0 else None
+        pace_text = f"{pace:.2f}x" if pace is not None else "unknown"
+        state = "ON" if credits > 0 else "OFF"
+        windows = []
+        for name, label in (("fiveHour", "5h"), ("weekly", "week")):
+            window = entry["windows"][name]
+            reset = window["resetAt"] / 1000
+            spent = window["used"] if now < reset else 0
+            if spent >= window["cap"] or (now < reset and window.get("exceeded")):
+                state = "OFF"
+            windows.append(f"{label} {spent:g}/{window['cap']:g} credits")
+        return {"state": state, "used": used, "limit": 70, "unit": "plan credits", "pace_ratio": pace,
+                "resets_at": end,
+                "note": f"{used:g}/70 monthly credits used, pace {pace_text}; "
+                        f"{credits:g}/70 monthly credits left (~${credits * 100 / 70:.2f} Flash usage); "
+                        + "; ".join(windows) + "; extra paid credits excluded"}
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        return {"state": "OFF", "note": "CommandCode credit reading is invalid"}
+
+
+BALANCES = {"deepseek": balance_deepseek, "vercel": balance_vercel, "commandcode": balance_commandcode,
+            "openrouter": balance_openrouter}
+
+
+def reading(reader, get, key):
+    got = reader(get, key)
+    entry = dict(got) if isinstance(got, dict) else {"usd": got}
+    if "usd" in entry:
+        entry["usd"] = round(float(entry["usd"]), 2)
+    return entry
 
 
 def read_credits(path=CREDITS):
@@ -406,22 +1460,61 @@ def read_credits(path=CREDITS):
     return data if isinstance(data, dict) else {}
 
 
+def save_credits(entries, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path + ".write-lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = read_credits(path)
+        data.update(entries)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    return data
+
+
 def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers=BALANCES):
-    data = read_credits(path)
+    updates = {}
     for name in names:
         reader = readers.get(name)
         if not reader:
             continue
         try:
-            data[name] = {"usd": round(reader(get, key), 2), "at": now}
+            updates[name] = dict(reading(reader, get, key), at=now)
         except Exception as exc:
             print(f"plan-pick: cannot read {name} credit: {type(exc).__name__}", file=sys.stderr)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(data, fh)
-    os.replace(tmp, path)
-    return data
+    return save_credits(updates, path)
+
+
+def plan_credits(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
+    now = time.time() if now is None else now
+    every = (number(cfg.get("credit_refresh_minutes")) or DEFAULT_CREDIT_REFRESH_MINUTES) * 60
+    stale_s = (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+    data = read_credits(path)
+    due = []
+    for plan in plans:
+        name = plan.get("credit")
+        entry = data.get(name) if isinstance(name, str) else None
+        if isinstance(name, str) and (not isinstance(entry, dict) or number(entry.get("credits" if name == "commandcode" else "usd")) is None
+                                      or now - (number(entry.get("at")) or 0) > every):
+            due.append(name)
+    if due:
+        data = refresh(due, now, path)
+    fresh = {}
+    for plan in plans:
+        name = plan.get("credit")
+        entry = data.get(name) if isinstance(name, str) else None
+        if not isinstance(entry, dict):
+            continue
+        read_at, left = number(entry.get("at")), number(entry.get("credits" if name == "commandcode" else "usd"))
+        if read_at is not None and left is not None and now - read_at <= stale_s:
+            fresh[name] = entry
+    return fresh
+
+
+def plan_lines(plans, cfg, now=None, path=CREDITS, refresh=refresh_credits):
+    credits = plan_credits(plans, cfg, now, path, refresh)
+    return [plan_line(plan, credits.get(plan.get("credit"))) for plan in plans]
 
 
 def credit_pool(entry, now, cfg):
@@ -432,9 +1525,12 @@ def credit_pool(entry, now, cfg):
         return None
     if now - entry["at"] > stale_s:
         return None
+    extra = {"credits_usd": entry["usd"], "credit_floor_usd": floor}
+    if entry.get("resets_at") is not None:
+        extra["resets_at"] = entry["resets_at"]
     if entry["usd"] < floor:
-        return {"state": "OFF", "note": f"${entry['usd']:.2f} credit left, under ${floor:g}"}
-    return {"state": "ON", "note": f"${entry['usd']:.2f} credit left"}
+        return dict(state="OFF", note=f"${entry['usd']:.2f} credit left, under ${floor:g}", **extra)
+    return dict(state="ON", note=f"${entry['usd']:.2f} credit left", **extra)
 
 
 def refresh_later(names, now, path):
@@ -454,7 +1550,8 @@ def with_credits(pools, lanes, cfg, now=None, path=CREDITS, refresh=refresh_late
         data = refresh(due, now, path)
     pools = dict(pools) if isinstance(pools, dict) else {}
     for name in names:
-        state = credit_pool(data.get(name), now, cfg)
+        reader = commandcode_pool if name == "commandcode" else credit_pool
+        state = reader(data.get(name), now, cfg)
         if state and f"credit:{name}" not in pools:
             pools[f"credit:{name}"] = state
     return pools
@@ -477,93 +1574,336 @@ def history_rows(pacing_dir):
     return rows
 
 
+def parse_opencode_windows(raw):
+    used = {}
+    if not isinstance(raw, dict):
+        return used
+    for name, val in raw.items():
+        if isinstance(val, dict):
+            used[name] = number(val.get("used") if val.get("used") is not None else val.get("percent"))
+        else:
+            used[name] = number(val)
+    return used
+
+
 def last_windows(pacing_dir):
     rows = [r for r in history_rows(pacing_dir) if isinstance(r.get("windows"), dict) and r["windows"]]
-    return max(rows, key=lambda r: r["at"]) if rows else None
+    if not rows:
+        return None
+    row = max(rows, key=lambda r: r["at"])
+    return {"at": row["at"], "used": parse_opencode_windows(row["windows"]),
+            "resets_at": row.get("resets_at", {})}
 
 
-def last_credit(pacing_dir):
-    rows = [r for r in history_rows(pacing_dir) if number(r.get("credits_usd")) is not None]
-    return max(rows, key=lambda r: r["at"]) if rows else None
+def read_opencode(cfg):
+    command = cfg.get("opencode_reader_command") or []
+    if not isinstance(command, list) or not command or not all(isinstance(arg, str) for arg in command):
+        raise ValueError("OpenCode reader command missing")
+    command = [os.path.expanduser(arg) for arg in command]
+    reading = {}
+    try:
+        out = subprocess.run(command + ["--print"], capture_output=True, text=True, timeout=180, check=True)
+        usage = json.loads(out.stdout)
+        windows = usage["windows"]
+        reading = {"at": datetime.fromisoformat(usage["measured_at"].replace("Z", "+00:00")).timestamp(),
+                   "windows": {w["name"]: w["used"] for w in windows},
+                   "resets_at": {w["name"]: w.get("resets_at") for w in windows}}
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    try:
+        out = subprocess.run(command + ["--credits", "--print"], capture_output=True, text=True,
+                             timeout=180, check=True)
+        money = json.loads(out.stdout)
+        reading.update(credits_usd=money["credits_usd"], credits_at=money["at"])
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass
+    return reading
 
 
-def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
-    stale_s = (number(cfg.get("opencode_stale_hours")) or DEFAULT_STALE_HOURS) * 3600
-    windows = last_windows(pacing_dir)
-    if not windows or now - windows["at"] > stale_s:
-        return {"state": "unknown", "note": "OpenCode usage reading missing or stale, assumed free"}
-    used = windows["windows"]
-    for name in ("rolling", "5-hour", "weekly", "monthly"):
-        if (number(used.get(name)) or 0) >= 100:
-            if name == "monthly":
-                return opencode_credit_pool(now, cfg, pacing_dir, sessions)
-            return {"state": "OFF", "note": f"OpenCode {name} window is full"}
-    return {"state": "ON", "note": "OpenCode windows have room"}
-
-
-def lane_spend(since, sessions=PI_SESSIONS, provider=OPENCODE_LANE_PROVIDER,
-               rate=DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK):
-    total = 0.0
-    for path in glob.glob(os.path.join(sessions, "*", "*.jsonl")):
+def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launches_path=LAUNCHES,
+                  credits_path=None, allow_live=True):
+    credits_path = CREDITS if credits_path is None else credits_path
+    plan = next((p for p in plans_from(cfg) if p.get("vendor") == "opencode"), {})
+    allowance = number(plan.get("included_allowance_usd"))
+    reading = None
+    if allow_live:
         try:
-            if os.path.getmtime(path) < since:
-                continue
-            with open(path, errors="replace") as fh:
-                lines = fh.read().splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            if provider not in line:
-                continue
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue
-            message = row.get("message") if isinstance(row, dict) else None
-            if not isinstance(message, dict) or message.get("provider") != provider:
+            reading = read_opencode(cfg)
+        except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            reading = None
+    now = time.time() if now is None else now
+    credit = number((reading or {}).get("credits_usd"))
+    credit_at = number((reading or {}).get("credits_at"))
+    live_credit = (credit is not None and math.isfinite(credit) and credit >= 0 and credit_at is not None
+                   and math.isfinite(credit_at) and 0 <= now - credit_at <= 60)
+    if live_credit:
+        save_credits({"opencode": {"usd": credit, "at": credit_at, "source": "OpenCode live console"}}, credits_path)
+    live = bool(reading and reading.get("windows"))
+    reading = reading if live else last_windows(pacing_dir)
+    if not reading:
+        return {"state": "OFF", "credit_unknown": True,
+                "note": "OpenCode live usage unavailable; credit unknown; never top up"}
+    used = parse_opencode_windows(reading.get("windows", reading.get("used")))
+    monthly = number(used.get("monthly"))
+    windows = ", ".join(f"{name} {used[name]:g}%" if number(used.get(name)) is not None else f"{name} unknown"
+                        for name in ("monthly", "weekly", "5-hour"))
+    result = {"state": "OFF", "used_pct": monthly, "windows": used, "note": windows,
+              "included_exhausted": monthly is not None and monthly >= 100}
+    renewal = (reading.get("resets_at") or {}).get("monthly")
+    if number(renewal) is None:
+        try:
+            renewal = datetime.fromisoformat(cfg["opencode_monthly_renewal"].replace("Z", "+00:00")).timestamp()
+        except (KeyError, ValueError, TypeError):
+            renewal = None
+    result["resets_at"] = renewal
+    if monthly is not None and allowance is not None and allowance > 0:
+        result.update(used_usd=monthly * allowance / 100, included_allowance_usd=allowance)
+        result["note"] += f"; ${result['used_usd']:.2f} of ${allowance:.2f} included allowance"
+    if result["included_exhausted"]:
+        result["note"] += "; included allowance used up"
+    at = number(reading.get("at"))
+    fresh_s = 300 if allow_live else (number(cfg.get("credit_stale_hours")) or DEFAULT_CREDIT_STALE_HOURS) * 3600
+    if (allow_live and not live) or at is None or not 0 <= now - at <= fresh_s:
+        result["note"] += "; live usage unavailable or stale; never top up"
+        if not result["included_exhausted"]:
+            return result
+    if (monthly is None or not math.isfinite(monthly) or monthly < 0 or allowance is None
+            or not math.isfinite(allowance) or allowance <= 0):
+        result["note"] += "; allowance missing; never top up"
+        return result
+    if monthly < 100:
+        if any((number(used.get(name)) or 0) >= 100 for name in ("rolling", "5-hour", "weekly")):
+            result["note"] += "; window is full"
+        else:
+            result.update(state="ON", funding="included")
+        return result
+    if live_credit:
+        result["note"] += f"; live available credit ${credit:.2f}"
+    else:
+        anchor = read_credits(credits_path).get("opencode")
+        anchor = anchor if isinstance(anchor, dict) else {}
+        credit, credit_at = number(anchor.get("usd")), number(anchor.get("at"))
+        if (credit is None or not math.isfinite(credit) or credit < 0 or credit_at is None
+                or not math.isfinite(credit_at) or not 0 <= now - credit_at <= 7 * 86400):
+            result["note"] += "; live credit unavailable; balance anchor missing, invalid or older than 7 days; credit unknown; never top up"
+            result["credit_unknown"] = True
+            return result
+        spent, unknown = opencode_spend(credit_at, now, sessions, launches_path)
+        credit = max(0.0, round(credit - spent, 10))
+        stamp = datetime.fromtimestamp(credit_at, timezone.utc).isoformat()
+        result["note"] += (f"; anchored credit ${credit:.2f}: ${anchor['usd']:.2f} at {stamp}"
+                           f" ({anchor.get('source', 'unknown source')}) less ${spent:.2f} run costs")
+        if unknown:
+            result["note"] += f"; includes conservative $0.50 default for {unknown} run(s) with unknown cost"
+    floor = number(cfg.get("opencode_credit_floor_usd"))
+    floor = 2 if floor is None or not math.isfinite(floor) or floor < 0 else floor
+    result.update(credits_usd=credit, credit_floor_usd=floor)
+    result["note"] += f" (floor ${floor:g}); never top up"
+    if credit <= floor:
+        result.update(floor_reached=True)
+        if number(renewal) is not None and math.isfinite(renewal) and renewal > now:
+            stamp = datetime.fromtimestamp(renewal, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            result["note"] += f"; skip until monthly renewal {stamp}"
+        else:
+            result["note"] += "; skip until monthly renewal"
+    elif cfg.get("opencode_extra_usage") is not True or cfg.get("opencode_auto_topup") is not False:
+        result["note"] += "; prepaid usage requires Extra Usage on and auto top-up OFF"
+    elif number(renewal) is None or not math.isfinite(renewal) or renewal <= now:
+        result["note"] += "; monthly renewal needs a fresh reading"
+    else:
+        result.update(state="ON", funding="prepaid")
+        result["note"] += "; using held prepaid credit"
+    return result
+
+
+def jsonl_rows(path):
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    yield row
+    except OSError:
+        return
+
+
+def opencode_spend(since, now, sessions, launches_path):
+    launches = [row for row in jsonl_rows(launches_path)
+                if number(row.get("at")) is not None and row["at"] <= now]
+    launches.sort(key=lambda row: row["at"])
+    runs = {("launch", i): {"usd": 0.0, "messages": 0, "unknown": False}
+            for i, row in enumerate(launches) if row.get("lane") == "opencode" and row["at"] > since}
+    seen = set()
+    for path in sorted(glob.glob(os.path.join(sessions, "*", "*.jsonl"))):
+        cwd, session = None, path
+        for row in jsonl_rows(path):
+            if row.get("type") == "session":
+                cwd, session = row.get("cwd"), row.get("id") or path
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("provider") != "opencode-go" or message.get("role") != "assistant":
                 continue
             at = number(message.get("timestamp"))
-            if at is None or at / 1000 <= since:
+            if at is None or not since < at / 1000 <= now:
                 continue
-            usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
-            cost = usage.get("cost") if isinstance(usage.get("cost"), dict) else {}
-            total += number(cost.get("total")) or (number(usage.get("totalTokens")) or 0) * rate / 1000000
-    return total
+            if row.get("id"):
+                identity = (row["id"], at)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            key = ("session", session)
+            for i in range(len(launches) - 1, -1, -1):
+                launch = launches[i]
+                if cwd and launch.get("cwd") == cwd and launch["at"] <= at / 1000:
+                    if launch.get("lane") == "opencode":
+                        key = ("launch", i)
+                    break
+            run = runs.setdefault(key, {"usd": 0.0, "messages": 0, "unknown": False})
+            run["messages"] += 1
+            usage = message.get("usage")
+            cost = usage.get("cost") if isinstance(usage, dict) else None
+            usd = number(cost.get("total")) if isinstance(cost, dict) else None
+            if usd is None or not math.isfinite(usd) or usd < 0:
+                run["unknown"] = True
+            else:
+                run["usd"] += usd
+    unknown = sum(run["unknown"] or run["messages"] == 0 for run in runs.values())
+    return sum(run["usd"] for run in runs.values()) + unknown * 0.50, unknown
 
 
-def estimated_credit(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
-    hours = number(cfg.get("opencode_estimate_hours")) or DEFAULT_OPENCODE_ESTIMATE_HOURS
-    base = last_credit(pacing_dir)
-    if not base or now - base["at"] > hours * 3600:
-        return None
-    rate = number(cfg.get("opencode_estimate_usd_per_mtok")) or DEFAULT_OPENCODE_ESTIMATE_USD_PER_MTOK
-    spent = lane_spend(base["at"], sessions, rate=rate)
-    return {"credits_usd": max(0.0, base["credits_usd"] - spent), "base_usd": base["credits_usd"],
-            "base_at": base["at"], "spent_usd": spent}
+PACE_LOG_NOTE = ("Launches come from the plan-pick launch log; counters come from token-ladder pools. "
+                 "The counter is the plan's own used share and the pace is used share over elapsed share. "
+                 "No tokens are read or printed.")
 
 
-def opencode_credit_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS):
-    floor = number(cfg.get("opencode_credit_floor_usd")) or DEFAULT_OPENCODE_CREDIT_FLOOR
-    fresh_s = (number(cfg.get("opencode_credit_fresh_hours")) or DEFAULT_OPENCODE_CREDIT_FRESH_HOURS) * 3600
-    hours = number(cfg.get("opencode_estimate_hours")) or DEFAULT_OPENCODE_ESTIMATE_HOURS
-    row = last_credit(pacing_dir)
-    if row and now - row["at"] <= fresh_s:
-        credit = row["credits_usd"]
-        if credit < floor:
-            return {"state": "OFF", "note": f"OpenCode monthly window is full and credit ${credit:.2f} is under ${floor:g}"}
-        return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} credit (floor ${floor:g})"}
-    est = estimated_credit(now, cfg, pacing_dir, sessions)
-    if est is None:
-        return {"state": "OFF", "note": "OpenCode monthly window is full and no credit reading or estimate "
-                                         f"from the last {hours:g} hours"}
-    credit = est["credits_usd"]
-    proof = (f"${est['base_usd']:.2f} read {(now - est['base_at']) / 3600:.1f}h ago "
-             f"less ${est['spent_usd']:.2f} spend seen since")
-    if credit < floor:
-        return {"state": "OFF", "note": f"OpenCode monthly window is full and estimated credit ${credit:.2f} "
-                                         f"is under ${floor:g} ({proof})"}
-    return {"state": "ON", "note": f"OpenCode monthly window is full, running on ${credit:.2f} estimated credit: "
-                                     f"{proof} (floor ${floor:g})"}
+def period_start(now):
+    return datetime.fromtimestamp(now, timezone.utc).replace(day=1, hour=0, minute=0, second=0,
+                                                             microsecond=0).timestamp()
+
+
+def pace_log(pools, cfg, now=None, launches_path=LAUNCHES, lanes=None):
+    now = time.time() if now is None else now
+    lanes = lanes_from(cfg) if lanes is None else lanes
+    launches = [(number(row.get("at")), row.get("lane")) for row in jsonl_rows(launches_path)]
+    rows = {}
+    for lane in lanes:
+        name = lane["lane"]
+        pool = pools.get(lane.get("pool")) if lane.get("pool") else None
+        if not isinstance(pool, dict) and lane.get("credit"):
+            pool = pools.get(f"credit:{lane['credit']}")
+        pool = pool if isinstance(pool, dict) else {}
+        reset = number(pool.get("resets_at"))
+        used = number(pool.get("used_pct"))
+        if used is None:
+            used = number(pool.get("used"))
+        span = (number(pool.get("window_minutes")) or 0) * 60
+        start = reset - span if reset is not None and span else reset
+        since = start if start is not None else period_start(now)
+        count = sum(1 for at, lane_name in launches if lane_name == name and at is not None and at >= since)
+        rows[name] = {"lane": name, "since": since, "since_reset": start is not None, "launches": count,
+                      "used_pct": used, "limit": number(pool.get("limit")), "unit": pool.get("unit"),
+                      "elapsed_pct": number(pool.get("elapsed_pct")),
+                      "window_minutes": number(pool.get("window_minutes")),
+                      "pace_ratio": number(pool.get("pace_ratio")), "state": pool.get("state"),
+                      "credit": bool(lane.get("credit")), "note": pool.get("note"),
+                      "chat_only": bool(pool.get("chat_only"))}
+    return {"now": now, "launch_log": launches_path, "note": PACE_LOG_NOTE, "lanes": rows}
+
+
+def pace_log_lines(report):
+    yield "Pace log: plan-pick launches since each plan reset, beside the plan's own counter"
+    yield report["note"]
+    for name, row in report["lanes"].items():
+        since = datetime.fromtimestamp(row["since"], timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        launch = f"{row['launches']} launch{'es' if row['launches'] != 1 else ''} since {since}" + \
+            ("" if row["since_reset"] else " (month start)")
+        if row["chat_only"]:
+            yield f"{name}: {launch}; chat-only pool, no worker counter"
+            continue
+        if row["used_pct"] is None:
+            yield f"{name}: {launch}; " + ("credit lane, no plan counter in this reading"
+                                           if row["credit"] else "counter unknown")
+            continue
+        counter = f"{row['used_pct']:g}% used" if row["limit"] is None else \
+            f"{row['used_pct']:g} of {row['limit']:g} {row['unit'] or 'credits'} used"
+        if row["elapsed_pct"] is not None:
+            window = f" of {row['window_minutes'] / 60:g} h" if row["window_minutes"] else ""
+            counter += f" with {row['elapsed_pct']:.1f}%{window} gone"
+        counter += f"; pace {row['pace_ratio']:.2f}x" if row["pace_ratio"] is not None else "; pace unknown"
+        yield f"{name}: {launch}; {counter}"
+
+
+def burn_report(cfg, now=None, sessions=PI_SESSIONS, launches_path=LAUNCHES):
+    now = time.time() if now is None else now
+    month = datetime.fromtimestamp(now, timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    start = month.timestamp()
+    providers = {"opencode-go": "opencode", "vercel-ai-gateway": "vercel", "openrouter-credit": "openrouter",
+                 "openai-codex": "codex"}
+    by_lane = {lane["lane"]: {"usd": None, "messages": 0, "unpriced_messages": 0, "launches": 0}
+               for lane in lanes_from(cfg)}
+    by_caller = {}
+
+    def entry(table, name):
+        return table.setdefault(name, {"usd": None, "messages": 0, "unpriced_messages": 0, "launches": 0})
+
+    seen = set()
+    for path in sorted(glob.glob(os.path.join(sessions, "*", "*.jsonl"))):
+        caller = "unknown caller"
+        for row in jsonl_rows(path):
+            if row.get("type") == "session":
+                caller = row.get("cwd") or "unknown caller"
+            message = row.get("message")
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            at = number(message.get("timestamp"))
+            provider = message.get("provider")
+            if at is None or not start <= at / 1000 <= now or not isinstance(provider, str):
+                continue
+            if row.get("id"):
+                identity = (provider, row["id"], at)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            usage = message.get("usage")
+            cost = usage.get("cost") if isinstance(usage, dict) else None
+            usd = number(cost.get("total")) if isinstance(cost, dict) else None
+            for item in (entry(by_lane, providers.get(provider, provider)), entry(by_caller, caller)):
+                item["messages"] += 1
+                if usd is None:
+                    item["unpriced_messages"] += 1
+                else:
+                    item["usd"] = (item["usd"] or 0) + usd
+    for row in jsonl_rows(launches_path):
+        at = number(row.get("at"))
+        if at is None or not start <= at <= now or not row.get("lane"):
+            continue
+        caller = row.get("caller") or row.get("cwd") or "unknown caller"
+        entry(by_lane, row["lane"])["launches"] += 1
+        entry(by_caller, caller)["launches"] += 1
+    return {"month": month.strftime("%Y-%m"), "currency": "USD", "by_lane": by_lane, "by_caller": by_caller,
+            "measured": cfg.get("measured_burn", []),
+            "note": "Recorded pi message costs, not invoices or extra-usage charges; no token-rate estimates. "
+                    "Missing cost data is unknown. Callers use usage-store cwd or launch caller/cwd; "
+                    "chat names and directories are separate when logs cannot link them."}
+
+
+def burn_lines(report):
+    yield f"Burn {report['month']} UTC (USD)"
+    yield report["note"]
+    for item in report.get("measured", []):
+        per_billion = round(item["usd"] / (item["tokens"] / 1e9), 1)
+        yield (f"Measured {item['lane']} direct, {item['period_days']} days ending {item['as_of']}: "
+               f"${item['usd']:.2f} for {item['tokens'] / 1e9:.2f}B tokens over {item['requests']:,} requests; "
+               f"about ${per_billion:.2f} per 1B tokens; ~{item['cached_pct']:g}% cached. "
+               "Separate account measurement, not added to recorded pi costs.")
+    for title, key in (("Per lane", "by_lane"), ("Per caller", "by_caller")):
+        yield title
+        for name, item in sorted(report[key].items()):
+            usd = "unknown" if item["usd"] is None else f"${item['usd']:.4f}"
+            yield (f"  {name}: {usd}; {item['messages']} messages; "
+                   f"{item['unpriced_messages']} unpriced; {item['launches']} launches")
 
 
 def read_pools(source):
@@ -577,34 +1917,437 @@ def read_pools(source):
     return json.loads(out)
 
 
-def with_opencode(pools, cfg, now=None):
+def reserve_share_pct(cfg):
+    got = number(cfg.get("antigravity_reserve_share_pct"))
+    return DEFAULT_ANTIGRAVITY_RESERVE_SHARE_PCT if got is None else got
+
+
+def max_daily_runs(cfg):
+    got = number(cfg.get("antigravity_max_daily_runs"))
+    return DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS if got is None else got
+
+
+def midnight(now):
+    return datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def today_launches(path, lane, now):
+    start = midnight(now)
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return 0
+    count = 0
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or row.get("lane") != lane:
+            continue
+        at = number(row.get("at"))
+        if at is not None and start <= at <= now:
+            count += 1
+    return count
+
+
+def antigravity_reserve(pool, cfg, ran):
+    used, limit = number(pool.get("used")), number(pool.get("limit"))
+    if limit is not None and limit > 0:
+        share = reserve_share_pct(cfg)
+        if share < 100 and used is not None and used >= limit * share / 100:
+            return f"daily limit: {used:g} of {limit:g} today is at or past {share:g}%"
+        return None
+    cap = max_daily_runs(cfg)
+    if cap is not None and ran >= cap:
+        return f"daily cap: {ran:g} worker runs today, cap {cap:g}"
+    return None
+
+
+def with_antigravity_reserve(pools, cfg, now=None, path=LAUNCHES):
+    pools = pools if isinstance(pools, dict) else {}
+    pool = pools.get(ANTIGRAVITY_POOL)
+    if not isinstance(pool, dict) or pool.get("state") == "OFF":
+        return pools
+    now = time.time() if now is None else now
+    why = antigravity_reserve(pool, cfg, today_launches(path, ANTIGRAVITY_LANE, now))
+    if not why:
+        return pools
+    pools = dict(pools)
+    pools[ANTIGRAVITY_POOL] = dict(pool, state="OFF", note=why)
+    return pools
+
+
+def with_opencode(pools, cfg, now=None, limits_path=LIMITS):
     pools = pools if isinstance(pools, dict) else {}
     if "opencode" not in pools:
-        pools = dict(pools, opencode=opencode_pool(time.time() if now is None else now, cfg))
+        state = opencode_pool(now, cfg)
+        now = time.time() if now is None else now
+        if state.get("floor_reached") and (number(state.get("resets_at")) or 0) > now:
+            mark_floor_lock("opencode", state["resets_at"], now, limits_path)
+        elif state.get("state") == "ON" and state.get("funding") == "prepaid":
+            clear_floor_lock("opencode", now, limits_path)
+        pools = dict(pools, opencode=state)
     return pools
+
+
+VENDOR_POOLS = {
+    "anthropic": "claude",
+    "openai": "codex",
+    "cursor": "grok",
+    "opencode": "opencode",
+    "google": "google",
+}
+
+
+def lane_pool_key(lane):
+    if lane.get("pool"):
+        return lane["pool"]
+    if lane.get("credit"):
+        return f"credit:{lane['credit']}"
+    return None
+
+
+def to_timestamp(value):
+    num = number(value)
+    if num is not None and math.isfinite(num):
+        return float(num)
+    if isinstance(value, str) and value.strip():
+        try:
+            stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            return stamp.timestamp()
+        except (ValueError, TypeError, OverflowError):
+            return None
+    return None
+
+
+def entry_status(pool, skip, now, warn, chat_only=False, retired=False, no_pace=False):
+    pool = pool if isinstance(pool, dict) else {}
+    state = pool.get("state")
+    used_pct = number(pool.get("used_pct"))
+    pace = number(pool.get("pace_ratio"))
+    note = pool.get("note") if isinstance(pool.get("note"), str) else ""
+    stale_off = bool(pool.get("credit_unknown") or (state == "OFF" and any(
+        phrase in note.lower() for phrase in ("missing or stale", "is invalid", "unavailable"))))
+    pool_used_up = bool(pool.get("used_up") or pool.get("floor_reached") or (
+        state == "OFF" and not stale_off) or (
+        pool.get("funding") != "prepaid" and used_pct is not None and used_pct >= 100))
+    skip_used_up = bool(skip and (pool_used_up or state == "WARN" or skip["until"] - now > 24 * 3600
+                                  or "used up" in skip["reason"].lower()))
+    used_up = bool(pool_used_up or skip_used_up)
+    if retired:
+        return {"status": "RETIRED", "status_kind": "muted", "used_up": used_up}
+    if chat_only:
+        return {"status": "USED UP · CHAT ONLY" if pool_used_up else "CHAT ONLY",
+                "status_kind": "hot" if pool_used_up else "muted", "used_up": pool_used_up}
+    if skip:
+        return {"status": "USED UP · SKIPPED" if used_up else "SKIPPED", "status_kind": "hot", "used_up": used_up}
+    if pool_used_up:
+        return {"status": "USED UP", "status_kind": "hot", "used_up": True}
+    if stale_off:
+        return {"status": "OFF", "status_kind": "warn", "used_up": False}
+    if pool.get("included_exhausted") and state == "ON":
+        return {"status": "EXTRA USAGE ON", "status_kind": "warn", "used_up": False}
+    if not no_pace and pace is not None and pace > warn:
+        return {"status": "OVER PACE", "status_kind": "warn", "used_up": False}
+    if state == "WARN":
+        return {"status": "WARN", "status_kind": "warn", "used_up": False}
+    if state == "ON":
+        return {"status": "ON", "status_kind": "ok", "used_up": False}
+    return {"status": "UNKNOWN", "status_kind": "muted", "used_up": False}
+
+
+def match_lanes_to_plans(plans, lanes):
+    by_plan = {i: [] for i in range(len(plans))}
+    lane_to_plan = {}
+    matchers = (
+        lambda p, l: bool(p.get("pool") and p["pool"] == lane_pool_key(l)),
+        lambda p, l: bool(p.get("credit") and p["credit"] == l.get("credit")),
+        lambda p, l: bool(p.get("vendor") and p["vendor"] in (l.get("lane"), l.get("credit"), l.get("pool"))),
+        lambda p, l: bool(p.get("vendor") and p["vendor"] == l.get("vendor")),
+    )
+    for matcher in matchers:
+        for lane in lanes:
+            name = lane["lane"]
+            if name in lane_to_plan:
+                continue
+            for idx, plan in enumerate(plans):
+                if matcher(plan, lane):
+                    by_plan[idx].append(lane)
+                    lane_to_plan[name] = idx
+                    break
+    return by_plan, lane_to_plan
+
+
+def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None, limits_path=None,
+                       credits_path=None, pacing_dir=None, sessions=None, launches_path=None,
+                       allow_live=False):
+    limits_path = LIMITS if limits_path is None else limits_path
+    credits_path = CREDITS if credits_path is None else credits_path
+    pacing_dir = PACING_DIR if pacing_dir is None else pacing_dir
+    sessions = PI_SESSIONS if sessions is None else sessions
+    launches_path = LAUNCHES if launches_path is None else launches_path
+    cfg = cfg if isinstance(cfg, dict) else {}
+    now = time.time() if now is None else now
+    warn = number(cfg.get("pace_warn_ratio")) or DEFAULT_PACE_WARN
+    raw_lanes = lanes_from(cfg, now)
+    burn = parse_burn(cfg, raw_lanes, now)
+    lanes = lanes_with_burn(raw_lanes, burn)
+    plans = plans_from(cfg)
+    limits = read_limits(limits_path) if limits is None else (limits if isinstance(limits, dict) else {})
+    credits_data = read_credits(credits_path) if credits_data is None else (
+        credits_data if isinstance(credits_data, dict) else {})
+    all_pools = {k: dict(v) for k, v in (pools.items() if isinstance(pools, dict) else ()) if isinstance(v, dict)}
+    has_opencode = any(l.get("pool") == "opencode" for l in lanes) or any(p.get("vendor") == "opencode" for p in plans)
+    if has_opencode and "opencode" not in all_pools:
+        all_pools["opencode"] = opencode_pool(
+            now, cfg, pacing_dir=pacing_dir, sessions=sessions, launches_path=launches_path,
+            credits_path=credits_path, allow_live=allow_live)
+    credit_names = []
+    for name in ([l.get("credit") for l in lanes] + [p.get("credit") for p in plans]
+                 + [p["pool"][7:] for p in plans if isinstance(p.get("pool"), str) and p["pool"].startswith("credit:")]):
+        if isinstance(name, str) and name and name not in credit_names:
+            credit_names.append(name)
+    for name in credit_names:
+        key = f"credit:{name}"
+        if key in all_pools:
+            continue
+        if name == "commandcode":
+            all_pools[key] = commandcode_pool(credits_data.get(name), now, cfg)
+        else:
+            state = credit_pool(credits_data.get(name), now, cfg)
+            if state:
+                all_pools[key] = state
+    all_pools = with_antigravity_reserve(all_pools, cfg, now=now, path=launches_path)
+    by_plan, lane_to_plan = match_lanes_to_plans(plans, lanes)
+
+    def lane_skip(lane):
+        return parse_limit(limits, lane["lane"], now) or parse_limit(limits, lane.get("pool"), now)
+
+    lane_rows = []
+    for lane in lanes:
+        name = lane["lane"]
+        pkey = lane_pool_key(lane)
+        pool = all_pools.get(pkey) if pkey else None
+        skip = lane_skip(lane)
+        no_pace = burn is not None and name == burn["lane"]
+        chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"))
+        shared = bool(lane.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats")))
+        plan_idx = lane_to_plan.get(name)
+        plan = plans[plan_idx] if plan_idx is not None else {}
+        credit_name = lane.get("credit") or plan.get("credit")
+        credit_entry = credits_data.get(credit_name) if isinstance(credit_name, str) else None
+        st = entry_status(pool, skip, now, warn, chat_only=chat_only, no_pace=no_pace)
+        why = None
+        if chat_only:
+            why = "chat-only pool, never workers"
+        elif skip:
+            why = f"skipped until {skip['until_text']} ({limit_note(skip)})"
+        elif st["status"] == "OFF" and isinstance(pool, dict) and pool.get("note"):
+            why = pool["note"]
+        else:
+            why = skip_reason(pool, warn, no_pace) or pool_note(pool, warn)
+        first_until = lane_first_until(lane)
+        lane_rows.append({
+            "lane": name,
+            "vendor": lane.get("vendor"),
+            "plan_name": plan.get("name"),
+            "pool_key": pkey,
+            "usage": dict(pool) if isinstance(pool, dict) else {},
+            "credit": dict(credit_entry) if isinstance(credit_entry, dict) else None,
+            "usd_per_cycle": number(plan.get("usd_per_cycle")),
+            "skip": skip,
+            "chat_only": chat_only,
+            "shared_with_chats": shared,
+            "first_until": first_until if first_until and first_until > now else None,
+            "burn_until": burn["until"] if no_pace else None,
+            "reason": why,
+            **st,
+        })
+
+    plan_rows = []
+    covered_pools = set()
+    for idx, plan in enumerate(plans):
+        matched = by_plan[idx]
+        pkey = plan.get("pool")
+        if not pkey and plan.get("credit"):
+            pkey = f"credit:{plan['credit']}"
+        if not pkey and matched:
+            pkey = lane_pool_key(matched[0])
+        if not pkey:
+            vendor = plan.get("vendor")
+            if vendor in VENDOR_POOLS:
+                pkey = VENDOR_POOLS[vendor]
+            elif vendor in all_pools:
+                pkey = vendor
+            elif isinstance(vendor, str) and f"credit:{vendor}" in all_pools:
+                pkey = f"credit:{vendor}"
+        if pkey:
+            covered_pools.add(pkey)
+        pool = all_pools.get(pkey) if pkey else None
+        credit_name = plan.get("credit")
+        if not credit_name and isinstance(pkey, str) and pkey.startswith("credit:"):
+            credit_name = pkey[7:]
+        if not credit_name and plan.get("vendor") in credits_data:
+            credit_name = plan.get("vendor")
+        credit_entry = credits_data.get(credit_name) if isinstance(credit_name, str) else None
+        skip = None
+        for lane in matched:
+            skip = lane_skip(lane)
+            if skip:
+                break
+        if not skip and pkey:
+            skip = parse_limit(limits, pkey, now)
+        if not skip and credit_name:
+            skip = parse_limit(limits, credit_name, now)
+        if not skip and plan.get("vendor"):
+            skip = parse_limit(limits, plan["vendor"], now)
+        shared = bool(plan.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats"))
+                      or any(l.get("shared_with_chats") for l in matched))
+        chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not shared)
+        retired = isinstance(plan.get("extra_cost"), str) and plan["extra_cost"].lower().startswith("retired")
+        no_pace = bool(burn and any(l["lane"] == burn["lane"] for l in matched))
+        st = entry_status(pool, skip, now, warn, chat_only=chat_only, retired=retired, no_pace=no_pace)
+        plan_rows.append({
+            "name": plan["name"],
+            "vendor": plan.get("vendor"),
+            "models": list(plan.get("included_models") or []),
+            "runs_on": list(plan.get("runs_on") or []),
+            "extra_cost": plan.get("extra_cost"),
+            "pool_key": pkey,
+            "lanes": [l["lane"] for l in matched],
+            "usage": dict(pool) if isinstance(pool, dict) else {},
+            "credit": dict(credit_entry) if isinstance(credit_entry, dict) else None,
+            "usd_per_cycle": number(plan.get("usd_per_cycle")),
+            "included_allowance_usd": number(plan.get("included_allowance_usd")),
+            "monthly_price_usd": number(plan.get("monthly_price_usd")),
+            "chat_only": chat_only,
+            "shared_with_chats": shared,
+            "retired": retired,
+            "skip": skip,
+            **st,
+        })
+
+    for pkey, pool in all_pools.items():
+        if pkey in covered_pools:
+            continue
+        matched = [l for l in lanes if lane_pool_key(l) == pkey]
+        skip = next((lane_skip(l) for l in matched if lane_skip(l)), None) or parse_limit(limits, pkey, now)
+        shared = bool(pool.get("shared_with_chats") or any(l.get("shared_with_chats") for l in matched))
+        chat_only = bool(pool.get("chat_only") and not shared)
+        st = entry_status(pool, skip, now, warn, chat_only=chat_only)
+        plan_rows.append({
+            "name": pkey,
+            "vendor": pkey,
+            "models": [],
+            "runs_on": [],
+            "extra_cost": None,
+            "pool_key": pkey,
+            "lanes": [l["lane"] for l in matched],
+            "usage": dict(pool),
+            "credit": None,
+            "usd_per_cycle": None,
+            "included_allowance_usd": None,
+            "monthly_price_usd": None,
+            "chat_only": chat_only,
+            "shared_with_chats": shared,
+            "retired": False,
+            "skip": skip,
+            **st,
+        })
+
+    skips = []
+    for key in limits:
+        if key.endswith(":floor") or key.endswith(":reason"):
+            continue
+        parsed = parse_limit(limits, key, now)
+        if parsed:
+            skips.append(parsed)
+    skips.sort(key=lambda item: (item["until"], item["lane"]))
+
+    picked = pick(lanes, all_pools, limits, now=now, warn=warn, burn=burn) if lanes else None
+    return {
+        "now": now,
+        "warn": warn,
+        "plans": plan_rows,
+        "lanes": lane_rows,
+        "pools": all_pools,
+        "skips": skips,
+        "picked": picked,
+    }
 
 
 def main(argv):
     parser = argparse.ArgumentParser(prog="plan-pick", description="Pick the lane for the next background worker.")
     parser.add_argument("--json", action="store_true", help="print plan, command and reason as JSON")
+    parser.add_argument("--brief", default="brief.txt", help="worker brief, including an optional Rung line")
+    parser.add_argument("--lease", default=os.environ.get("PLAN_PICK_LEASE"), help="lease receipt containing the ticket id")
+    parser.add_argument("--rung-report", action="store_true", help="report cost per first-pass job and rung/model results")
+    parser.add_argument("--last", type=int, default=50, help="finished jobs in --rung-report (default 50)")
+    parser.add_argument("--burn", action="store_true", help="report this month's recorded spend per lane and caller")
+    parser.add_argument("--pace-log", nargs="?", const=LAUNCHES, metavar="FILE",
+                        help="compare plan-pick launches since each plan's reset with the plan's own counter")
     parser.add_argument("--plans", action="store_true",
                         help="print what each subscription includes, where it runs and whether it costs extra")
     parser.add_argument("--pools", metavar="FILE", help="read pool state from FILE or - for stdin instead of token-ladder")
+    parser.add_argument("--lane-ok", metavar="LANE_OR_VENDOR",
+                        help="check one lane without fallback (exit 0 allowed, 3 refused with one reason line)")
+    parser.add_argument("--cloud", action="store_true", help="check the same shared pool for a cloud launch with --lane-ok")
     parser.add_argument("--claude-helper", action="store_true",
                         help="answer whether an in-chat Claude helper is allowed (exit 0 allowed, 3 refused)")
+    parser.add_argument("--claude-emergency-until", metavar="ISO8601_OR_OFF",
+                        help="let --claude-helper allow Claude above pace until this time (needs --reason); off removes it")
     parser.add_argument("--loop-interval", action="store_true",
                         help="print how many seconds a loop should wait before its next tick, from Claude's pace")
     parser.add_argument("--limited", metavar="LANE",
                         help="mark LANE limited after a 429, quota or empty-credit error; plan-pick skips it for a while")
-    parser.add_argument("--not-vendor", metavar="VENDOR",
-                        help="skip lanes from VENDOR, so a review comes from a different vendor than the author")
+    parser.add_argument("--not-vendor", metavar="VENDOR", action="append", default=[],
+                        help="skip lanes from VENDOR; repeat the flag or pass a comma list, so a review "
+                             "comes from a different vendor than every author")
     parser.add_argument("--run", action="store_true",
-                        help="run the picked lane's command; on a failed exit with a 429, 402, quota error or no output, mark it limited and run the next lane")
+                        help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
                         help="read the credit balance of these lanes (all credit lanes when none) and store it")
+    parser.add_argument("--set-credit", nargs=2, metavar=("LANE", "USD"),
+                        help="record an OpenCode prepaid balance anchor without reading live state")
+    parser.add_argument("--credit-source", default="Valentin dashboard screenshot", help="balance anchor source")
+    parser.add_argument("--credit-at", help="balance anchor time in ISO 8601 with timezone (default: now UTC)")
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
+    parser.add_argument("--reason", help="optional reason recorded with --limited in lane-limits.json")
     args = parser.parse_args(argv)
+    if args.cloud and not args.lane_ok:
+        parser.error("--cloud requires --lane-ok")
     cfg = load_config()
+    if args.last < 1:
+        parser.error("--last must be positive")
+    if args.rung_report:
+        try:
+            report = rung_report(last=args.last)
+        except (OSError, ValueError) as exc:
+            print(f"plan-pick: cannot read rung report: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(report) if args.json else "\n".join(rung_report_lines(report)))
+        return 0
+    if args.set_credit is not None:
+        lane, value = args.set_credit
+        try:
+            usd = float(value)
+            at = time.time()
+            if args.credit_at:
+                stamp = datetime.fromisoformat(args.credit_at.replace("Z", "+00:00"))
+                if stamp.tzinfo is None:
+                    raise ValueError("timezone required")
+                at = stamp.timestamp()
+            if lane != "opencode" or not math.isfinite(usd) or usd < 0 or at > time.time() or not args.credit_source.strip():
+                raise ValueError("invalid anchor")
+        except (ValueError, OverflowError):
+            parser.error("--set-credit requires opencode, a finite nonnegative USD balance, a nonfuture timezone-aware time and a source")
+        save_credits({lane: {"usd": usd, "at": at, "source": args.credit_source}}, CREDITS)
+        print(f"Stored {lane} balance anchor at {datetime.fromtimestamp(at, timezone.utc).isoformat()} ({args.credit_source}).")
+        return 0
     if args.loop_interval:
         answer = loop_interval_answer(args.pools, cfg)
         if args.json:
@@ -612,13 +2355,40 @@ def main(argv):
         else:
             print(f"{answer['seconds']} {answer['reason']}")
         return 0
+    if args.pace_log:
+        try:
+            pools = read_pools(args.pools)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pools = {}
+        report = pace_log(pools if isinstance(pools, dict) else {}, cfg, launches_path=args.pace_log)
+        print(json.dumps(report) if args.json else "\n".join(pace_log_lines(report)))
+        return 0
+    if args.burn:
+        report = burn_report(cfg)
+        print(json.dumps(report) if args.json else "\n".join(burn_lines(report)))
+        return 0
     if args.plans:
         plans = plans_from(cfg)
+        try:
+            pools = read_pools(args.pools) if any(plan.get("pool") for plan in plans) else {}
+        except (OSError, ValueError, subprocess.SubprocessError):
+            pools = {}
+        pools = pools if isinstance(pools, dict) else {}
+        if not args.pools:
+            pools = with_credits(pools, [lane for lane in lanes_from(cfg) if lane.get("credit") == "commandcode"], cfg)
+        plans = [dict(plan, usage=pools.get(plan["pool"]) or {}) if plan.get("pool") else plan for plan in plans]
+        state = opencode_pool(None, cfg)
+        plans = [dict(plan, status=("included allowance used up; extra usage " + state["state"])
+                      if state.get("included_exhausted") else state["state"], note=state["note"],
+                      windows=state.get("windows", {}), credits_usd=state.get("credits_usd"),
+                      resets_at=state.get("resets_at"))
+                 if plan.get("vendor") == "opencode" else plan for plan in plans]
+
         if args.json:
             print(json.dumps(plans))
         else:
-            for plan in plans:
-                print(plan_line(plan))
+            for line in plan_lines(plans, cfg):
+                print(line)
             print(PLANS_NOTE)
         return 0
     warn = number(cfg.get("pace_warn_ratio")) or DEFAULT_PACE_WARN
@@ -637,45 +2407,91 @@ def main(argv):
             data = refresh_credits(names, time.time())
         finally:
             os.unlink(lock)
-        print(", ".join(f"{n} ${data[n]['usd']:.2f}" for n in names if n in data))
+        print(", ".join(f"{n} " + (commandcode_pool(data[n], time.time(), cfg)["note"] if n == "commandcode"
+                                     else f"${data[n]['usd']:.2f}") for n in names if n in data))
         return 0
     if args.limited:
         if args.limited not in {lane["lane"] for lane in lanes}:
             print(f"plan-pick: unknown lane {args.limited}; lanes: {', '.join(l['lane'] for l in lanes)}", file=sys.stderr)
             return 2
         hours = args.hours if args.hours is not None else number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS
-        until = mark_limited(args.limited, hours)
+        until = mark_limited(args.limited, hours, reason=args.reason)
         print(f"Lane {args.limited} is skipped until {datetime.fromtimestamp(until, timezone.utc):%Y-%m-%d %H:%M} UTC.")
         return 0
-    try:
-        pools = read_pools(args.pools)
-        if not args.pools:
-            pools = with_credits(with_opencode(pools, cfg), lanes, cfg)
-    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-        print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
-        return 1
+    if args.claude_emergency_until:
+        try:
+            data = set_emergency(args.claude_emergency_until, args.reason)
+        except ValueError as exc:
+            print(f"plan-pick: --claude-emergency-until {exc}", file=sys.stderr)
+            return 2
+        print("Claude emergency allowance removed." if data is None
+              else f"Claude emergency allowance until {data['until']} ({data['reason']}).")
+        return 0
     if args.claude_helper:
-        answer = claude_helper(pools, warn)
+        if args.pools:
+            try:
+                pools = read_pools(args.pools)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
+                return 1
+            reading_age = None
+        else:
+            pools, reading_age = read_cached_claude_pool()
+        answer = claude_helper(pools, warn, reading_age=reading_age)
         if args.json:
             print(json.dumps(answer))
         else:
             print(f"Claude helper: {'allowed' if answer['allowed'] else 'refused'}. Why: {answer['reason']}.")
         return 0 if answer["allowed"] else 3
-    if args.not_vendor:
-        lanes = [lane for lane in lanes if lane.get("vendor") != args.not_vendor.lower()]
+    try:
+        pools = with_opencode(read_pools(args.pools), cfg)
+        if not args.pools:
+            pools = with_credits(pools, lanes, cfg)
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        if args.lane_ok:
+            print(f"{args.lane_ok}: cannot read pool state")
+            return 3
+        print(f"plan-pick: cannot read pool state: {exc}", file=sys.stderr)
+        return 1
+    pools = with_antigravity_reserve(pools, cfg)
+    excluded = vendor_exclusions(args.not_vendor)
+    if excluded:
+        lanes = [lane for lane in lanes if not any(name in lane_names(lane) for name in excluded)]
+    if any(lane.get("credit") == "commandcode" for lane in lanes) and "credit:commandcode" not in pools:
+        pools = dict(pools, **{"credit:commandcode": commandcode_pool(None, time.time(), cfg)})
+    if args.lane_ok:
+        try:
+            rung = rung_context(args.brief, LAUNCHES, args.lease) if cfg.get("rungs") else None
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+            print(f"{args.lane_ok}: cannot resolve rung: {exc}")
+            return 3
+        answer = lane_ok(args.lane_ok, lanes, pools, read_limits(), warn=warn, rung=rung, cfg=cfg)
+        print(" ".join(answer["reason"].splitlines()))
+        return 0 if answer["allowed"] else 3
     burn = parse_burn(cfg, lanes)
     lanes = lanes_with_burn(lanes, burn)
-    if args.run:
-        return run_lanes(lanes, pools, cfg, warn, not_vendor=args.not_vendor, burn=burn)
-    result = pick(lanes, pools, read_limits(), warn=warn, burn=burn)
+    try:
+        rung = rung_context(args.brief, LAUNCHES, args.lease) if cfg.get("rungs") else None
+        if args.run:
+            if args.brief != "brief.txt":
+                parser.error("--run reads brief.txt; use --brief only for dry runs")
+            return run_lanes(lanes, pools, cfg, warn, not_vendor=excluded or None, burn=burn, rung=rung)
+        if rung:
+            result, rung, _ = pick_rung(lanes, pools, cfg, rung, read_limits(), warn)
+        else:
+            result = pick(lanes, pools, read_limits(), warn=warn, burn=burn)
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print(f"plan-pick: cannot pick rung: {exc}", file=sys.stderr)
+        return 1
+    resolved = f" Rung: {rung['rung']} ({rung['rung_reason']})." if rung else ""
     if args.json:
         print(json.dumps(result))
     elif result["command"]:
-        vendor_flag = f" --not-vendor {args.not_vendor}" if args.not_vendor else ""
+        vendor_flag = "".join(f" --not-vendor {name}" for name in excluded)
         print(f"Worker plan: {result['plan']}. Launch: ~/.local/bin/plan-pick --run{vendor_flag} (reads brief.txt, runs {result['command']}, "
-              f"moves to the next lane on a 429). Why: {result['reason']}.")
+              f"moves to the next lane on a 429). Why: {result['reason']}.{resolved}")
     else:
-        print(f"Worker plan: none. Why: {result['reason']}.")
+        print(f"Worker plan: none. Why: {result['reason']}.{resolved}")
     return 0
 
 

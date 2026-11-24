@@ -120,7 +120,7 @@ class OnePasswordTests(unittest.TestCase):
                 with open(status) as f:
                     saved = json.load(f)
                     self.assertEqual(saved["onepassword"], expected)
-                    self.assertEqual(set(saved["pools"]), {"claude", "codex", "grok"})
+                    self.assertEqual(set(saved["pools"]), {"claude", "codex", "grok", "google"})
                     self.assertEqual(saved["pools"]["claude"]["state"], "ON")
                 self.assertEqual(mirrored[-1]["onepassword"], expected)
             self.assertEqual(op_calls, 2)

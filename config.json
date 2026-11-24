@@ -1,7 +1,13 @@
 {
   "grok_stale_hours": 3,
-  "opencode_estimate_hours": 24,
-  "opencode_estimate_usd_per_mtok": 2.0,
+  "opencode_reader_command": ["python3", "~/projects/poteto-2-advisor/bin/opencode-read"],
+  "opencode_credit_floor_usd": 2,
+  "opencode_extra_usage": true,
+  "opencode_auto_topup": false,
+  "opencode_monthly_renewal": "2026-11-30T23:00:00Z",
+  "measured_burn": [{"lane": "deepseek", "as_of": "2026-11-22", "period_days": 30,
+                     "usd": 59.93, "tokens": 8110000000, "requests": 67963, "cached_pct": 98.7,
+                     "source": "Valentin, DeepSeek direct account measurement"}],
   "unknown_assumed_pct": 70,
   "pool_warn_pct": 80,
   "pace_warn_ratio": 1.1,
@@ -16,43 +22,60 @@
   },
   "lanes": [
     {
+      "lane": "opencode",
+      "vendor": "deepseek",
+      "pool": "opencode",
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "antigravity",
+      "vendor": "google",
+      "effort": "high",
+      "pool": "google",
+      "shared_with_chats": true,
+      "print_timeout": "45m",
+      "command": "~/.local/bin/agy --print \"$(cat brief.txt)\" --model gemini-4-neon-high --dangerously-skip-permissions --print-timeout 45m --output-format json </dev/null"
+    },
+    {
       "lane": "vercel",
       "credit": "vercel",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
-      "lane": "deepseek",
-      "credit": "deepseek",
+      "lane": "vercel-zai",
+      "credit": "vercel",
+      "vendor": "zai",
+      "pool": null,
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider vercel-ai-gateway --model zai/glm-5.3-flash \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "commandcode",
+      "credit": "commandcode",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider deepseek --model deepseek-flash \"$(cat brief.txt)\" </dev/null"
-    },
-    {
-      "lane": "opencode",
-      "vendor": "deepseek",
-      "pool": "opencode",
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider opencode-go --model deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
-    },
-    {
-      "lane": "codex",
-      "vendor": "openai",
-      "pool": "codex",
-      "command": "~/.local/bin/hax --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p \"$(cat brief.txt)\" </dev/null"
-    },
-    {
-      "lane": "cursor",
-      "vendor": "cursor",
-      "pool": "grok",
-      "command": "~/.local/bin/cursor-agent -p --force --output-format text --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
+      "command": "COMMANDCODE_API_KEY=\"${COMMANDCODE_API_KEY:-$(~/.local/bin/yeo-key 'Commando Code API Key' credential)}\" ~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-commandcode.mjs --provider commandcode --model deepseek/deepseek-v4.1-flash \"$(cat brief.txt)\" </dev/null"
     },
     {
       "lane": "openrouter",
       "credit": "openrouter",
       "vendor": "deepseek",
       "pool": null,
-      "command": "~/.npm-global/bin/pi -p --thinking medium --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+      "command": "~/.npm-global/bin/pi -p --mode json --thinking medium -e ~/projects/token-ladder/tools/pi-lane-pins.mjs --provider openrouter-credit --model deepseek/deepseek-v4.1-flash-1017 \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "codex",
+      "vendor": "openai",
+      "pool": "codex",
+      "command": "~/.local/bin/hax --json --provider=codex --model=gpt-6.1-sol --effort=high --no-session -p \"$(cat brief.txt)\" </dev/null"
+    },
+    {
+      "lane": "cursor",
+      "vendor": "cursor",
+      "pool": "grok",
+      "first_until": "2026-11-24T23:59:00Z",
+      "command": "~/.local/bin/cursor-agent -p --force --output-format json --model composer-2.5 \"$(cat brief.txt)\" </dev/null"
     }
   ],
   "plans": [
@@ -60,7 +83,7 @@
       "name": "Claude",
       "vendor": "anthropic",
       "included_models": ["Claude Opus 5.5", "Claude Sonnet 5.5", "Claude Haiku 5.5", "Claude Fable"],
-      "runs_on": ["local"],
+      "runs_on": ["local", "cloud"],
       "extra_cost": "none",
       "source": "unknown"
     },
@@ -83,26 +106,54 @@
     {
       "name": "Vercel AI Gateway Token Pass",
       "vendor": "vercel",
-      "included_models": ["DeepSeek V4.1 Flash"],
+      "included_models": ["DeepSeek V4.1 Flash", "GLM 5.3 Flash"],
+      "model_vendors": ["deepseek", "zai"],
       "runs_on": ["local"],
       "extra_cost": "none until the pass credit is used",
-      "source": "unknown"
+      "source": "unknown",
+      "credit": "vercel",
+      "usd_per_cycle": 110
     },
     {
       "name": "DeepSeek direct",
       "vendor": "deepseek",
       "included_models": ["DeepSeek V4.1 Flash"],
       "runs_on": ["local"],
-      "extra_cost": "prepaid credit",
+      "extra_cost": "retired; balance -$0.01; no more top-ups",
       "source": "unknown"
     },
     {
-      "name": "OpenCode Go",
+      "name": "OpenCode Go Plus",
+      "monthly_price_usd": 40,
+      "included_allowance_usd": 200,
       "vendor": "opencode",
       "included_models": ["DeepSeek V4.1 Flash"],
       "runs_on": ["local"],
-      "extra_cost": "none until the monthly window is full, then prepaid credit with auto-recharge",
-      "source": "unknown"
+      "extra_cost": "held prepaid credit above $2 only; auto top-up OFF; never top up",
+      "source": "Valentin, 2026-11-22"
+    },
+    {
+      "name": "Google Antigravity plan",
+      "vendor": "google",
+      "pool": "google",
+      "shared_with_chats": true,
+      "included_models": ["Gemini 4 Neon"],
+      "runs_on": ["local"],
+      "extra_cost": "none within the plan quota; never buys overages",
+      "source": "Valentin, 2026-11-22; https://antigravity.google/docs/plans.md"
+    },
+    {
+      "name": "CommandCode GOAT",
+      "vendor": "commandcode",
+      "pool": "credit:commandcode",
+      "included_models": [
+        "DeepSeek V4.1 Flash"
+      ],
+      "runs_on": [
+        "local"
+      ],
+      "extra_cost": "$10/month; up to $100 Flash usage/month, $20/5h, $50/week",
+      "source": "https://commandcode.ai/docs/plans/goat; https://commandcode.ai/docs/resources/usage-limits"
     },
     {
       "name": "OpenRouter",
@@ -113,6 +164,8 @@
       "source": "unknown"
     }
   ],
+  "opencode_monthly_slack_pct": 25,
+  "antigravity_reserve_share_pct": 100,
   "limited_hours": 1,
   "pool_off_pct": 95,
   "claude_floor_percent": 15,
@@ -155,5 +208,109 @@
       "valentinyeo/token-ladder"
     ],
     "claude": []
+  },
+  "rungs": {
+    "light": [
+      {
+        "lane": "opencode",
+        "effort": "low"
+      },
+      {
+        "lane": "vercel",
+        "effort": "low"
+      },
+      {
+        "lane": "commandcode",
+        "effort": "low"
+      },
+      {
+        "lane": "openrouter",
+        "effort": "low"
+      },
+      {
+        "lane": "vercel-zai",
+        "effort": "low"
+      }
+    ],
+    "medium": [
+      {
+        "lane": "opencode"
+      },
+      {
+        "lane": "antigravity"
+      },
+      {
+        "lane": "vercel"
+      },
+      {
+        "lane": "commandcode"
+      },
+      {
+        "lane": "openrouter"
+      },
+      {
+        "lane": "codex"
+      },
+      {
+        "lane": "cursor"
+      }
+    ],
+    "hard": [
+      {
+        "lane": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "high"
+      },
+      {
+        "lane": "antigravity",
+        "model": "gemini-4-neon-high"
+      }
+    ]
+  },
+  "list_prices": {
+    "deepseek-v4.1-flash": {
+      "in": 0.15,
+      "cached": 0.003,
+      "out": 0.6
+    },
+    "deepseek/deepseek-v4.1-flash": {
+      "in": 0.15,
+      "cached": 0.003,
+      "out": 0.6
+    },
+    "deepseek/deepseek-v4.1-flash-1017": {
+      "in": 0.15,
+      "cached": 0.003,
+      "out": 0.6
+    },
+    "zai/glm-5.3-flash": {
+      "in": 0.15,
+      "cached": 0.03,
+      "out": 0.5
+    },
+    "gpt-6.1-sol": {
+      "in": 2,
+      "cached": 0.1,
+      "out": 10
+    },
+    "gemini-4-neon-high": {
+      "in": 3,
+      "cached": 0.15,
+      "out": 15
+    },
+    "composer-2.5": {
+      "in": 0.5,
+      "cached": 0.05,
+      "out": 2.5
+    }
+  },
+  "list_price_unit": "USD per million tokens; input excludes cached reads; list-equivalent, not invoices",
+  "list_price_sources": {
+    "as_of": "2026-11-23",
+    "deepseek": "https://api-docs.deepseek.com/quick_start/pricing",
+    "glm": "https://docs.z.ai/guides/overview/pricing",
+    "openai": "https://developers.openai.com/api/docs/pricing",
+    "google": "https://ai.google.dev/gemini-api/docs/pricing",
+    "cursor": "https://cursor.com/docs/models"
   }
 }

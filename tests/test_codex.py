@@ -124,17 +124,36 @@ class CodexSelectionTests(unittest.TestCase):
                 self.assertIsNone(tl.read_codex_logs())
 
 
+class CodexBinaryTests(unittest.TestCase):
+    def test_finds_codex_where_timers_and_worker_shells_leave_it(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = os.path.join(home, ".npm-global/bin/codex")
+            os.makedirs(os.path.dirname(path))
+            open(path, "w").close()
+            os.chmod(path, 0o755)
+            with patch.dict(os.environ, {"HOME": home}), patch.object(tl.shutil, "which", return_value=None):
+                self.assertEqual(tl.codex_command(), path)
+
+    def test_path_wins_and_a_missing_binary_keeps_the_plain_name(self):
+        with patch.object(tl.shutil, "which", return_value="/usr/bin/codex"):
+            self.assertEqual(tl.codex_command(), "/usr/bin/codex")
+        with tempfile.TemporaryDirectory() as home, patch.dict(os.environ, {"HOME": home}), \
+                patch.object(tl.shutil, "which", return_value=None):
+            self.assertEqual(tl.codex_command(), "codex")
+
+
 class CodexProtocolTests(unittest.TestCase):
     def run_server(self, script, timeout=2):
         real_popen = subprocess.Popen
         processes = []
         def launch(argv, **kwargs):
-            self.assertEqual(argv, ["codex", "app-server", "--listen", "stdio://"])
+            self.assertEqual(argv[1:], ["app-server", "--listen", "stdio://"])
             proc = real_popen([sys.executable, "-u", "-c", script], **kwargs)
             processes.append(proc)
             return proc
         try:
-            with patch.object(tl.subprocess, "Popen", side_effect=launch):
+            with patch.object(tl, "codex_command", return_value="codex"), \
+                    patch.object(tl.subprocess, "Popen", side_effect=launch):
                 return tl.probe_codex(timeout=timeout)
         finally:
             self.assertTrue(processes)

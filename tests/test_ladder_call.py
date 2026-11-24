@@ -22,7 +22,18 @@ def run_lint(root):
 
 def action_run_script():
     lines = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8').splitlines()
-    start = lines.index('      run: |') + 1
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() != 'id: run':
+            continue
+        for j in range(index + 1, len(lines)):
+            if lines[j].strip() == 'run: |':
+                start = j + 1
+                break
+        if start is not None:
+            break
+    if start is None:
+        start = lines.index('      run: |') + 1
     block = []
     for line in lines[start:]:
         if line.startswith('        '):
@@ -35,6 +46,7 @@ def action_run_script():
     replacements = {
         '${{ inputs.purpose }}': 'test-purpose',
         '${{ inputs.request-file }}': '${REQUEST_FILE}',
+        '${{ inputs.require-verdict }}': 'false',
         '${{ github.action_path }}': str(ACTION_LADDER),
         '${{ github.run_id }}': '123',
         '${{ github.run_attempt }}': '1',
@@ -48,10 +60,19 @@ def action_run_script():
 class StubHandler(BaseHTTPRequestHandler):
     routes = {}
     delay = 0
+    last_bodies = []
+    last_headers = []
 
     def do_POST(self):
         if self.delay:
             time.sleep(self.delay)
+        length = int(self.headers.get('Content-Length') or 0)
+        raw = self.rfile.read(length) if length else b''
+        StubHandler.last_headers.append(dict(self.headers))
+        try:
+            StubHandler.last_bodies.append(json.loads(raw))
+        except json.JSONDecodeError:
+            StubHandler.last_bodies.append(None)
         route = self.routes.get(self.path)
         if not route:
             self.send_response(404)
@@ -80,12 +101,29 @@ def run_server(routes, delay=0):
     return server, server.server_address[1]
 
 
-def ladder_call(env, stdin_obj, lanes_file=None):
+def fake_cursor_agent(tmp_dir, mode='ok', answer='cursor-ok'):
+    script = Path(tmp_dir) / 'cursor-agent'
+    if mode == 'ok':
+        body = f'#!/bin/sh\nprintf "%s\\n" "{answer}"\n'
+    elif mode == 'fail':
+        body = '#!/bin/sh\nexit 1\n'
+    elif mode == 'empty':
+        body = '#!/bin/sh\nexit 0\n'
+    elif mode == 'rate':
+        body = '#!/bin/sh\necho "rate limit exceeded"\nexit 0\n'
+    else:
+        raise ValueError(mode)
+    script.write_text(body, encoding='utf-8')
+    script.chmod(0o755)
+    return str(script)
+
+
+def ladder_call(env, stdin_obj, lanes_file=None, args=()):
     env = {**os.environ, **env}
     if lanes_file:
         env['LADDER_CALL_LANES'] = str(lanes_file)
     return subprocess.run(
-        [str(LADDER), '--purpose', 'test'],
+        [str(LADDER), '--purpose', 'test', *args],
         input=json.dumps(stdin_obj),
         text=True,
         capture_output=True,
@@ -100,6 +138,7 @@ def write_lanes(port, path):
         'key_env': 'AI_GATEWAY_API_KEY',
         'url': f'http://127.0.0.1:{port}{path}',
         'model': 'test-model',
+        'gateway': {'only': ['token-pass']},
     }]
     fh = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
     json.dump(lanes, fh)
@@ -107,7 +146,76 @@ def write_lanes(port, path):
     return fh.name
 
 
+def write_vercel_then_opencode(port):
+    lanes = [
+        {
+            'name': 'vercel-ai-gateway',
+            'key_env': 'AI_GATEWAY_API_KEY',
+            'url': f'http://127.0.0.1:{port}/v1/chat/completions',
+            'model': 'test-model',
+        },
+        {
+            'name': 'opencode-go',
+            'key_env': 'OPENCODE_API_KEY',
+            'url': f'http://127.0.0.1:{port}/zen/go/v1/chat/completions',
+            'model': 'test-model',
+        },
+    ]
+    fh = tempfile.NamedTemporaryFile('w', suffix='.json', delete=False)
+    json.dump(lanes, fh)
+    fh.close()
+    return fh.name
+
+
 class LadderCallTests(unittest.TestCase):
+    def test_gateway_tags_reach_http_server(self):
+        StubHandler.last_headers = []
+        server, port = run_server({'/v1/chat/completions': (200, {
+            'choices': [{'message': {'content': 'PASS'}}],
+        }, None)})
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        fixture = json.loads((FIXTURE_DIR / 'gateway-tags.json').read_text())[0]
+        result = ladder_call(dict(fixture['env'], AI_GATEWAY_API_KEY='stub', LADDER_CALL_CALLER=''),
+                             {'messages': []}, lanes_file=lanes_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(StubHandler.last_headers[-1]['Ai-Reporting-Tags'], ','.join(fixture['tags']))
+
+    def test_excluded_family_is_never_called(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'PASS'}}],
+            }, None),
+        })
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        lanes = [
+            {'name': 'opencode-go', 'model': 'deepseek-v4.1-flash'},
+            {'name': 'google', 'model': 'gemini-2.5-flash'},
+        ]
+        for lane in lanes:
+            lane.update(key_env='STUB_API_KEY', url=f'http://127.0.0.1:{port}/v1/chat/completions')
+        with tempfile.TemporaryDirectory() as scratch:
+            plan = Path(scratch) / 'lanes.json'
+            plan.write_text(json.dumps(lanes), encoding='utf-8')
+            result = ladder_call({'STUB_API_KEY': 'stub'}, {'messages': []},
+                                 lanes_file=plan, args=('--exclude-families', 'deepseek,openai'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane opencode-go skipped: excluded family deepseek', result.stderr)
+        self.assertIn('lane google answered', result.stderr)
+        self.assertEqual([body['model'] for body in StubHandler.last_bodies], ['gemini-2.5-flash'])
+
+    def test_all_families_excluded_fails_before_checking_keys(self):
+        result = ladder_call({}, {'messages': []},
+                             args=('--exclude-families', 'deepseek,zai,google,cursor'))
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn('all lanes excluded by author model families', result.stderr)
+        self.assertNotIn('no key', result.stderr)
+        self.assertEqual(result.stdout, '')
+
     def test_gateway_402_falls_to_opencode(self):
         server, port = run_server({
             '/v1/chat/completions': (402, {'error': 'payment'}, None),
@@ -123,7 +231,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('402', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
@@ -145,7 +256,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('lane vercel-ai-gateway skipped: 429', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
@@ -191,7 +305,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0)
         self.assertIn('skipped: empty answer', result.stderr)
         self.assertIn('lane opencode-go answered', result.stderr)
@@ -211,7 +328,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertNotIn('Traceback', result.stderr + result.stdout)
         self.assertIn('invalid response', result.stderr)
@@ -246,6 +366,132 @@ class LadderCallTests(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload['choices'][0]['message']['content'][0]['text'], 'hello ')
 
+    def test_reasoning_only_answer_counts_as_answer(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {
+                    'content': '',
+                    'reasoning': 'The diff matches the feature map.\n\nPASS\n',
+                    'tool_calls': [{'type': 'function', 'function': {'name': 'bash'}}],
+                }}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'k'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway answered', result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['choices'][0]['message']['content'], '')
+
+    def test_require_verdict_skips_agent_style_answer(self):
+        server, port = run_server({
+            '/agent': (200, {'choices': [{'message': {
+                'content': "I'll start by inspecting the repo state and the supplied merge base.\n\n"
+                           "**Shell**\n```\npwd; git status --short\n```\n",
+            }}]}, None),
+            '/verdict': (200, {'choices': [{'message': {
+                'content': '**PASS**\n\nTests are green and the diff matches the map.',
+            }}]}, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes = [
+            {
+                'name': 'agent-lane',
+                'key_env': 'AI_GATEWAY_API_KEY',
+                'url': f'http://127.0.0.1:{port}/agent',
+                'model': 'm',
+            },
+            {
+                'name': 'verdict-lane',
+                'key_env': 'OPENCODE_API_KEY',
+                'url': f'http://127.0.0.1:{port}/verdict',
+                'model': 'm',
+            },
+        ]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key', 'OPENCODE_API_KEY': 'oc-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+            args=('--require-verdict',),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane agent-lane skipped: no verdict', result.stderr)
+        self.assertIn('lane agent-lane no-verdict answer tail:', result.stderr)
+        self.assertIn('verdict-lane answered', result.stderr)
+
+    def test_require_verdict_decides_from_a_long_analysis(self):
+        seen = []
+
+        class DecideHandler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or 0)
+                seen.append(json.loads(self.rfile.read(length) or b'{}'))
+                if len(seen) == 1:
+                    text = ("I'll start by inspecting the repo state.\n\n**Shell**\n```\npwd\n```")
+                else:
+                    text = 'PASS+NOTES\nReview was cut short; tests and lint passed.'
+                payload = json.dumps({'choices': [{'message': {'content': text}}]}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *_):
+                pass
+
+        server = HTTPServer(('127.0.0.1', 0), DecideHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        lanes = [{
+            'name': 'agent-lane',
+            'key_env': 'AI_GATEWAY_API_KEY',
+            'url': f'http://127.0.0.1:{server.server_address[1]}/agent',
+            'model': 'm',
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+            args=('--require-verdict',),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane agent-lane answered', result.stderr)
+        self.assertEqual(len(seen), 2)
+        self.assertIn('possibly cut short', seen[1]['messages'][1]['content'])
+        self.assertIn('Decide now', seen[1]['messages'][1]['content'])
+        self.assertLessEqual(seen[1]['max_tokens'], 2048)
+        payload = json.loads(result.stdout)
+        self.assertTrue(payload['choices'][0]['message']['content'].startswith('PASS+NOTES'))
+
+    def test_require_verdict_env_var(self):
+        server, port = run_server({
+            '/v1/chat/completions': (200, {'choices': [{'message': {'content': 'no answer here'}}]}, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_REQUIRE_VERDICT': '1'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 3)
+        self.assertIn('skipped: no verdict', result.stderr)
+
     def test_401_skipped(self):
         server, port = run_server({
             '/v1/chat/completions': (401, {'error': 'auth'}, None),
@@ -261,7 +507,10 @@ class LadderCallTests(unittest.TestCase):
             'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
             'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
         }
-        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            env, {'messages': [{'role': 'user', 'content': 'hi'}]}, lanes_file=lanes_path)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('skipped: 401', result.stderr)
 
@@ -308,12 +557,269 @@ class LadderCallTests(unittest.TestCase):
                     'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
                     'LADDER_CALL_URL_OPENCODE_GO': base + '/zen/go/v1/chat/completions',
                 }
-                result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+                lanes_path = write_vercel_then_opencode(port)
+                try:
+                    result = ladder_call(
+                        env, {'messages': [{'role': 'user', 'content': 'hi'}]},
+                        lanes_file=lanes_path,
+                    )
+                finally:
+                    os.unlink(lanes_path)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'skipped: {status}', result.stderr)
                 self.assertIn('lane opencode-go answered', result.stderr)
                 payload = json.loads(result.stdout)
                 self.assertEqual(payload['choices'][0]['message']['content'], 'second-lane-ok')
+
+    def test_google_lane_answers_from_stub(self):
+        server, port = run_server({
+            '/v1beta/openai/chat/completions': (200, {
+                'choices': [{'message': {'content': 'gemini-ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        base = f'http://127.0.0.1:{port}'
+        lanes = [{
+            'name': 'google',
+            'key_env': 'GEMINI_API_KEY',
+            'url': base + '/v1beta/openai/chat/completions',
+            'model': 'gemini-2.5-flash',
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {
+                'GEMINI_API_KEY': 'g-key',
+                'LADDER_CALL_LANES': lanes_path,
+            },
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane google answered', result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload['choices'][0]['message']['content'], 'gemini-ok')
+
+    def test_google_429_falls_to_cursor_then_vercel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor_bin = fake_cursor_agent(tmp, answer='from-cursor')
+            server, port = run_server({
+                '/v1beta/openai/chat/completions': (429, {'error': 'rate'}, None),
+                '/v1/chat/completions': (200, {
+                    'choices': [{'message': {'content': 'from-vercel'}}],
+                }, None),
+            })
+            self.addCleanup(server.shutdown)
+            base = f'http://127.0.0.1:{port}'
+            lanes = [
+                {
+                    'name': 'google',
+                    'key_env': 'GEMINI_API_KEY',
+                    'url': base + '/v1beta/openai/chat/completions',
+                    'model': 'gemini-2.5-flash',
+                },
+                {
+                    'name': 'cursor',
+                    'key_env': 'CURSOR_API_KEY',
+                    'kind': 'cursor',
+                    'model': 'composer-2.5',
+                },
+                {
+                    'name': 'vercel-ai-gateway',
+                    'key_env': 'AI_GATEWAY_API_KEY',
+                    'url': base + '/v1/chat/completions',
+                    'model': 'test-model',
+                },
+            ]
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(lanes, fh)
+                lanes_path = fh.name
+            self.addCleanup(lambda: os.unlink(lanes_path))
+            env = {
+                'GEMINI_API_KEY': 'g',
+                'CURSOR_API_KEY': 'c',
+                'AI_GATEWAY_API_KEY': 'v',
+                'LADDER_CALL_LANES': lanes_path,
+                'LADDER_CALL_CURSOR_AGENT': cursor_bin,
+                'LADDER_CALL_URL_VERCEL_AI_GATEWAY': base + '/v1/chat/completions',
+            }
+            result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('lane google skipped: 429', result.stderr)
+            self.assertIn('lane cursor answered', result.stderr)
+            self.assertNotIn('lane vercel-ai-gateway answered', result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload['choices'][0]['message']['content'], 'from-cursor')
+
+    def test_cursor_lane_failure_and_empty_skipped(self):
+        for mode, reason in (('fail', 'exit 1'), ('empty', 'empty answer')):
+            with self.subTest(reason=reason):
+                with tempfile.TemporaryDirectory() as tmp:
+                    script = fake_cursor_agent(tmp, mode=mode)
+                    lanes = [{
+                        'name': 'cursor',
+                        'key_env': 'CURSOR_API_KEY',
+                        'kind': 'cursor',
+                        'model': 'composer-2.5',
+                    }]
+                    with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                        json.dump(lanes, fh)
+                        lanes_path = fh.name
+                    try:
+                        result = ladder_call(
+                            {
+                                'CURSOR_API_KEY': 'c',
+                                'LADDER_CALL_LANES': lanes_path,
+                                'LADDER_CALL_CURSOR_AGENT': script,
+                            },
+                            {'messages': [{'role': 'user', 'content': 'hi'}]},
+                        )
+                        self.assertEqual(result.returncode, 3, result.stderr)
+                        self.assertIn(f'lane cursor skipped: {reason}', result.stderr)
+                    finally:
+                        os.unlink(lanes_path)
+
+    def test_cursor_rate_limit_text_skipped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rate_bin = fake_cursor_agent(tmp, mode='rate')
+            lanes = [{
+                'name': 'cursor',
+                'key_env': 'CURSOR_API_KEY',
+                'kind': 'cursor',
+                'model': 'composer-2.5',
+            }]
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(lanes, fh)
+                lanes_path = fh.name
+            self.addCleanup(lambda: os.unlink(lanes_path))
+            result = ladder_call(
+                {
+                    'CURSOR_API_KEY': 'c',
+                    'LADDER_CALL_LANES': lanes_path,
+                    'LADDER_CALL_CURSOR_AGENT': rate_bin,
+                },
+                {'messages': [{'role': 'user', 'content': 'hi'}]},
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertIn('lane cursor skipped: rate limit', result.stderr)
+
+    def test_google_429_cursor_fail_falls_to_vercel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cursor_bin = fake_cursor_agent(tmp, mode='fail')
+            server, port = run_server({
+                '/v1beta/openai/chat/completions': (429, {'error': 'rate'}, None),
+                '/v1/chat/completions': (200, {
+                    'choices': [{'message': {'content': 'from-vercel'}}],
+                }, None),
+            })
+            self.addCleanup(server.shutdown)
+            base = f'http://127.0.0.1:{port}'
+            lanes = [
+                {
+                    'name': 'google',
+                    'key_env': 'GEMINI_API_KEY',
+                    'url': base + '/v1beta/openai/chat/completions',
+                    'model': 'gemini-2.5-flash',
+                },
+                {
+                    'name': 'cursor',
+                    'key_env': 'CURSOR_API_KEY',
+                    'kind': 'cursor',
+                    'model': 'composer-2.5',
+                },
+                {
+                    'name': 'vercel-ai-gateway',
+                    'key_env': 'AI_GATEWAY_API_KEY',
+                    'url': base + '/v1/chat/completions',
+                    'model': 'test-model',
+                },
+            ]
+            with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+                json.dump(lanes, fh)
+                lanes_path = fh.name
+            self.addCleanup(lambda: os.unlink(lanes_path))
+            env = {
+                'GEMINI_API_KEY': 'g',
+                'CURSOR_API_KEY': 'c',
+                'AI_GATEWAY_API_KEY': 'v',
+                'LADDER_CALL_LANES': lanes_path,
+                'LADDER_CALL_CURSOR_AGENT': cursor_bin,
+            }
+            result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('lane google skipped: 429', result.stderr)
+            self.assertIn('lane cursor skipped: exit 1', result.stderr)
+            self.assertIn('lane vercel-ai-gateway answered', result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload['choices'][0]['message']['content'], 'from-vercel')
+
+    def test_vercel_payload_pins_token_pass(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        env = {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_LANES': lanes_path}
+        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = StubHandler.last_bodies[-1]
+        self.assertEqual(body['providerOptions'], {'gateway': {'only': ['token-pass']}})
+
+    def test_openrouter_payload_pins_streamlake(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/api/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes = [{
+            'name': 'openrouter',
+            'key_env': 'OPENROUTER_API_KEY',
+            'url': f'http://127.0.0.1:{port}/api/v1/chat/completions',
+            'model': 'deepseek/deepseek-v4.1-flash-1017',
+            'provider': {'only': ['StreamLake'], 'allow_fallbacks': False},
+        }]
+        with tempfile.NamedTemporaryFile('w', suffix='.json', delete=False) as fh:
+            json.dump(lanes, fh)
+            lanes_path = fh.name
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        env = {'OPENROUTER_API_KEY': 'k', 'LADDER_CALL_LANES': lanes_path}
+        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = StubHandler.last_bodies[-1]
+        self.assertEqual(body['provider'], {'only': ['StreamLake'], 'allow_fallbacks': False})
+
+    def test_ci_lanes_model_ids(self):
+        lanes = json.loads((REPO / 'ci' / 'lanes.json').read_text(encoding='utf-8'))
+        models = {lane['name']: lane['model'] for lane in lanes}
+        self.assertEqual(models['vercel-ai-gateway'], 'deepseek/deepseek-v4.1-flash')
+        self.assertEqual(models['vercel-ai-gateway-zai'], 'zai/glm-5.3-flash')
+        self.assertEqual(models['openrouter'], 'deepseek/deepseek-v4.1-flash-1017')
+        self.assertNotIn('deepseek', models)
+
+    def test_lane_without_gateway_key_sends_no_provider_options(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_lanes(port, '/v1/chat/completions')
+        lanes = json.loads(Path(lanes_path).read_text(encoding='utf-8'))
+        lanes[0].pop('gateway')
+        Path(lanes_path).write_text(json.dumps(lanes), encoding='utf-8')
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        env = {'AI_GATEWAY_API_KEY': 'k', 'LADDER_CALL_LANES': lanes_path}
+        result = ladder_call(env, {'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn('providerOptions', StubHandler.last_bodies[-1])
 
     def test_timeout_skipped_with_env(self):
         class SlowHandler(BaseHTTPRequestHandler):
@@ -438,6 +944,13 @@ class LintDirectModelCallsTests(unittest.TestCase):
         self.assertIn('${{ github.action_path }}/run', action_yml)
         self.assertNotIn('/ci/ladder-call', action_yml)
 
+    def test_action_installs_cursor_agent(self):
+        action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
+        self.assertIn('Install cursor-agent', action_yml)
+        self.assertIn('cursor.com/install', action_yml)
+        self.assertIn('GEMINI_API_KEY', action_yml)
+        self.assertIn('CURSOR_API_KEY', action_yml)
+
     def test_action_wrapper_logs_on_failure(self):
         action_yml = (ACTION_LADDER / 'action.yml').read_text(encoding='utf-8')
         self.assertIn('if !', action_yml)
@@ -467,6 +980,21 @@ class LintDirectModelCallsTests(unittest.TestCase):
             self.assertEqual(len(answers), 2)
             self.assertEqual(len(logs), 2)
             self.assertNotEqual(answers[0].name, answers[1].name)
+
+    def test_action_passes_family_exclusions_to_ladder(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = {k: v for k, v in os.environ.items() if not k.endswith('_API_KEY')}
+            env['RUNNER_TEMP'] = tmp
+            env['GITHUB_OUTPUT'] = os.path.join(tmp, 'output')
+            env['EXCLUDE_FAMILIES'] = 'deepseek,zai,google,cursor'
+            request = Path(tmp) / 'request.json'
+            request.write_text('{"messages": []}', encoding='utf-8')
+            env['REQUEST_FILE'] = str(request)
+            result = subprocess.run(['bash', '-c', action_run_script()],
+                                    capture_output=True, text=True, env=env, check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('all lanes excluded by author model families', result.stderr)
+        self.assertNotIn('no key', result.stderr)
 
     def test_flags_real_multiprompt_verifier_with_file_line(self):
         with tempfile.TemporaryDirectory() as tmp:

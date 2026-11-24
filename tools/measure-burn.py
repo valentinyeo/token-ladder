@@ -6,8 +6,17 @@ import os
 from pathlib import Path
 import sched
 import subprocess
+import sys
 import threading
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'bin'))
+from gateway_burn import report_lines
+
+if sys.argv[1:] == ['--gateway']:
+    lines = report_lines()
+    print('\n'.join(lines))
+    sys.exit(1 if any(line.startswith('Vercel report unavailable:') for line in lines) else 0)
 
 now = dt.datetime.now(dt.timezone.utc)
 cutoff = now - dt.timedelta(days=7)
@@ -111,5 +120,6 @@ for taken, categories, top in samples:
 lines.extend(["", "Largest CPU consumers are frequently unclassified; these samples cannot establish their workload.", ""])
 for taken, categories, top in samples:
     lines.append(f"Top five at {taken}: " + "; ".join(f"{category} {cpu:.1f}%" for category, cpu in top) + ".")
+lines.extend(["", "## Vercel AI Gateway", "", *report_lines(), ""])
 Path(__file__).with_name("burn-report.md").write_text("\n".join(lines) + "\n")
 print("Burn report written: tools/burn-report.md")

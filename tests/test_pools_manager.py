@@ -49,7 +49,7 @@ class PoolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as state, patch.object(tl, "STATE", state):
             s = {"claude": {"week": bar(96)}, "codex": {"week": bar(10)}}
             pools = tl.current_pools(s, NOW)
-            self.assertEqual([p["state"] for p in pools.values()], ["OFF", "ON", "unknown"])
+            self.assertEqual([p["state"] for p in pools.values()], ["OFF", "ON", "unknown", "unknown"])
             self.assertIn("assume 70% used for planning", tl.pool_line("grok", pools["grok"]))
             path = Path(state, "grok.json")
             path.write_text(json.dumps({"used_pct": 81, "resets_at": "2026-10-26T16:03:00+02:00", "updated_at": "2026-10-25T16:03:00+02:00"}))
@@ -76,8 +76,31 @@ class PoolTests(unittest.TestCase):
                 patch.object(tl.subprocess, "run", side_effect=AssertionError("no subprocess")), \
                 patch.object(tl.urllib.request, "urlopen", side_effect=AssertionError("no network")):
             tl.pools_command()
-            self.assertEqual(set(json.loads(out.getvalue())), {"claude", "codex", "grok"})
+            self.assertEqual(set(json.loads(out.getvalue())), {"claude", "codex", "grok", "google"})
             self.assertEqual(os.listdir(state), [])
+
+
+class PaceAfterResetTests(unittest.TestCase):
+    def test_week_pace_exists_in_the_first_hours_after_a_reset(self):
+        state = tl.pool_state(tl.window(8, NOW + 162 * 3600, 10080, NOW), None, CFG, NOW)
+        elapsed = 100 * 6 / 168
+        self.assertEqual(state["window_minutes"], 10080)
+        self.assertAlmostEqual(state["elapsed_pct"], elapsed, places=4)
+        self.assertAlmostEqual(state["pace_ratio"], round(8 / elapsed, 4), places=4)
+
+    def test_used_share_is_measured_against_a_two_percent_floor(self):
+        state = tl.pool_state(tl.window(3, NOW + 168 * 3600 - 600, 10080, NOW), None, CFG, NOW)
+        self.assertLess(state["elapsed_pct"], 2)
+        self.assertAlmostEqual(state["pace_ratio"], 1.5)
+        state = tl.pool_state(tl.window(0, NOW + 168 * 3600 - 600, 10080, NOW), None, CFG, NOW)
+        self.assertEqual(state["pace_ratio"], 0.0)
+
+    def test_short_window_still_waits_for_ten_percent_elapsed(self):
+        state = tl.pool_state(tl.window(0, NOW + 160 * 3600, 10080, NOW),
+                              tl.window(20, NOW + 290 * 60, 300, NOW), CFG, NOW)
+        self.assertEqual(state["window_minutes"], 300)
+        self.assertAlmostEqual(state["elapsed_pct"], 100 * 10 / 300, places=4)
+        self.assertEqual(state["pace_ratio"], 0.0)
 
 
 class BashRulesTests(unittest.TestCase):
@@ -100,7 +123,7 @@ class BashRulesTests(unittest.TestCase):
         self.assertIsNone(tl.bash_refusal("python3 - <<'EOF'\ns='ccr start'\nEOF", {}))
 
     def test_pi_lanes_allowed_for_deepseek_flash_only(self):
-        for ok in ("pi -p --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash-1017 --thinking medium",
+        for ok in ("pi -p --provider vercel-ai-gateway --model deepseek/deepseek-v4.1-flash --thinking medium",
                    "pi --provider=vercel-ai-gateway --model=deepseek/deepseek-v4.1-flash",
                    "pi -p --provider deepseek --model deepseek-flash",
                    "pi -p --provider opencode-go --model deepseek-v4.1-flash",

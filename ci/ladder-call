@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import argparse
+import hashlib
 import json
 import os
+import re
+import shutil
+import subprocess
 import sys
 import urllib.error
 import urllib.request
@@ -10,6 +14,18 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
 SKIP_HTTP = {401, 402, 403, 404, 408, 425, 429}
+CURSOR_RATE_MARKERS = (
+    'rate limit',
+    'rate_limit',
+    'rate-limit',
+    'too many requests',
+    'quota exceeded',
+    'resource exhausted',
+)
+
+sys.path.insert(0, str(REPO))
+from model_families import filter_lanes, model_family
+from verdict import answer_text, find_verdict
 
 
 def timeout_seconds():
@@ -64,6 +80,98 @@ def message_content(result):
         return ''
 
 
+def messages_prompt(body):
+    messages = body.get('messages')
+    if not isinstance(messages, list):
+        return ''
+    parts = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = message.get('role') or 'user'
+        content = message.get('content')
+        if content is None:
+            continue
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, list):
+            text = message_content({'choices': [{'message': {'content': content}}]})
+        else:
+            text = str(content).strip()
+        if text:
+            parts.append(f'{role}: {text}')
+    return '\n'.join(parts)
+
+
+def cursor_agent_bin():
+    override = os.environ.get('LADDER_CALL_CURSOR_AGENT', '').strip()
+    if override:
+        return override
+    found = shutil.which('cursor-agent')
+    if found:
+        return found
+    candidate = Path.home() / '.local' / 'bin' / 'cursor-agent'
+    if candidate.is_file():
+        return str(candidate)
+    return ''
+
+
+def cursor_rate_limited(text):
+    lower = text.lower()
+    return any(marker in lower for marker in CURSOR_RATE_MARKERS)
+
+
+def call_cursor_lane(lane, key, body):
+    prompt = messages_prompt(body)
+    if not prompt:
+        return None, 'empty answer'
+    bin_path = cursor_agent_bin()
+    if not bin_path:
+        return None, 'no cursor-agent'
+    model = lane.get('model') or 'composer-2.5'
+    env = os.environ.copy()
+    env['CURSOR_API_KEY'] = key
+    cmd = [bin_path, '-p', '--output-format', 'text', '--model', model, prompt]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds(),
+            env=env,
+            stdin=subprocess.DEVNULL,
+        )
+    except subprocess.TimeoutExpired:
+        return None, 'timeout'
+    except OSError as exc:
+        return None, type(exc).__name__
+    if proc.returncode != 0:
+        return None, f'exit {proc.returncode}'
+    text = (proc.stdout or '').strip()
+    if not text:
+        return None, 'empty answer'
+    if cursor_rate_limited(text):
+        return None, 'rate limit'
+    return {'choices': [{'message': {'content': text}}]}, None
+
+
+def gateway_tags(env):
+    def slug(value, default):
+        return value.lower() if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]*', value) else default
+
+    repo = slug(env.get('GITHUB_REPOSITORY', '').rsplit('/', 1)[-1], 'token-ladder')
+    job = slug(env.get('GITHUB_JOB', ''), 'cli')
+    caller = slug(env.get('LADDER_CALL_CALLER', ''), job)
+    tag = f'caller={repo}-{caller}'
+    if len(tag) > 64:
+        tag = tag[:51] + '-' + hashlib.sha256(tag.encode()).hexdigest()[:12]
+    tags = [tag]
+    pr = env.get('LADDER_CALL_PR', '')
+    if env.get('GITHUB_EVENT_NAME') in ('pull_request', 'pull_request_target') and re.fullmatch(r'[1-9][0-9]{0,9}', pr):
+        tags.append(f'pr={pr}')
+    return tags
+
+
 def call_lane(lane, key, body):
     url = lane_url(lane)
     headers = {
@@ -71,10 +179,21 @@ def call_lane(lane, key, body):
         'Content-Type': 'application/json',
         'User-Agent': 'token-ladder-ladder-call/1',
     }
-    if lane['name'] == 'opencode-go' and os.environ.get('GITHUB_RUN_ID'):
-        headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+    if lane['name'] == 'vercel-ai-gateway':
+        headers['ai-reporting-tags'] = ','.join(gateway_tags(os.environ))
+    if lane['name'] == 'opencode-go':
+        if os.environ.get('GITHUB_RUN_ID'):
+            headers['x-opencode-session'] = os.environ['GITHUB_RUN_ID']
+        else:
+            headers['x-opencode-session'] = 'token-ladder-ladder-call'
     payload = dict(body)
     payload['model'] = lane['model']
+    gateway = lane.get('gateway')
+    if isinstance(gateway, dict) and gateway:
+        payload['providerOptions'] = {'gateway': gateway}
+    provider = lane.get('provider')
+    if isinstance(provider, dict) and provider:
+        payload['provider'] = provider
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=timeout_seconds()) as response:
         raw = response.read()
@@ -98,51 +217,119 @@ def skip_reason(lane, exc=None, status=None, empty=False):
     return str(status)
 
 
+DECIDE_SYSTEM = (
+    'You are the verdict line of an independent pull request verifier. '
+    'You did not write the change. Decide from the verifier notes you are given, which may '
+    'be cut short. '
+    'Your first line must be exactly PASS, PASS+NOTES, or FAIL, alone, with no markdown. '
+    'Then at most three short lines.'
+)
+DECIDE_TAIL = 4000
+DECIDE_TOKENS = 2048
+
+
 def log_skip(name, reason):
     print(f'ladder-call: lane {name} skipped: {reason}', file=sys.stderr)
+
+
+def flatten(text, limit=300):
+    flat = ' '.join((text or '').split())
+    return flat[-limit:]
+
+
+def decide_request(answer):
+    notes = (answer or '').strip()[-DECIDE_TAIL:]
+    return {
+        'messages': [
+            {'role': 'system', 'content': DECIDE_SYSTEM},
+            {
+                'role': 'user',
+                'content': (
+                    'A PR verifier reviewed a diff and wrote these notes, possibly cut short:\n\n'
+                    + notes
+                    + '\n\nDecide now from these notes. First line exactly PASS, PASS+NOTES, '
+                    'or FAIL, alone. Then at most three short lines.'
+                ),
+            },
+        ],
+        'max_tokens': DECIDE_TOKENS,
+    }
+
+
+def attempt_lane(lane, key, body):
+    try:
+        if lane.get('kind') == 'cursor':
+            return call_cursor_lane(lane, key, body)
+        return call_lane(lane, key, body), None
+    except urllib.error.HTTPError as exc:
+        if exc.code in SKIP_HTTP or exc.code >= 500:
+            return None, skip_reason(lane, exc=exc)
+        print(
+            f'ladder-call: lane {lane["name"]} failed: HTTP {exc.code}',
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        if isinstance(getattr(exc, 'reason', None), TimeoutError):
+            return None, 'timeout'
+        return None, skip_reason(lane, exc=exc)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--purpose', required=True)
+    parser.add_argument('--require-verdict', action='store_true')
+    parser.add_argument('--exclude-families', default='', help='Comma-separated model families to skip')
     args = parser.parse_args()
+    require_verdict = args.require_verdict or os.environ.get('LADDER_CALL_REQUIRE_VERDICT') == '1'
     try:
         body = json.load(sys.stdin)
     except json.JSONDecodeError:
         print('ladder-call: invalid JSON on stdin', file=sys.stderr)
         raise SystemExit(2)
     lanes = load_lanes()
+    try:
+        excluded = {model_family(family) for family in args.exclude_families.split(',') if family.strip()}
+        eligible = filter_lanes(lanes, excluded)
+    except ValueError as exc:
+        print(f'ladder-call: cannot enforce family exclusions: {exc}', file=sys.stderr)
+        raise SystemExit(2)
     for lane in lanes:
+        if lane not in eligible:
+            log_skip(lane['name'], f'excluded family {model_family(lane["model"])}')
+    if excluded and not eligible:
+        print('ladder-call: all lanes excluded by author model families', file=sys.stderr)
+        raise SystemExit(3)
+    for lane in eligible:
         key = os.environ.get(lane['key_env'], '').strip()
         if not key:
             log_skip(lane['name'], 'no key')
             continue
-        try:
-            result = call_lane(lane, key, body)
-        except urllib.error.HTTPError as exc:
-            if exc.code in SKIP_HTTP:
-                log_skip(lane['name'], skip_reason(lane, exc=exc))
-                continue
-            if exc.code >= 500:
-                log_skip(lane['name'], skip_reason(lane, exc=exc))
-                continue
-            print(
-                f'ladder-call: lane {lane["name"]} failed: HTTP {exc.code}',
-                file=sys.stderr,
-            )
-            raise SystemExit(1)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            if isinstance(getattr(exc, 'reason', None), TimeoutError):
-                log_skip(lane['name'], 'timeout')
-            else:
-                log_skip(lane['name'], skip_reason(lane, exc=exc))
+        result, reason = attempt_lane(lane, key, body)
+        if reason:
+            log_skip(lane['name'], reason)
             continue
         if result is None:
             log_skip(lane['name'], 'invalid response')
             continue
-        if not message_content(result):
+        answer = answer_text(result)
+        if not answer:
             log_skip(lane['name'], 'empty answer')
             continue
+        if require_verdict and not find_verdict(answer)[0]:
+            print(
+                f'ladder-call: lane {lane["name"]} no-verdict answer tail: {flatten(answer, 600)}',
+                file=sys.stderr,
+            )
+            result, reason = attempt_lane(lane, key, decide_request(answer))
+            if reason:
+                log_skip(lane['name'], reason)
+                continue
+            decision = answer_text(result) if result else ''
+            if not find_verdict(decision)[0]:
+                log_skip(lane['name'], 'no verdict')
+                continue
+            answer = decision
         print(f'ladder-call: lane {lane["name"]} answered ({args.purpose})', file=sys.stderr)
         json.dump(result, sys.stdout)
         print()

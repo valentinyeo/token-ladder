@@ -1,0 +1,20 @@
+{
+  "launches": [
+    {"event": "start", "launch_id": "cheap-1", "at": 1, "lane": "opencode", "rung": "light", "model": "deepseek-v4.1-flash"},
+    {"event": "finish", "launch_id": "cheap-1", "finished_at": 2, "exit_code": 0, "pr_url": "https://github.com/fixture/jobs/pull/1", "cost_usd": 0.1},
+    {"event": "start", "launch_id": "cheap-2", "at": 3, "lane": "opencode", "rung": "medium", "model": "deepseek-v4.1-flash"},
+    {"event": "finish", "launch_id": "cheap-2", "finished_at": 4, "exit_code": 0, "pr_url": "https://github.com/fixture/jobs/pull/2", "cost_usd": 0.1},
+    {"event": "start", "launch_id": "strong-1", "at": 5, "lane": "codex", "rung": "hard", "model": "gpt-6.1-sol"},
+    {"event": "finish", "launch_id": "strong-1", "finished_at": 6, "exit_code": 0, "pr_url": "https://github.com/fixture/jobs/pull/3", "cost_usd": 1.0}
+  ],
+  "cheap_fails_twice": {
+    "https://github.com/fixture/jobs/pull/1": "FAIL",
+    "https://github.com/fixture/jobs/pull/2": "FAIL",
+    "https://github.com/fixture/jobs/pull/3": "PASS"
+  },
+  "both_pass": {
+    "https://github.com/fixture/jobs/pull/1": "PASS",
+    "https://github.com/fixture/jobs/pull/2": "PASS",
+    "https://github.com/fixture/jobs/pull/3": "PASS"
+  }
+}
