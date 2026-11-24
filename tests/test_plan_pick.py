@@ -2025,5 +2025,20 @@ class OwnCheckoutTests(unittest.TestCase):
         self.assertNotEqual(out.returncode, 2, out.stderr)
 
 
+class ShimRefusalTests(unittest.TestCase):
+    def test_plan_picks_own_source_is_no_refusal(self):
+        source = Path(REPO, "bin/plan-pick").read_text()
+        self.assertIn("plan-pick worker:", source)
+        self.assertIsNone(pp.shim_refusal(source))
+
+    def test_guard_and_missing_host_refusals_still_match(self):
+        self.assertEqual(pp.shim_refusal("BLOCKED by heavy-local-guard: python3 runs on GitHub."), "python3")
+        self.assertEqual(pp.shim_refusal("hypertask is not installed on this host"), "hypertask")
+
+    def test_worker_refusal_keeps_its_words(self):
+        self.assertEqual(pp.shim_refusal("plan-pick worker: gradle is not allowed"),
+                         "gradle is not allowed")
+
+
 if __name__ == "__main__":
     unittest.main()
