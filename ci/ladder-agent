@@ -125,7 +125,7 @@ def main():
         extensions = agent_dir / 'extensions'
         extensions.mkdir()
         extension = (ROOT / 'ci/ladder-agent-pins.mjs').as_uri()
-        (extensions / 'ladder.mjs').write_text(f'export {{ default }} from {json.dumps(extension)};\n')
+        (extensions / 'ladder.js').write_text(f'export {{ default }} from {json.dumps(extension)};\n')
         for lane in lanes:
             name = lane['name']
             if lane not in eligible:
