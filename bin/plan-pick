@@ -1018,12 +1018,12 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
             kind = None
         effective_code = 1 if code == 0 and (kind is not None or fast is not None or info["error"] is not None) else code
         lane_failure = kind is not None or fast is not None
-        say(attempt_line(result["plan"], code, elapsed, pr_url, info["empty"], last_words(tail)))
         if rung:
             launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now,
                           lane_failure=lane_failure, silent=info["empty"])
         if kind is None:
             if fast is None:
+                say(attempt_line(result["plan"], code, elapsed, pr_url, info["empty"], last_words(tail)))
                 return effective_code
             tried.add(result["plan"])
             source = "fast-fail 4xx" if nonquota_http else "fast-fail"
