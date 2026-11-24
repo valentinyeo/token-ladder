@@ -2040,5 +2040,82 @@ class ShimRefusalTests(unittest.TestCase):
                          "gradle is not allowed")
 
 
+class ServerHoldTests(unittest.TestCase):
+    HOLD_LINE = "HOLD worker, HOLD chat: load5 30.36 is 1.69x 18 cores"
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.dir = Path(self.home, "check")
+        self.dir.mkdir()
+        self.pools = Path(self.home, "pools.json")
+        self.pools.write_text("{}")
+        self.launches = Path(self.home, "launches.jsonl")
+        self.marker = self.dir / "stub-ran"
+        self.repo = Path(tempfile.mkdtemp())
+        (self.repo / "bin").mkdir()
+        (self.repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (self.repo / "config.json").write_text(json.dumps(
+            {"lanes": [{"lane": "a", "pool": None, "command": "echo worker-done"}]}))
+
+    def stub(self, code, line=""):
+        path = self.dir / "vps-state"
+        script = f"#!/bin/sh\ntouch '{self.marker}'\n"
+        if line:
+            script += f"printf '%s\\n' '{line}'\n"
+        script += f"exit {code}\n"
+        path.write_text(script)
+        path.chmod(0o755)
+        return str(path)
+
+    def cli(self, binary, *args):
+        return subprocess.run(
+            [sys.executable, str(self.repo / "bin" / "plan-pick"), "--pools", str(self.pools), *args],
+            capture_output=True, text=True,
+            env={"HOME": self.home, "PATH": "/usr/bin:/bin",
+                 "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG,
+                 "PLAN_PICK_LAUNCHES": str(self.launches),
+                 "VPS_STATE_BIN": binary})
+
+    def logged(self):
+        return [json.loads(line) for line in self.launches.read_text().splitlines()]
+
+    def test_hold_starts_nothing_and_exits_75(self):
+        out = self.cli(self.stub(2, self.HOLD_LINE), "--run")
+        self.assertEqual(out.returncode, 75, out.stderr)
+        self.assertEqual(out.stdout, "")
+        self.assertEqual([entry["lane"] for entry in self.logged()], ["server-hold"])
+        self.assertIn(self.HOLD_LINE, out.stderr)
+        self.assertIn("plan-pick --run again", out.stderr)
+        lines = [line for line in out.stderr.strip().splitlines() if line]
+        self.assertEqual(len(lines), 2, out.stderr)
+        self.assertTrue(lines[0].startswith("Pacer launch: server-hold "), out.stderr)
+        self.assertIn(self.HOLD_LINE, lines[1])
+        self.assertIn("plan-pick --run again", lines[1])
+
+    def test_careful_add_and_probe_failure_launch(self):
+        for code, line in ((1, "CAREFUL worker, ADD chat: load5 10.00 is 0.55x 18 cores"),
+                           (0, "ADD worker, ADD chat: load5 2.00 is 0.11x 18 cores"),
+                           (3, "")):
+            with self.subTest(code=code):
+                self.launches.unlink(missing_ok=True)
+                got = self.cli(self.stub(code, line), "--run")
+                self.assertEqual((got.returncode, got.stdout), (0, "worker-done\n"), got.stderr)
+                self.assertEqual([entry["lane"] for entry in self.logged()], ["a"])
+
+    def test_missing_binary_launches(self):
+        got = self.cli(str(self.dir / "no-such-vps-state"), "--run")
+        self.assertEqual((got.returncode, got.stdout), (0, "worker-done\n"), got.stderr)
+        self.assertEqual([entry["lane"] for entry in self.logged()], ["a"])
+
+    def test_plain_pick_and_json_skip_the_check(self):
+        binary = self.stub(2, self.HOLD_LINE)
+        for args in ([], ["--json"]):
+            with self.subTest(args=args):
+                self.marker.unlink(missing_ok=True)
+                got = self.cli(binary, *args)
+                self.assertEqual(got.returncode, 0, got.stderr)
+                self.assertFalse(self.marker.exists(), got.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -61,6 +61,10 @@ DEFAULT_LOOP_FAR_AHEAD_RATIO = 1.2
 DEFAULT_LOOP_USED_PCT = 95
 DEFAULT_LOOP_MIN_SECONDS = 1800
 PLANS_NOTE = "Included means no extra cost: never quote API pricing or ask for a spend cap for these."
+VPS_STATE = "~/.local/share/vstack/skills/vps-state/vps-state"
+SERVER_CHECK_TIMEOUT = 15
+SERVER_HOLD_EXIT = 75
+SERVER_HOLD_LANE = "server-hold"
 
 
 def number(value):
@@ -966,6 +970,22 @@ def log_launch(path, lane, now, not_vendor, metadata=None):
     if lane is not None:
         stamp = datetime.fromtimestamp(at, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         print(f"Pacer launch: {lane} {stamp}", file=sys.stderr)
+
+
+def server_busy(path=None):
+    binary = path or os.environ.get("VPS_STATE_BIN") or VPS_STATE
+    try:
+        out = subprocess.run([os.path.expanduser(binary), "--can-launch", "worker", "--no-write", "--brief"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                             timeout=SERVER_CHECK_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 2:
+        return None
+    lines = out.stdout.strip().splitlines()
+    return lines[0].strip() if lines and lines[0].strip() else "HOLD"
+
+
 def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, now=None, say=None,
               launches_path=LAUNCHES, not_vendor=None, burn=None, rung=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
@@ -2576,6 +2596,13 @@ def main(argv):
         if args.run:
             if args.brief != "brief.txt":
                 parser.error("--run reads brief.txt; use --brief only for dry runs")
+            held = server_busy()
+            if held is not None:
+                log_launch(LAUNCHES, SERVER_HOLD_LANE, None, excluded or None)
+                record_no_lane(rung)
+                print(f"plan-pick: server busy, no worker started: {held}. "
+                      f"Wait a few minutes and run plan-pick --run again.", file=sys.stderr)
+                return SERVER_HOLD_EXIT
             return run_lanes(lanes, pools, cfg, warn, not_vendor=excluded or None, burn=burn, rung=rung)
         if rung:
             result, rung, _ = pick_rung(lanes, pools, cfg, rung, read_limits(), warn)
