@@ -1,0 +1,58 @@
+name: ladder-agent
+description: Run the pi coding agent through token-ladder CI lane fallback.
+inputs:
+  prompt:
+    description: Task for the coding agent. Tools and repository skills remain enabled.
+    required: true
+  working-directory:
+    description: Directory in which pi runs, relative to the job workspace or absolute.
+    required: false
+    default: '.'
+  exclude-families:
+    description: Comma-separated model families whose lanes must not be called.
+    required: false
+    default: ''
+  timeout-seconds:
+    description: Maximum seconds per lane, including tools and child agents.
+    required: false
+    default: '1800'
+outputs:
+  lane:
+    description: Lane that answered, or the last attempted lane on failure.
+    value: ${{ steps.run.outputs.lane }}
+  model:
+    description: Model used by that lane.
+    value: ${{ steps.run.outputs.model }}
+  exit-code:
+    description: Zero on success, 3 when no lane answered, otherwise the agent exit code.
+    value: ${{ steps.run.outputs.exit-code }}
+  answer-file:
+    description: Absolute path to the final answer text file (empty on failure).
+    value: ${{ steps.run.outputs.answer-file }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: '22'
+    - name: Install pinned pi coding agent
+      shell: bash
+      run: |
+        set -euo pipefail
+        prefix="$(mktemp -d "${RUNNER_TEMP}/ladder-agent-pi-XXXXXX")"
+        timeout 300 npm install --prefix "$prefix" --no-audit --no-fund @mariozechner/pi-coding-agent@0.73.1
+        echo "$prefix/node_modules/.bin" >> "$GITHUB_PATH"
+    - name: ladder-agent
+      id: run
+      shell: bash
+      env:
+        LADDER_AGENT_PROMPT: ${{ inputs.prompt }}
+        LADDER_AGENT_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+        LADDER_AGENT_TIMEOUT: ${{ inputs.timeout-seconds }}
+        LADDER_AGENT_ACTION_PATH: ${{ github.action_path }}
+        EXCLUDE_FAMILIES: ${{ inputs.exclude-families || env.EXCLUDE_FAMILIES }}
+      run: |
+        set -euo pipefail
+        printf '%s' "$LADDER_AGENT_PROMPT" | "$LADDER_AGENT_ACTION_PATH/run" \
+          --working-directory "$LADDER_AGENT_WORKING_DIRECTORY" \
+          --timeout-seconds "$LADDER_AGENT_TIMEOUT"

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+from model_families import filter_lanes, model_family
+
+ROOT = Path(__file__).resolve().parents[1]
+LANES = ('opencode-go', 'vercel-ai-gateway', 'vercel-ai-gateway-zai', 'openrouter')
+RETRYABLE = re.compile(
+    r'\b(?:401|402|403|404|408|425|429|5\d\d)\b|payment required|'
+    r'insufficient[ _](?:balance|credits?|funds|quota)|rate[ _-]?limit|'
+    r'too many requests|quota|resource[ _-]?exhausted', re.IGNORECASE,
+)
+
+
+def final_result(path):
+    answer, error = '', ''
+    for line in path.read_text(encoding='utf-8', errors='replace').splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        kind = event.get('type')
+        if kind == 'auto_retry_end' and event.get('success') is False:
+            answer, error = '', str(event.get('finalError') or 'retry failed')
+        elif kind == 'agent_settled' and event.get('aborted') is True:
+            answer, error = '', error or 'agent aborted'
+        elif kind in ('message_end', 'turn_end', 'agent_end'):
+            messages = event.get('messages', []) if kind == 'agent_end' else [event.get('message')]
+            for message in messages:
+                if not isinstance(message, dict) or message.get('role') != 'assistant':
+                    continue
+                stop = message.get('stopReason')
+                if stop in ('error', 'aborted'):
+                    answer, error = '', str(message.get('errorMessage') or stop)
+                else:
+                    content = message.get('content', [])
+                    answer = ''.join(part.get('text', '') for part in content
+                                     if isinstance(part, dict) and part.get('type') == 'text').strip()
+                    if stop == 'toolUse':
+                        answer = ''
+                    error = ''
+    return answer, error
+
+
+def configure(agent_dir, lane):
+    url = os.environ.get('LADDER_AGENT_URL_' + lane['name'].upper().replace('-', '_'), lane['url'])
+    provider = {
+        'baseUrl': url.removesuffix('/chat/completions'),
+        'api': 'openai-completions',
+        'apiKey': lane['key_env'],
+        'models': [{
+            'id': lane['model'], 'reasoning': True, 'contextWindow': 200000, 'maxTokens': 16384,
+            'compat': {'thinkingFormat': 'zai' if model_family(lane['model']) == 'zai' else 'deepseek',
+                       'maxTokensField': 'max_tokens', 'supportsDeveloperRole': False},
+        }],
+    }
+    if lane['name'] == 'opencode-go':
+        provider['headers'] = {'x-opencode-session': os.environ.get('GITHUB_RUN_ID', 'token-ladder-agent')}
+    (agent_dir / 'models.json').write_text(json.dumps({'providers': {lane['name']: provider}}))
+    (agent_dir / 'settings.json').write_text(json.dumps({
+        'defaultProvider': lane['name'], 'defaultModel': lane['model'], 'defaultThinkingLevel': 'medium',
+        'retry': {'enabled': False, 'provider': {'maxRetries': 0}},
+    }))
+
+
+def run_lane(agent_dir, lane, prompt, cwd, timeout, output_dir):
+    configure(agent_dir, lane)
+    env = dict(os.environ, PI_CODING_AGENT_DIR=str(agent_dir), PI_OFFLINE='1',
+               LADDER_AGENT_LANE=json.dumps(lane))
+    stream = output_dir / (lane['name'] + '.jsonl')
+    log = output_dir / (lane['name'] + '.stderr')
+    command = ['pi', '-p', '--mode', 'json', '--no-session', '--provider', lane['name'],
+               '--model', lane['model'], '--thinking', 'medium']
+    with stream.open('w') as stdout, log.open('w') as stderr:
+        try:
+            proc = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
+                                    stdout=stdout, stderr=stderr, text=True, start_new_session=True)
+        except OSError:
+            return 127, '', 'cannot launch pi'
+        try:
+            proc.communicate(prompt, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            return 124, '', 'timeout'
+    answer, error = final_result(stream)
+    if proc.returncode and not error:
+        error = log.read_text(encoding='utf-8', errors='replace')
+    return proc.returncode, answer, error
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--working-directory', default='.')
+    parser.add_argument('--exclude-families', default=os.environ.get('EXCLUDE_FAMILIES', ''))
+    parser.add_argument('--timeout-seconds', type=int, default=1800)
+    args = parser.parse_args()
+    prompt = sys.stdin.read()
+    cwd = Path(args.working_directory).resolve()
+    if not prompt.strip() or not cwd.is_dir() or args.timeout_seconds <= 0:
+        parser.error('a nonempty prompt, existing working directory and positive timeout are required')
+    lanes = json.loads((ROOT / 'ci/lanes.json').read_text())
+    lanes = [next(lane for lane in lanes if lane['name'] == name) for name in LANES]
+    try:
+        excluded = {model_family(family) for family in args.exclude_families.split(',') if family.strip()}
+        eligible = filter_lanes(lanes, excluded)
+    except ValueError as exc:
+        parser.error(f'cannot enforce family exclusions: {exc}')
+    output_dir = Path(tempfile.mkdtemp(prefix='ladder-agent-', dir=os.environ.get('RUNNER_TEMP')))
+    answer_file = output_dir / 'answer.txt'
+    answer_file.write_text('')
+    result = {'lane': '', 'model': '', 'exit-code': 3, 'answer-file': str(answer_file)}
+    with tempfile.TemporaryDirectory(prefix='pi-agent-') as scratch:
+        agent_dir = Path(scratch)
+        extensions = agent_dir / 'extensions'
+        extensions.mkdir()
+        extension = (ROOT / 'ci/ladder-agent-pins.mjs').as_uri()
+        (extensions / 'ladder.mjs').write_text(f'export {{ default }} from {json.dumps(extension)};\n')
+        for lane in lanes:
+            name = lane['name']
+            if lane not in eligible:
+                print(f'ladder-agent: lane {name} skipped: excluded family', file=sys.stderr)
+                continue
+            if not os.environ.get(lane['key_env'], '').strip():
+                print(f'ladder-agent: lane {name} skipped: no key', file=sys.stderr)
+                continue
+            code, answer, error = run_lane(agent_dir, lane, prompt, cwd, args.timeout_seconds, output_dir)
+            result.update(lane=name, model=lane['model'])
+            if error and (RETRYABLE.search(error) or error == 'timeout'):
+                print(f'ladder-agent: lane {name} skipped: provider unavailable', file=sys.stderr)
+                continue
+            if code or error:
+                result['exit-code'] = code if code > 0 else 1
+                print(f'ladder-agent: lane {name} failed (exit {result["exit-code"]})', file=sys.stderr)
+                break
+            if not answer:
+                print(f'ladder-agent: lane {name} skipped: empty answer', file=sys.stderr)
+                continue
+            answer_file.write_text(answer + '\n', encoding='utf-8')
+            result['exit-code'] = 0
+            print(f'ladder-agent: lane {name} answered', file=sys.stderr)
+            break
+    if result['exit-code'] == 3:
+        print('ladder-agent: no lane answered', file=sys.stderr)
+    if os.environ.get('GITHUB_OUTPUT'):
+        with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+            for key, value in result.items():
+                print(f'{key}={value}', file=output)
+    print(json.dumps(result))
+    return result['exit-code']
+
+
+if __name__ == '__main__':
+    sys.exit(main())

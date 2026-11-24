@@ -566,6 +566,74 @@ The reusable action is
 lists GitHub secret names per repo, and prints a tab-separated table including
 whether each repo already references `ladder-call`.
 
+## CI agent runs
+
+Use `ladder-agent` instead of `claude-code-action` when a check needs tools,
+child agents or a multi-step journey. `ladder-call` remains the route for a
+single chat completion.
+
+Replace the Claude action step with this example. Keep your checkout and any
+project setup steps before it. No Claude or Codex plan login is needed.
+
+```yaml
+- uses: actions/checkout@v4
+- name: Agent verification
+  id: agent
+  uses: valentinyeo/token-ladder/.github/actions/ladder-agent@main
+  env:
+    OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
+    AI_GATEWAY_API_KEY: ${{ secrets.AI_GATEWAY_API_KEY }}
+    OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+  with:
+    prompt: |
+      Read AGENTS.md. Inspect the proposed change, run the verification
+      journeys, and report PASS or FAIL with evidence. Use tools to check
+      your claims. If needed, delegate focused tasks with pi -p.
+    working-directory: .
+    exclude-families: ${{ env.EXCLUDE_FAMILIES }}
+    timeout-seconds: '1800'
+- name: Read final answer
+  env:
+    ANSWER_FILE: ${{ steps.agent.outputs.answer-file }}
+  run: cat "$ANSWER_FILE"
+```
+
+The action installs `@mariozechner/pi-coding-agent@0.73.1` on Node 22 and runs
+`pi -p --mode json` in the supplied directory. Built-in tools, repository
+skills and Pi extensions remain enabled. Translate Claude-specific tool or
+subagent instructions to Pi equivalents when moving a prompt.
+
+It tries keyed lanes in this order: `opencode-go`, `vercel-ai-gateway`
+(DeepSeek), `vercel-ai-gateway-zai` (GLM), then `openrouter`. Models and provider
+pins come from `ci/lanes.json`. Both Vercel lanes stay on Token Pass;
+OpenRouter stays on StreamLake with provider fallback disabled.
+Missing keys, exhausted credit, rate limits, unavailable providers, timeouts
+and empty final answers move to the next lane. Structured provider failures
+count even if Pi exits zero. Work errors and bad requests stop the action.
+Each retry starts a fresh conversation but keeps workspace changes, so use
+retry-safe prompts for tasks with external effects.
+
+`exclude-families` accepts the same comma-separated family names as
+`ladder-call`. When omitted, it inherits `EXCLUDE_FAMILIES` from the job.
+Exclusions apply before any provider call. Pi uses an isolated agent directory
+without saved plan logins. Child `pi` processes inherit its lane, model and
+provider pins. Pi's internal provider retries are disabled so the ladder can
+advance. `timeout-seconds` limits each lane, including tools and child agents.
+
+Outputs are `lane`, `model`, `exit-code` and `answer-file`. The answer file is
+UTF-8 text containing only the final assistant answer, not tool events or
+intermediate narration. Files have unique paths under `RUNNER_TEMP`.
+On failure the file is empty. Exit `3` means no lane answered; another nonzero
+exit reports an agent or setup failure. `lane` and `model` identify the last
+attempt on failure, or are empty if no lane was attempted. A successful agent
+process does not imply its verdict is PASS; the calling check must interpret
+the answer.
+
+The `ladder agent composite action` CI job runs the real pinned Pi against a
+streaming stub provider. It checks lane fallback, file tools, a child agent,
+provider pins, family exclusions and separate output files without live keys.
+`lint-direct-model-calls` accepts `ladder-agent` as a ladder route.
+
 ## Adding the scan to a repo
 
 Any repo can run this scan on its own pull requests, so a new direct call fails
