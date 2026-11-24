@@ -1,0 +1,2 @@
+{"kind":"turn_usage","usage":{"in_tokens":60112,"cached":190000,"output":1502}}
+BLOCKED by heavy-local-guard: gradle belongs on GitHub free runners, not this host; push and let CI run, or use `gh workflow run <workflow> --ref <branch>`.

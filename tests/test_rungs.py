@@ -273,6 +273,22 @@ class RungPreviewTests(unittest.TestCase):
         self.assertIn("rung medium", ran.stderr)
         self.assertNotIn("no lane left", ran.stderr)
 
+    def test_worker_shim_refusal_is_visible_and_never_climbs(self):
+        fixture = Path(REPO) / "tests" / "fixtures" / "worker-shim-refusal.jsonl"
+        (self.repo / "config.json").write_text(json.dumps({
+            "rungs": {"light": [{"lane": "l"}], "medium": [{"lane": "m"}], "hard": [{"lane": "h"}]},
+            "lanes": [{"lane": "l", "command": f"cat {fixture}"},
+                      {"lane": "m", "command": f"cat {fixture}"},
+                      {"lane": "h", "command": "echo ran-h"}]}))
+        ran = self.cli("--run", lease=True)
+        self.assertEqual(ran.returncode, 1, ran.stderr)
+        self.assertIn("BLOCKED by heavy-local-guard: gradle", ran.stdout)
+        self.assertIn("worker-shim refusal (gradle); recorded as environment, no rung climb", ran.stderr)
+        state = json.loads((self.launches.parent / "rung-attempts.json").read_text())["ticket:T-1"]
+        self.assertEqual((state["failure"], state["refused"]), ("environment", "gradle"))
+        got = json.loads(self.cli("--json", lease=True).stdout)
+        self.assertEqual((got["rung"], got["plan"]), ("medium", "m"))
+
     def test_legacy_exit_75_is_a_lane_limit_not_a_work_failure(self):
         self.prior(rung="medium", exit_code=75, pr_url=None)
         got = json.loads(self.cli("--json", lease=True).stdout)
