@@ -1784,7 +1784,7 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(out.stdout.startswith("Worker plan: opencode. Launch: ~/.local/bin/plan-pick --run (reads brief.txt, runs ~/.npm-global/bin/pi -p"), out.stdout)
 
     def test_none_line_has_no_launch(self):
-        for lane in ("vercel", "deepseek", "openrouter", "antigravity"):
+        for lane in ("vercel", "deepseek", "openrouter", "antigravity", "vercel-zai", "commandcode"):
             self.cli("--limited", lane)
         out = self.run_cli({p: pool("OFF") for p in ("opencode", "codex", "grok", "google")})
         self.assertTrue(out.stdout.startswith("Worker plan: none. Why:"), out.stdout)

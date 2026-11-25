@@ -1031,6 +1031,8 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
             record_no_lane(rung, now)
             say(f"no lane left, nothing ran. {result['reason']}")
             return 75
+        if result.get("note"):
+            say(result["note"])
         say(f"lane {result['plan']}: {result['reason']}")
         launch_id = uuid.uuid4().hex
         metadata = None
@@ -1231,11 +1233,14 @@ def rung_context(brief, launches_path, lease=None):
     if prior and not no_climb_attempt(prior):
         reason = climb_reason(prior, cache_path)
         old = prior["rung"]
+        if reason is not None:
+            old = prior.get("rung_climbed") or old
         next_index = min(RUNGS.index(old) + int(reason is not None), len(RUNGS) - 1)
         chosen = RUNGS[max(RUNGS.index(rung), next_index)]
         if reason is not None or chosen != rung:
+            climb = f"rung {old} -> {chosen}" if chosen != old else f"rung {chosen}"
             ctx.update(rung=chosen, rung_source="climb",
-                       rung_reason=f"rung {old} -> {chosen} ({reason or 'prior climb'})")
+                       rung_reason=f"{climb} ({reason or 'prior climb'})")
     return ctx
 
 
@@ -1271,16 +1276,41 @@ def rung_lanes(lanes, cfg, rung):
 def pick_rung(lanes, pools, cfg, ctx, limits, warn, now=None):
     ctx = dict(ctx)
     initial = ctx["rung"]
-    while True:
-        eligible = rung_lanes(lanes, cfg, ctx["rung"])
-        result = pick(eligible, pools, limits, now, warn, strict_pace=True)
-        if result["command"] or ctx["rung"] == "hard":
-            result.update({key: ctx[key] for key in ("rung", "rung_source", "rung_reason")})
-            result["reason"] = ctx["rung_reason"] + "; " + result["reason"]
-            return result, ctx, eligible
+    empty = {}
+
+    def attempt(rung):
+        eligible = rung_lanes(lanes, cfg, rung)
+        return pick(eligible, pools, limits, now, warn, strict_pace=True), eligible
+
+    result, eligible = attempt(ctx["rung"])
+    while not result["command"] and ctx["rung"] != RUNGS[-1]:
+        empty[ctx["rung"]] = result["reason"]
         ctx["rung"] = RUNGS[RUNGS.index(ctx["rung"]) + 1]
         ctx["rung_source"] = "climb"
         ctx["rung_reason"] = f"rung {initial} -> {ctx['rung']} (no room)"
+        result, eligible = attempt(ctx["rung"])
+    climbed = ctx["rung"]
+    if not result["command"]:
+        empty[climbed] = result["reason"]
+        for lower in reversed(RUNGS[:RUNGS.index(climbed)]):
+            if lower in empty:
+                continue
+            fallback, lower_lanes = attempt(lower)
+            if fallback["command"]:
+                note = f"rung {climbed} has no free lane; running at {lower}"
+                prefix = "" if ctx["rung_reason"] == f"rung {climbed}" else f"{ctx['rung_reason']}; "
+                ctx.update(rung=lower, rung_source="fallback", rung_climbed=climbed,
+                           rung_reason=prefix + note)
+                result, eligible = fallback, lower_lanes
+                break
+            empty[lower] = fallback["reason"]
+        else:
+            result["reason"] = f"no free lane at any rung ({', '.join(empty)}); " + result["reason"]
+    result.update({key: ctx[key] for key in ("rung", "rung_source", "rung_reason")})
+    result["reason"] = ctx["rung_reason"] + "; " + result["reason"]
+    if ctx["rung"] != climbed:
+        result["note"] = f"rung {climbed} has no free lane; running at {ctx['rung']}"
+    return result, ctx, eligible
 
 
 class RunOutput(str):
@@ -1394,6 +1424,8 @@ def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_
         finish["refused"] = refused
     append_launch(path, finish)
     attempt = dict(finish, rung=ctx["rung"])
+    if ctx.get("rung_climbed"):
+        attempt["rung_climbed"] = ctx["rung_climbed"]
     update_state(ctx["state_path"], ctx["job"], attempt)
 
 

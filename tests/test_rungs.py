@@ -59,15 +59,22 @@ class RungTests(unittest.TestCase):
                         lane["command"].replace("vercel-ai-gateway", "openrouter-credit")):
             self.assertIsNotNone(tl.bash_refusal(command, {}))
 
-    def test_limits_and_pace_climb_but_hard_waits(self):
+    def test_limits_and_pace_climb_then_fall_back_before_waiting(self):
         ctx = self.context()
         limits = {l["lane"]: 200 for l in pp.rung_lanes(self.lanes, self.cfg, "light")}
         result, climbed, _ = pp.pick_rung(self.lanes, {}, self.cfg, ctx, limits, 1.1, now=100)
         self.assertEqual(climbed["rung"], "medium")
         self.assertNotIn(result["plan"], limits)
         pools = {"codex": {"pace_ratio": 1.2}, "google": {"state": "OFF"}}
-        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.context("Rung: hard\n"), {}, 1.1, now=100)
+        result, fell_back, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.context("Rung: hard\n"), {}, 1.1, now=100)
+        self.assertEqual((fell_back["rung"], fell_back["rung_climbed"]), ("medium", "hard"))
+        self.assertEqual(fell_back["rung_reason"], "rung hard has no free lane; running at medium")
+        self.assertEqual(result["note"], "rung hard has no free lane; running at medium")
+        limits = {lane["lane"]: 200 for lane in self.lanes}
+        pp.write_limits(limits, self.limits)
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.context("Rung: hard\n"), limits, 1.1, now=100)
         self.assertEqual(result["plan"], "none")
+        self.assertIn("no free lane at any rung", result["reason"])
         code = pp.run_lanes(self.lanes, pools, self.cfg, 1.1, rung=self.context("Rung: hard\n"),
                             runner=mock.Mock(side_effect=AssertionError("must wait")),
                             limits_path=self.limits, launches_path=self.log, now=100, say=lambda _: None)
@@ -256,6 +263,28 @@ class RungPreviewTests(unittest.TestCase):
         self.assertIn("ran-h", ran.stdout)
         self.assertIn("rung medium -> hard (prior run failed)", ran.stderr)
 
+    def test_climbed_rung_with_no_free_lane_falls_back_and_keeps_the_climb(self):
+        (self.repo / "config.json").write_text(json.dumps({
+            "rungs": {"light": [{"lane": "l"}], "medium": [{"lane": "m"}], "hard": [{"lane": "h"}]},
+            "lanes": [{"lane": "l", "command": "echo ran-l"},
+                      {"lane": "m", "command": "echo ran-m"},
+                      {"lane": "h", "command": "echo ran-h"}]}))
+        (self.launches.parent / "lane-limits.json").write_text(json.dumps(
+            {"h": {"until": 4102444800, "reason": "worn out", "source": "manual", "error_line": ""}}))
+        self.prior(rung="medium", exit_code=1, pr_url=None, failure="work")
+        preview = self.cli(lease=True)
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn("Rung: medium (rung medium -> hard (prior run failed); "
+                      "rung hard has no free lane; running at medium).", preview.stdout)
+        ran = self.cli("--run", lease=True)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertIn("ran-m", ran.stdout)
+        self.assertIn("plan-pick: rung hard has no free lane; running at medium", ran.stderr)
+        state = json.loads((self.launches.parent / "rung-attempts.json").read_text())["ticket:T-1"]
+        self.assertEqual((state["rung"], state["rung_climbed"]), ("medium", "hard"))
+        self.assertIn("Rung: medium (rung hard (prior run failed); rung hard has no free lane; running at medium)",
+                      self.cli(lease=True).stdout)
+
     def test_lane_limit_prior_leaves_plain_preview_and_run_on_the_brief_rung(self):
         self.prior(rung="hard", exit_code=3, pr_url=None, failure="lane")
         preview = self.cli()
@@ -310,14 +339,15 @@ class RungPreviewTests(unittest.TestCase):
                          ["plan-pick: cannot read verifier comments for a/b#31; verdict unknown, no climb"])
         self.assertNotIn("cannot pick rung", preview.stderr)
 
-    def test_no_lane_left_is_recorded_as_a_lane_failure_and_never_climbs(self):
+    def test_no_free_lane_in_any_rung_is_a_lane_failure_and_never_climbs(self):
         (self.repo / "config.json").write_text(json.dumps({
             "rungs": {"light": [{"lane": "l"}], "medium": [{"lane": "m"}], "hard": [{"lane": "h"}]},
-            "lanes": [{"lane": "l", "command": "echo ran-l"},
+            "lanes": [{"lane": "l", "command": "echo 'quota error: RESOURCE_EXHAUSTED'; exit 1"},
                       {"lane": "m", "command": "echo 'quota error: RESOURCE_EXHAUSTED'; exit 1"},
                       {"lane": "h", "command": "echo 'quota error: RESOURCE_EXHAUSTED'; exit 1"}]}))
         first = self.cli("--run", lease=True)
         self.assertEqual(first.returncode, 75, first.stderr)
+        self.assertIn("no free lane at any rung", first.stderr)
         state = json.loads((self.launches.parent / "rung-attempts.json").read_text())["ticket:T-1"]
         self.assertEqual((state["failure"], state["exit_code"]), ("lane", 75))
         (self.home / ".local/state/token-ladder/lane-limits.json").unlink()
