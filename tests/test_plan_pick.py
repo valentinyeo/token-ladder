@@ -2259,16 +2259,20 @@ class CiWaitBriefTests(unittest.TestCase):
         return lines[0]
 
     def test_real_brief_lines_that_ask_for_waiting_are_refused(self):
-        for phrase, line in (("read CI", "Push and read CI, then report."),
-                             ("Stop when CI is green", "Stop when CI is green and the verifier has run."),
+        for phrase, line in (("Stop when CI is green", "Stop when CI is green and the verifier has run."),
                              ("sleep 240", "sleep 240; gh pr checks")):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase.lower(), self.refused(f"Rung: medium\n{line}\n").lower())
 
     def test_every_waiting_phrase_is_named_and_refused(self):
-        for phrase in ("wait for CI", "watch CI", "until checks pass", "read the PR checks", "gh pr checks"):
+        for phrase in ("wait for CI", "watch CI", "until checks pass", "gh pr checks"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase.lower(), self.refused(f"Rung: medium\nPush, open the PR, then {phrase}.\n").lower())
+
+    def test_the_house_rules_line_that_reads_the_checks_is_accepted(self):
+        line = "Push and read the PR checks; a build or suite on the shared server is refused."
+        out = self.cli(f"Rung: medium\n{line}\n", "--run")
+        self.assertEqual((out.returncode, out.stdout), (0, "worker-done\n"), out.stderr)
 
     def test_a_brief_that_forbids_waiting_runs_the_worker(self):
         out = self.cli("Rung: medium\nPush, open the PR, then exit. Do not wait on CI.\n", "--run")
@@ -2283,7 +2287,9 @@ class CiWaitBriefTests(unittest.TestCase):
         self.assertEqual(pp.ci_wait_phrase("Stop when CI is green and the verifier has run"),
                          "Stop when CI is green")
         self.assertEqual(pp.ci_wait_phrase("sleep 240; gh pr checks"), "sleep 240")
-        self.assertEqual(pp.ci_wait_phrase("Push and read CI"), "read CI")
+        self.assertIsNone(pp.ci_wait_phrase("Push and read CI"))
+        self.assertIsNone(pp.ci_wait_phrase("Push and read the PR checks"))
+        self.assertEqual(pp.ci_wait_phrase("Push, then gh pr checks"), "gh pr checks")
         self.assertIsNone(pp.ci_wait_phrase("Do not wait for CI; push, open the PR, then exit"))
         self.assertIsNone(pp.ci_wait_phrase("Push, open the PR, then exit"))
 
