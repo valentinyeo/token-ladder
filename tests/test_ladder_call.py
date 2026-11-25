@@ -540,6 +540,100 @@ class LadderCallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn('failed: HTTP 400', result.stderr)
 
+    def test_400_credit_required_falls_to_second_lane(self):
+        server, port = run_server({
+            '/v1/chat/completions': (400, {'error': {
+                'message': 'positive gateway credit balance is required',
+                'type': 'invalid_request_error',
+            }}, None),
+            '/zen/go/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'second-lane-ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key', 'OPENCODE_API_KEY': 'oc-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: 400 no credit', result.stderr)
+        self.assertIn('lane opencode-go answered', result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)['choices'][0]['message']['content'], 'second-lane-ok')
+
+    def test_400_no_providers_available_falls_to_second_lane(self):
+        server, port = run_server({
+            '/v1/chat/completions': (400, {'error': {
+                'message': 'No providers are available for this model',
+                'type': 'no_providers_available',
+            }}, None),
+            '/zen/go/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'second-lane-ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key', 'OPENCODE_API_KEY': 'oc-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: 400 no provider', result.stderr)
+        self.assertIn('lane opencode-go answered', result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)['choices'][0]['message']['content'], 'second-lane-ok')
+
+    def test_400_invalid_request_still_stops_before_the_second_lane(self):
+        StubHandler.last_bodies = []
+        server, port = run_server({
+            '/v1/chat/completions': (400, {'error': {
+                'message': 'messages is required',
+                'type': 'invalid_request_error',
+                'code': 'invalid_request',
+            }}, None),
+            '/zen/go/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'second-lane-ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key', 'OPENCODE_API_KEY': 'oc-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn('lane vercel-ai-gateway failed: HTTP 400', result.stderr)
+        self.assertNotIn('lane opencode-go answered', result.stderr)
+        self.assertEqual(len(StubHandler.last_bodies), 1)
+
+    def test_oversize_400_body_still_skips_the_lane(self):
+        server, port = run_server({
+            '/v1/chat/completions': (400, {'error': {
+                'message': 'positive gateway credit balance is required ' + 'x' * 8000,
+            }}, None),
+            '/zen/go/v1/chat/completions': (200, {
+                'choices': [{'message': {'content': 'second-lane-ok'}}],
+            }, None),
+        })
+        self.addCleanup(server.shutdown)
+        lanes_path = write_vercel_then_opencode(port)
+        self.addCleanup(lambda: os.unlink(lanes_path))
+        result = ladder_call(
+            {'AI_GATEWAY_API_KEY': 'gw-key', 'OPENCODE_API_KEY': 'oc-key'},
+            {'messages': [{'role': 'user', 'content': 'hi'}]},
+            lanes_file=lanes_path,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('lane vercel-ai-gateway skipped: 400 no credit', result.stderr)
+        self.assertIn('lane opencode-go answered', result.stderr)
+
     def test_404_408_425_fall_to_second_lane(self):
         for status in (404, 408, 425):
             with self.subTest(status=status):
