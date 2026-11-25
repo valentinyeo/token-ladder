@@ -49,7 +49,6 @@ CI_WAIT = re.compile(
     r"(?:stop when|once|when) (?:the )?(?:ci|checks?) (?:is |are |goes )?(?:green|done|pass(?:es)?)"
     r"|until (?:the )?(?:ci|checks?)(?: (?:is|are))?(?: green| pass(?:es)?)"
     r"|(?:wait|watch)(?:ing)? (?:for |on |until )?(?:the )?(?:ci|checks?|pr checks)\b"
-    r"|read (?:the )?(?:ci|(?:pr )?checks)\b"
     r"|gh pr checks\b"
     r"|gh run watch\b"
     r"|sleep[ \t]+\d+(?:\.\d+)?[ \t]*[smhd]?\b"
