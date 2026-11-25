@@ -562,7 +562,7 @@ class AgentPlanHoldTests(unittest.TestCase):
     def test_the_pick_line_says_the_held_lane_is_tried_last(self):
         repo = Path(tempfile.mkdtemp())
         (repo / "bin").mkdir()
-        (repo / "bin" / "plan-pick").write_text(Path(REPO, "bin" / "plan-pick").read_text())
+        (repo / "bin" / "plan-pick").write_text(Path(REPO, "bin", "plan-pick").read_text())
         (repo / "config.json").write_text(json.dumps({"lanes": AGENT_LANES}))
         pools = repo / "pools.json"
         pools.write_text("{}")
