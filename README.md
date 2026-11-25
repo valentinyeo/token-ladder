@@ -32,6 +32,13 @@ While `until` is in the future, `plan-pick` runs that lane first and ignores its
 
 `plan-pick` runs a background worker on the first free lane allowed by its rung in `config.json`.
 
+A worker pushes, opens or updates the PR, and exits. The parent chat owns every wait: it reads the checks, and when CI is red it starts a fresh worker with the failing output. Two guards keep a worker from sitting on a CI timer:
+
+- `bin/worker-shims` goes first on a worker's `PATH`. `sleep` refuses any duration over 30 seconds. `gh` refuses `pr checks --watch` and `run watch`. Every other `sleep` and `gh` call runs the real program. A refusal prints one line, `worker shim refused: sleep 240 (over 30s; workers push and exit, the parent waits)`, which `plan-pick` records as `failure: environment`, so it never climbs a rung.
+- `plan-pick --run` reads `brief.txt` before it launches and refuses with exit 2 when the brief asks the worker to wait for CI: `stop when CI is green`, `wait for CI`, `watch CI`, `until checks pass`, `read the PR checks`, `gh pr checks`, `sleep 240`. The one line names the phrase and the fix. A line that says `do not wait for CI` passes. `PLAN_PICK_ALLOW_CI_WAIT=1` skips the check for a reviewer run; never set it for a worker brief.
+
+Write the brief as "push, open the PR, then exit".
+
 For the default medium rung, the Cursor lane runs first while its `first_until` time is in the future (`2026-11-24T23:59:00Z`, when Valentin's Cursor plan ends). After that time the order is the table below.
 
 | Order | Lane | Included usage / credit |

@@ -31,7 +31,8 @@ RATE_ERROR = re.compile(r"\b429\b|too many requests|rate[ _-]?limit|usage limit|
 BLOCKED_ERROR = re.compile(r"requires a challenge|\"code\":\s*\"challenge\"", re.I)
 SHIM_REFUSAL = re.compile(r"BLOCKED by heavy-local-guard:[ \t]*([A-Za-z][\w.+-]*)"
                           r"|^[ \t]*([A-Za-z][\w.+-]*) is not installed on this host[ \t]*$"
-                          r"|plan-pick worker:[ \t]*([A-Za-z][^.\n]*)", re.M)
+                          r"|plan-pick worker:[ \t]*([A-Za-z][^.\n]*)"
+                          r"|^[ \t]*worker shim refused:[ \t]*([A-Za-z][^.\n]*)", re.M)
 PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\s]+[45]\d{2}", re.I)
 MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
@@ -43,6 +44,17 @@ NO_PR_BRIEF = re.compile(r"(?:do not|don't|never|no)[ \t]+(?:open|create|raise)[
                          r"|repo[ \t]+pr[ \t]+cap|open-pr[ \t]+cap"
                          r"|no[ \t]+duplicate[ \t]+pr\b"
                          r"|push[ \t]+to[ \t]+(?:this|that|the same)[ \t]+pr\b", re.I)
+CI_WAIT = re.compile(
+    r"(?i)(?:"
+    r"(?:stop when|once|when) (?:the )?(?:ci|checks?) (?:is |are |goes )?(?:green|done|pass(?:es)?)"
+    r"|until (?:the )?(?:ci|checks?)(?: (?:is|are))?(?: green| pass(?:es)?)"
+    r"|(?:wait|watch)(?:ing)? (?:for |on |until )?(?:the )?(?:ci|checks?|pr checks)\b"
+    r"|read (?:the )?(?:ci|(?:pr )?checks)\b"
+    r"|gh pr checks\b"
+    r"|gh run watch\b"
+    r"|sleep[ \t]+\d+(?:\.\d+)?[ \t]*[smhd]?\b"
+    r")")
+CI_WAIT_NEGATED = re.compile(r"(?i)\b(?:do not|don't|not|never|no|without)[ \t]+(?:\w+[ \t]+){0,3}$")
 NON_WORK_FAILURES = ("lane", "silent", "environment", "no-pr")
 FAST_FAIL_BEFORE_WORK_S = 30
 POOLS_READ_TIMEOUT_S = 90
@@ -1049,11 +1061,8 @@ def shim_refusal(tail):
     match = SHIM_REFUSAL.search(str(tail))
     if not match:
         return None
-    if match.group(1):
-        return match.group(1)
-    if match.group(2):
-        return match.group(2)
-    return " ".join(match.group(3).split())
+    said = next((group for group in match.groups() if group), None)
+    return " ".join(said.split()) if said else None
 
 
 def last_words(tail):
@@ -1312,6 +1321,31 @@ def climb_reason(prior, cache_path):
 
 def brief_wants_pr(text):
     return NO_PR_BRIEF.search(text or "") is None
+
+
+def ci_wait_phrase(text):
+    for line in (text or "").splitlines():
+        for match in CI_WAIT.finditer(line):
+            if CI_WAIT_NEGATED.search(line[:match.start()]):
+                continue
+            return " ".join(match.group(0).split())
+    return None
+
+
+def ci_wait_refusal(path):
+    if os.environ.get("PLAN_PICK_ALLOW_CI_WAIT") == "1":
+        return None
+    try:
+        with open(path) as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    phrase = ci_wait_phrase(text)
+    if phrase is None:
+        return None
+    return (f"plan-pick: {os.path.basename(path)} asks the worker to wait for CI ({phrase!r}); "
+            f"workers push and exit; the parent waits. Remove that line, or set "
+            f"PLAN_PICK_ALLOW_CI_WAIT=1 for a reviewer run.")
 
 
 def rung_context(brief, launches_path, lease=None):
@@ -2602,7 +2636,7 @@ def main(argv):
                         help="skip lanes from VENDOR; repeat the flag or pass a comma list, so a review "
                              "comes from a different vendor than every author")
     parser.add_argument("--run", action="store_true",
-                        help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane; print the lane's output and what it did, and record a worker-shim refusal as environment")
+                        help="run the picked lane's command; on a 429, 402, quota or no output mark it limited and run the next lane; on a fast provider failure before work, run the next lane; print the lane's output and what it did, and record a worker-shim refusal as environment; refuse a brief that asks the worker to wait for CI (exit 2) unless PLAN_PICK_ALLOW_CI_WAIT=1")
     parser.add_argument("--read-credits", nargs="*", metavar="LANE",
                         help="read the credit balance of these lanes (all credit lanes when none) and store it")
     parser.add_argument("--set-credit", nargs=2, metavar=("LANE", "USD"),
@@ -2616,6 +2650,10 @@ def main(argv):
     own_checkout_warning(root)
     if args.run:
         refusal = own_checkout_run_refusal(root=root)
+        if refusal:
+            print(refusal, file=sys.stderr)
+            return 2
+        refusal = ci_wait_refusal(args.brief)
         if refusal:
             print(refusal, file=sys.stderr)
             return 2

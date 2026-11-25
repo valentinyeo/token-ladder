@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+import os
+import re
+import sys
+
+SHIM_DIR = os.path.dirname(os.path.realpath(__file__))
+LIMIT_S = 30
+UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+DURATION = re.compile(r"^\+?(\d+(?:\.\d+)?)([smhd]?)$")
+
+
+def real(name):
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder or os.path.realpath(folder) == SHIM_DIR:
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def seconds(args):
+    total = 0.0
+    for word in args:
+        match = DURATION.match(word)
+        if match:
+            total += float(match.group(1)) * UNITS[match.group(2)]
+    return total
+
+
+def main(argv):
+    if seconds(argv) > LIMIT_S:
+        print(f"worker shim refused: sleep {' '.join(argv)} (over {LIMIT_S}s; "
+              "workers push and exit, the parent waits)", file=sys.stderr)
+        return 3
+    program = real("sleep")
+    if program is None:
+        print("sleep is not installed on this host", file=sys.stderr)
+        return 127
+    os.execv(program, ["sleep", *argv])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
