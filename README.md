@@ -21,7 +21,7 @@ token-ladder pools --json
 token-ladder grok-set --pct 42 --resets-at 2026-11-01T12:00:00Z
 ```
 
-`pools --json` prints one object per pool: `used_pct`, `hours_left`, `resets_at`, `state` (`ON`, `WARN`, `OFF` or `unknown`) and `pace_ratio`. It is read-only and works offline against the last collected state. `pools` without `--json` prints the same states as one line each.
+`pools --json` prints one object per pool: `used_pct`, `hours_left`, `resets_at`, `state` (`ON`, `WARN`, `OFF` or `unknown`) and `pace_ratio`. Claude, Codex and Grok come from the last collected state; the Google pool runs `agy -p "/usage"` (no quota spent) and reuses that reading for two minutes. The Google object also carries `estimated`, `source`, `five_hour_used_pct`, `five_hour_resets_at` and a `gemini` and `claude_gpt` sub-object per model group; see [Antigravity quota](#antigravity-quota). `pools` without `--json` prints the same states as one line each, and marks an estimated percentage `(estimated)`.
 
 `grok-set` atomically writes `~/.local/state/token-ladder/grok.json` with `pct` (0-100), ISO `resets_at` and `updated_at=now`. The reader also accepts legacy `used_pct` in place of `pct`, but still requires ISO `updated_at`. A missing or malformed file, missing timestamp, expired reset, future update or update older than `grok_stale_hours: 3` makes Grok unknown.
 
@@ -133,13 +133,21 @@ Change the pin in `ci/lanes.json` and both paths follow.
 
 `plan-pick --plans` shows the `google` pool as shared with chats, with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. The `antigravity` worker lane reads this pool and burns it fully by default, as described under [Antigravity worker lane](#antigravity-worker-lane).
 
+### Antigravity quota
+
+`~/.local/bin/agy -p "/usage" --print-timeout 45s`, run in an empty temporary directory, is the quota source. It spends no quota and prints one tab-separated row per window: the model group, the window, the percentage remaining and the reset time. The `Gemini Models` group sets the pool: `used_pct` is 100 minus the weekly remaining, with that weekly reset, and the five-hour remaining sits beside it. The `Claude and GPT models` group is a separate Opus 5.5 / Sonnet 5.5 quota inside agy and is published under `claude_gpt`. Both groups appear in `pools.google` in `status.json` and in `token-ladder pools --json`.
+
+The reader reuses a reading for two minutes, then calls agy again, with a 60-second timeout. When agy is missing, fails or prints nothing the reader falls back to the local history count below and marks the pool `estimated`, leaving the quota unknown.
+
 The read-only fallback counts `timestamp` metadata in `~/.gemini/antigravity-cli/history.jsonl` from midnight UTC through now. These timestamps are milliseconds since the Unix epoch. The count covers local history entries, which can include slash commands, not model requests, tokens or quota consumption. Other devices, retries, tool calls and unrecorded chats are not counted. The reader never opens credential or token files, calls a quota endpoint, signs in, buys overages or runs an agent.
 
-Missing, unreadable, empty or wholly invalid history produces unknown usage. Malformed records and future timestamps are ignored. An older valid history produces zero local entries today, not proof of zero account usage. Quota percentage, limit, reset and pace remain unknown even when a local count is available. A missing Google reading never stops `plan-pick`.
+Missing, unreadable, empty or wholly invalid history produces unknown usage. Malformed records and future timestamps are ignored. An older valid history produces zero local entries today, not proof of zero account usage. A missing Google reading never stops `plan-pick`.
 
 ### Used up from the agy log
 
-The newest quota-related line in `~/.gemini/antigravity-cli/cli.log` for the current day decides one extra thing. When that line is a `RESOURCE_EXHAUSTED`, rate-limit or quota-exceeded error, `token-ladder pools` prints the pool as OFF and used up at the time of the line, and `plan-pick --plans` adds `Used up at <ISO time>.` with `used_up` and `used_up_at` in `--plans --json`. A later successful quota refresh, or no error, leaves today's behaviour alone. agy writes log times in local time; the reader shows them in UTC. Only `cli.log` is opened, never `antigravity-oauth-token` or any other file in that folder, and the reader still never runs `agy`.
+The meter only calls the pool used up on a real signal: a `/usage` reading of 0% remaining on the weekly or the five-hour window, which carries that window's reset, or a genuine provider quota error. When `/usage` answers, that reading decides and the log is not consulted.
+
+Otherwise the newest quota-related line in `~/.gemini/antigravity-cli/cli.log` for the current day decides. The error pattern needs `RESOURCE_EXHAUSTED`, `status 429`, `HTTP 429`, `code: 429`, `429 Too Many Requests`, rate-limit or quota-exceeded wording, so a bare number such as a log line's `length: 429` never matches. When that line is a real error, `token-ladder pools` prints the pool as OFF and used up at the time of the line, and `plan-pick --plans` adds `Used up at <ISO time>.` with `used_up` and `used_up_at` in `--plans --json`. A later successful quota refresh, or no error, leaves the pool unknown rather than used up. agy writes log times in local time; the reader shows them in UTC. Only `cli.log` is opened, never `antigravity-oauth-token` or any other file in that folder.
 
 ### Quota source investigation, 2026-11-22
 

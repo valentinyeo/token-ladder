@@ -37,6 +37,7 @@ MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
 PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
 FAST_FAIL_BEFORE_WORK_S = 30
+POOLS_READ_TIMEOUT_S = 90
 FAST_FAIL_4XX_SOURCE = "fast-fail 4xx"
 FAST_FAIL_4XX_KEY_SUFFIX = ":fast-fail-4xx"
 FAST_FAIL_REPEAT_WINDOW_S = 3600
@@ -587,17 +588,36 @@ def plan_line(plan, credit=None):
             f"Extra cost: {plan.get('extra_cost')}. Source: {plan.get('source')}.{state}")
     if plan.get("pool"):
         usage = plan.get("usage") or {}
-        used, limit, pace = (number(usage.get(key)) for key in ("used", "limit", "pace_ratio"))
+        used, used_pct, limit, pace = (number(usage.get(key))
+                                      for key in ("used", "used_pct", "limit", "pace_ratio"))
+        estimated = bool(usage.get("estimated"))
         line += f" Pool: {plan['pool']}."
         if plan.get("shared_with_chats"):
             line += " Shared with chats; the antigravity lane burns the full quota."
-        line += f" Used: {used:g}" if used is not None else " Used: unknown"
-        if usage.get("unit"):
-            line += f" {usage['unit']}"
-        line += f". Limit: {limit:g}" if limit is not None else ". Limit: unknown"
+        if used_pct is not None:
+            line += f" Used: {used_pct:g}%" + (" (estimated)" if estimated else "")
+        elif used is not None:
+            line += f" Used: {used:g}"
+            if usage.get("unit"):
+                line += f" {usage['unit']}"
+            line += ", estimated" if estimated else ""
+        else:
+            line += " Used: unknown"
+        if limit is not None:
+            line += f". Limit: {limit:g}"
+        else:
+            line += ". Limit: 100%" if used_pct is not None else ". Limit: unknown"
         line += f". Pace: {pace:.2f}x." if pace is not None else ". Pace: unknown."
+        for key, label in (("gemini", "Gemini"), ("claude_gpt", "Claude and GPT")):
+            group = usage.get(key)
+            weekly = number(group.get("weekly_remaining_pct")) if isinstance(group, dict) else None
+            if weekly is None:
+                continue
+            five = number(group.get("five_hour_remaining_pct"))
+            line += f" {label}: {weekly:g}% weekly left" + (f", {five:g}% 5h left." if five is not None else ".")
         if usage.get("used_up") and usage.get("used_up_at"):
-            line += f" Used up at {usage['used_up_at']}."
+            line += (f" Used up (provider quota error at {usage['used_up_at']})." if estimated
+                     else f" Used up at {usage['used_up_at']}.")
         if usage.get("note"):
             line += f" {usage['note']}."
     allowance = number(plan.get("usd_per_cycle"))
@@ -2156,7 +2176,7 @@ def read_pools(source):
         with open(source) as fh:
             return json.load(fh)
     out = subprocess.run([sys.executable, os.path.join(HERE, "token-ladder"), "pools", "--json"],
-                         capture_output=True, text=True, timeout=20, check=True).stdout
+                         capture_output=True, text=True, timeout=POOLS_READ_TIMEOUT_S, check=True).stdout
     return json.loads(out)
 
 
