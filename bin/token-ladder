@@ -987,7 +987,7 @@ def agy_pool(groups, now, cfg):
 def read_google(now):
     pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
             "pace_ratio": None, "chat_only": False, "shared_with_chats": True, "used": None, "limit": None,
-            "unit": "local history entries today (UTC)", "estimated": True,
+            "unit": "local history entries today (UTC)",
             "source": "agy local history timestamps; Antigravity quota unavailable"}
     start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     used, seen = 0, False
@@ -1011,6 +1011,7 @@ def read_google(now):
     if groups.get("gemini"):
         pool.update(agy_pool(groups, now, load_config()))
         return pool
+    pool["estimated"] = True
     quota = google_quota_used_up(now)
     if quota:
         pool.update(quota)
