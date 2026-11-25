@@ -423,3 +423,143 @@ class RungReportTests(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertIn("jobs=0 passes=0 unknowns=0 errors=0", run.stdout)
         self.assertIn("legacy_missing_finish=1", run.stdout)
+
+
+AGY_PR = "https://github.com/hypertask-ai/hypertask/pull/3848"
+
+
+def antigravity_timeout_output():
+    stream = (Path(REPO) / "tests" / "fixtures" / "antigravity-print-timeout.jsonl").read_text()
+    return pp.measured_output(io.StringIO(stream), stream)
+
+
+class RungOutcomeRecordTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.brief = self.root / "brief.txt"
+        self.log = str(self.root / "launches.jsonl")
+        self.limits = str(self.root / "limits.json")
+        self.cfg = {"rungs": {rung: [{"lane": "g"}] for rung in pp.RUNGS},
+                    "lanes": [{"lane": "g", "command": "echo ran-g"}]}
+
+    def context(self, text):
+        self.brief.write_text(text)
+        return pp.rung_context(str(self.brief), self.log)
+
+    def run_lane(self, ctx, answer, code=0, elapsed=2705.0, work=False):
+        runner = mock.Mock(return_value=(code, answer, elapsed, work))
+        return pp.run_lanes(self.cfg["lanes"], {}, self.cfg, 1.1, rung=ctx, runner=runner,
+                            limits_path=self.limits, launches_path=self.log, now=100, say=lambda _: None)
+
+    def finish(self):
+        rows = [json.loads(line) for line in Path(self.log).read_text().splitlines()]
+        return rows[-1]
+
+    def attempt(self, ctx):
+        return json.loads((self.root / "rung-attempts.json").read_text())[ctx["job"]]
+
+    def report(self, rows, verdicts=None, last=50):
+        Path(self.log).write_text("".join(json.dumps(r) + "\n" for r in rows))
+        return pp.rung_report(self.log, last, lambda pr: (verdicts or {}).get(pr))
+
+    def test_antigravity_timeout_keeps_its_pr_and_is_a_lane_failure(self):
+        output = antigravity_timeout_output()
+        self.assertEqual(output.pr_url, AGY_PR)
+        self.assertIsNone(pp.limit_kind(3, output))
+        self.assertIsNone(pp.fast_fail_kind(3, output, 2705.0, False))
+        self.assertTrue(pp.LANE_TIMEOUT.search(pp.analyze_output(output)["error"]))
+
+    def test_a_lane_timeout_with_its_pr_is_not_a_work_failure_and_does_not_climb(self):
+        ctx = self.context("Rung: hard\nOpen one PR.\n")
+        self.assertEqual(self.run_lane(ctx, antigravity_timeout_output(), code=3), 3)
+        finish = self.finish()
+        self.assertEqual((finish["failure"], finish["pr_url"]), ("lane", AGY_PR))
+        self.assertEqual(finish["pr_expected"], True)
+        self.assertEqual(self.attempt(ctx)["failure"], "lane")
+        self.assertEqual(self.context("Rung: hard\nOpen one PR.\n")["rung"], "hard")
+        self.assertEqual(self.context("Rung: hard\nOpen one PR.\n")["rung_source"], "brief line")
+
+    def test_a_brief_that_asks_for_no_pr_records_no_pr_and_does_not_climb(self):
+        brief = "Rung: hard\nPUSH the branch, but do NOT open a PR: the repo is over its open-PR cap.\n"
+        ctx = self.context(brief)
+        self.assertEqual(ctx["pr_expected"], False)
+        answer = pp.measured_output(io.StringIO(json.dumps({"type": "result", "text": "Pushed one commit; no PR opened."})),
+                                    "tail")
+        self.assertEqual(self.run_lane(ctx, answer, elapsed=1827.0, work=True), 0)
+        self.assertEqual((self.finish()["failure"], self.finish()["pr_expected"]), ("no-pr", False))
+        again = self.context(brief)
+        self.assertEqual((again["rung"], again["rung_source"]), ("hard", "brief line"))
+
+    def test_a_brief_that_asks_for_a_pr_still_climbs_when_none_appears(self):
+        ctx = self.context("Rung: medium\nHTPR-1: One PR. Auto-merge off. Do not merge.\n")
+        self.assertEqual(ctx["pr_expected"], True)
+        answer = pp.measured_output(io.StringIO(json.dumps({"type": "result", "text": "Ran out of time."})), "tail")
+        self.assertEqual(self.run_lane(ctx, answer, elapsed=700.0, work=True), 0)
+        self.assertEqual(self.finish()["failure"], "work")
+        self.assertEqual(self.context("Rung: medium\nHTPR-1: One PR.\n")["rung"], "hard")
+
+    def test_real_brief_lines_that_mean_no_new_pr(self):
+        for line in ("Do NOT open a PR (repo PR cap); the fix ships inside PR 1394.",
+                     "PUSH the branch, but do NOT open a PR: the repo is over its open-PR cap.",
+                     "Push to that same PR (never a new PR, never force-push).",
+                     "Use existing PR only, no duplicate PR.",
+                     "Do not open a new PR (repo policy).",
+                     "Push to this PR; never open a second one.",
+                     "Take over and finish EXISTING PR https://github.com/a/b/pull/1351"):
+            with self.subTest(line=line):
+                self.assertFalse(pp.brief_wants_pr(line))
+        for line in ("HTPR-9684: One PR. Auto-merge off. Do not merge.",
+                     "9. ONE PR \"HTPR-9685 [IMPROVE] Hypertask-paid AI burns the free Claude credit first\".",
+                     "11. Open ONE PR to master titled \"MUBO-535: Switch every chat\".",
+                     "Final message: one line: PR <url> | head <sha> | checks <state>.",
+                     "Rung: hard"):
+            with self.subTest(line=line):
+                self.assertTrue(pp.brief_wants_pr(line))
+
+    def test_a_lane_timeout_does_not_mark_the_lane_limited(self):
+        ctx = self.context("Rung: hard\nOpen one PR.\n")
+        self.run_lane(ctx, antigravity_timeout_output(), code=3)
+        self.assertFalse(self.root.joinpath("limits.json").exists())
+
+    def test_lane_and_no_pr_finishes_leave_the_first_pass_rate_alone(self):
+        rows = [
+            {"event": "start", "launch_id": "no-pr", "at": 10, "lane": "codex", "rung": "hard",
+             "model": "gpt-6.1-sol", "job": "ticket:MUBO-552", "pr_expected": False},
+            {"event": "finish", "launch_id": "no-pr", "finished_at": 11, "exit_code": 0, "pr_url": None,
+             "failure": "no-pr", "pr_expected": False, "cost_usd": 0.38},
+            {"event": "start", "launch_id": "timeout", "at": 20, "lane": "antigravity", "rung": "hard",
+             "model": "gemini-4-neon-high", "job": "ticket:HTPR-9685", "pr_expected": True},
+            {"event": "finish", "launch_id": "timeout", "finished_at": 21, "exit_code": 3, "pr_url": AGY_PR,
+             "failure": "lane", "pr_expected": True, "cost_usd": None},
+            {"event": "start", "launch_id": "work", "at": 30, "lane": "codex", "rung": "hard",
+             "model": "gpt-6.1-sol", "job": "ticket:HTPR-9684", "pr_expected": True},
+            {"event": "finish", "launch_id": "work", "finished_at": 31, "exit_code": 0, "pr_url": None,
+             "failure": "work", "pr_expected": True, "cost_usd": 0.5}]
+        report = self.report(rows, {})
+        self.assertEqual((report["jobs"], report["errors"], report["not_work"], report["hard_failed"]), (3, 1, 2, 1))
+        self.assertEqual(sum(group["known"] for group in report["groups"]), 1)
+        self.assertEqual(report["passes"], 0)
+        self.assertIn("not_work=2", "\n".join(pp.rung_report_lines(report)))
+
+    def test_a_finish_without_pr_expected_metadata_still_counts_as_work(self):
+        rows = [
+            {"event": "start", "launch_id": "old", "at": 10, "lane": "codex", "rung": "medium",
+             "model": "gpt-6.1-sol"},
+            {"event": "finish", "launch_id": "old", "finished_at": 11, "exit_code": 0, "pr_url": None,
+             "cost_usd": 0.2}]
+        report = self.report(rows, {})
+        self.assertEqual((report["errors"], report["not_work"], report["hard_failed"]), (1, 0, 0))
+        self.assertEqual(report["groups"][0]["known"], 1)
+
+    def test_a_finish_is_stamped_when_it_ended(self):
+        ctx = {"rung": "medium", "state_path": str(Path(self.tmp.name, "rung-attempts.json")), "job": "job"}
+        lane = {"lane": "g", "command": "echo hi"}
+        output = pp.RunOutput("tail")
+        output.pr_url = "https://github.com/a/b/pull/31"
+        output.tokens = None
+        with mock.patch.object(pp.time, "time", return_value=5000.0):
+            pp.launch_finish(self.log, "later", ctx, lane, 0, output, {})
+        row = json.loads(Path(self.log).read_text().splitlines()[0])
+        self.assertEqual(row["finished_at"], 5000.0)
