@@ -523,9 +523,11 @@ in `ci/lanes.json` when the matching key env var is set:
 `cursor-agent` headless; the composite action installs it on the runner when
 needed.
 On payment or quota errors, rate limits, missing models (`404`, `408`, `425`),
-5xx, timeouts or empty answers it falls through to the next lane; a `400`
-request-body error stops the run. Each skip is logged on stderr, the provider
-JSON goes on stdout, and exit `3` means every lane failed.
+5xx, timeouts or empty answers it falls through to the next lane. A `400` that
+reports no credit or `no_providers_available` in its error body also falls
+through; any other `400` request-body error stops the run. Each skip is logged
+on stderr with the status and a short reason (`no credit`, `no provider`), the
+provider JSON goes on stdout, and exit `3` means every lane failed.
 
 ```yaml
 - uses: valentinyeo/token-ladder/.github/actions/ladder-call@main

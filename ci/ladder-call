@@ -16,6 +16,9 @@ REPO = Path(__file__).resolve().parent
 DEFAULT_LANES = REPO / 'lanes.json'
 SKIP_HTTP = {401, 402, 403, 404, 408, 425, 429}
 IMAGE_SKIP_HTTP = {400, 415, 422}
+ERROR_BODY_LIMIT = 4096
+NO_PROVIDER_MARKERS = ('no_providers_available', 'no providers available', 'no provider available')
+CREDIT_MARKERS = ('credit', 'balance', 'billing', 'quota', 'insufficient funds', 'insufficient_funds', 'insufficient credit')
 IMAGE_MEDIA = {'.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
 MAX_IMAGES = 8
 MAX_IMAGE_BYTES = 2 * 1024 * 1024
@@ -328,6 +331,25 @@ def decide_request(answer):
     }
 
 
+def error_body_text(exc):
+    try:
+        raw = exc.read(ERROR_BODY_LIMIT)
+    except (AttributeError, OSError, ValueError):
+        return ''
+    return raw.decode('utf-8', 'replace').lower() if raw else ''
+
+
+def lane_skip_reason(exc):
+    text = error_body_text(exc)
+    if not text:
+        return None
+    if any(marker in text for marker in NO_PROVIDER_MARKERS):
+        return 'no provider'
+    if any(marker in text for marker in CREDIT_MARKERS):
+        return 'no credit'
+    return None
+
+
 def attempt_lane(lane, key, body, images=False):
     try:
         if lane.get('kind') == 'cursor':
@@ -338,6 +360,9 @@ def attempt_lane(lane, key, body, images=False):
             return None, f'{exc.code} with images'
         if exc.code in SKIP_HTTP or exc.code >= 500:
             return None, skip_reason(lane, exc=exc)
+        reason = lane_skip_reason(exc)
+        if reason:
+            return None, f'{exc.code} {reason}'
         print(
             f'ladder-call: lane {lane["name"]} failed: HTTP {exc.code}',
             file=sys.stderr,
