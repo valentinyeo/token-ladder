@@ -8,7 +8,7 @@ Subcommands:
   grok-set       record Grok Bot usage with a fresh timestamp
   route          choose the local or cloud command for a repository
   mode X         set an override: claude | codex | auto
-  hook-prompt    UserPromptSubmit hook: print pool states and role instructions
+  hook-prompt    UserPromptSubmit hook: print one line of plan usage, or --account for one plan's push level
   hook-bash      PreToolUse(Bash) hook: refuse disallowed models and paid fallbacks
   hook-agent     PreToolUse(Agent) hook: respect the Claude pool
 """
@@ -1724,9 +1724,172 @@ th{{color:#888;font-weight:500}}</style></head><body>
 </body></html>"""
 
 
-def hook_prompt():
+HOOK_PLAN_SHOWN = "hook-plan-shown.json"
+HOOK_PLAN_EVERY_S = 3600
+HOOK_PLAN_KEEP_S = 7 * 86400
+PLAN_PART_VENDORS = ("anthropic", "openai", "google", "opencode", "vercel", "commandcode")
+COMMANDCODE_CREDITS = 70
+
+
+def num_value(value):
     try:
-        sid = json.loads(sys.stdin.read() or "{}").get("session_id") if not sys.stdin.isatty() else None
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+def age_text(seconds):
+    minutes = int(max(0.0, seconds) // 60)
+    if minutes < 60:
+        return f"{minutes} min"
+    hours, rem = divmod(minutes, 60)
+    return f"{hours} h {rem} min" if rem else f"{hours} h"
+
+
+def hook_plan_state_path():
+    return os.path.join(HOME, ".local/state/token-ladder", HOOK_PLAN_SHOWN)
+
+
+def hook_plan_shown(path=None):
+    try:
+        with open(path or hook_plan_state_path()) as fh:
+            shown = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return shown if isinstance(shown, dict) else {}
+
+
+def hook_plan_due(sid, now=None, path=None):
+    if not sid:
+        return True
+    now = time.time() if now is None else now
+    last = num_value(hook_plan_shown(path).get(sid))
+    return last is None or now - last >= HOOK_PLAN_EVERY_S
+
+
+def hook_plan_record(sid, now=None, path=None):
+    if not sid:
+        return
+    now = time.time() if now is None else now
+    path = path or hook_plan_state_path()
+    shown = {key: num_value(value) for key, value in hook_plan_shown(path).items()
+             if num_value(value) is not None and now - num_value(value) <= HOOK_PLAN_KEEP_S}
+    shown[sid] = now
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(shown, fh)
+    os.replace(tmp, path)
+
+
+def plan_credit_readings(path=None):
+    try:
+        with open(path or os.path.join(HOME, ".local/state/token-ladder", "lane-credits.json")) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def plan_week_part(label, pool, week):
+    pool = pool if isinstance(pool, dict) else {}
+    week = week if isinstance(week, dict) else {}
+    used = num_value(pool.get("used_pct"))
+    if used is None:
+        used = num_value(week.get("used"))
+    if used is None:
+        return None
+    return f"{label} {used:g}% wk" + (" est" if pool.get("estimated") else "")
+
+
+def plan_google_part(pool):
+    pool = pool if isinstance(pool, dict) else {}
+    gemini = pool.get("gemini") if isinstance(pool.get("gemini"), dict) else {}
+    weekly_left = num_value(gemini.get("weekly_remaining_pct"))
+    used = 100 - weekly_left if weekly_left is not None else num_value(pool.get("used_pct"))
+    if used is None:
+        return None
+    five_left = num_value(gemini.get("five_hour_remaining_pct"))
+    five = 100 - five_left if five_left is not None else num_value(pool.get("five_hour_used_pct"))
+    part = f"Antigravity Gemini {used:g}% wk"
+    if five is not None:
+        part += f", 5h {five:g}%"
+    return part + (" est" if pool.get("estimated") else "")
+
+
+def plan_credit_part(plan, entry):
+    entry = entry if isinstance(entry, dict) else {}
+    usd = num_value(entry.get("usd"))
+    credits = num_value(entry.get("credits"))
+    vendor = plan.get("vendor")
+    if vendor == "opencode":
+        return f"OpenCode credit ${usd:.2f}" if usd is not None else None
+    if vendor == "vercel":
+        if usd is None:
+            return None
+        cycle = num_value(plan.get("usd_per_cycle"))
+        if cycle is None:
+            return f"Vercel Token Pass ${usd:.0f} left"
+        return f"Vercel Token Pass ${min(usd, cycle):.0f} of ${cycle:g}"
+    if vendor == "commandcode":
+        return f"CommandCode {round(COMMANDCODE_CREDITS - credits, 1):g}% mo" if credits is not None else None
+    return None
+
+
+def plan_usage_parts(s, credits=None):
+    credits = plan_credit_readings() if credits is None else credits
+    cfg = s.get("config") if isinstance(s.get("config"), dict) else {}
+    plans = cfg.get("plans") if isinstance(cfg.get("plans"), list) else []
+    pools = s.get("pools") if isinstance(s.get("pools"), dict) else {}
+    labels = {"anthropic": ("Claude", "claude"), "openai": ("Codex", "codex")}
+    parts = []
+    seen = set()
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        vendor = plan.get("vendor")
+        if vendor not in PLAN_PART_VENDORS or vendor in seen:
+            continue
+        seen.add(vendor)
+        if vendor in labels:
+            label, key = labels[vendor]
+            read = s.get(key) if isinstance(s.get(key), dict) else {}
+            part = plan_week_part(label, pools.get(key), read.get("week"))
+        elif vendor == "google":
+            part = plan_google_part(pools.get("google"))
+        else:
+            entry = credits.get(vendor) if isinstance(credits.get(vendor), dict) else {}
+            part = plan_credit_part(plan, entry)
+        if part:
+            parts.append(part)
+    return parts
+
+
+def plan_usage_line(s, credits=None, now=None):
+    now = time.time() if now is None else now
+    parts = plan_usage_parts(s, credits)
+    if not parts:
+        return None
+    age = num_value(s.get("ts"))
+    head = "Plan usage (token-ladder)" if age is None else f"Plan usage (token-ladder, {age_text(now - age)} old)"
+    return f"{head}: " + " \u00b7 ".join(parts) + ". Source: plan-pick --plans."
+
+
+def hook_session_id():
+    if sys.stdin.isatty():
+        return None
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except (OSError, ValueError):
+        return None
+    sid = payload.get("session_id") if isinstance(payload, dict) else None
+    return sid if isinstance(sid, str) and sid else None
+
+
+def hook_prompt():
+    sid = hook_session_id()
+    try:
         if sid and sid in open(os.path.expanduser("~/.local/state/alert-mute/sessions")).read().split():
             return
     except (OSError, ValueError):
@@ -1737,6 +1900,17 @@ def hook_prompt():
         return
     if "--account" in sys.argv:
         print(token_max_line(s, sys.argv[sys.argv.index("--account") + 1]))
+        return
+    try:
+        if not hook_plan_due(sid):
+            return
+        line = plan_usage_line(s)
+        if not line:
+            return
+        print(line)
+        hook_plan_record(sid)
+    except Exception:
+        return
 
 
 def token_max_line(s, account_id):
