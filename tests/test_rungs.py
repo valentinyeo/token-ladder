@@ -498,7 +498,7 @@ class RungOutcomeRecordTests(unittest.TestCase):
         answer = pp.measured_output(io.StringIO(json.dumps({"type": "result", "text": "Ran out of time."})), "tail")
         self.assertEqual(self.run_lane(ctx, answer, elapsed=700.0, work=True), 0)
         self.assertEqual(self.finish()["failure"], "work")
-        self.assertEqual(self.context("Rung: medium\nHTPR-1: One PR.\n")["rung"], "hard")
+        self.assertEqual(self.context("Rung: medium\nHTPR-1: One PR. Auto-merge off. Do not merge.\n")["rung"], "hard")
 
     def test_real_brief_lines_that_mean_no_new_pr(self):
         for line in ("Do NOT open a PR (repo PR cap); the fix ships inside PR 1394.",
