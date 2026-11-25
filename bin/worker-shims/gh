@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+SHIM_DIR = os.path.dirname(os.path.realpath(__file__))
+
+
+def real(name):
+    for folder in os.environ.get("PATH", "").split(os.pathsep):
+        if not folder or os.path.realpath(folder) == SHIM_DIR:
+            continue
+        path = os.path.join(folder, name)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def waiting_form(argv):
+    words = [word.split("=", 1)[0] for word in argv]
+    if words[:2] == ["pr", "checks"] and ("--watch" in words or "-w" in words):
+        return "pr checks --watch"
+    if words[:2] == ["run", "watch"]:
+        return "run watch"
+    return None
+
+
+def main(argv):
+    form = waiting_form(argv)
+    if form:
+        print(f"worker shim refused: gh {' '.join(argv)} ({form} waits on CI; "
+              "workers push and exit, the parent waits)", file=sys.stderr)
+        return 3
+    program = real("gh")
+    if program is None:
+        print("gh is not installed on this host", file=sys.stderr)
+        return 127
+    os.execv(program, ["gh", *argv])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

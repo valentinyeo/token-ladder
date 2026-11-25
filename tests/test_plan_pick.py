@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -2205,6 +2206,7 @@ class ShimRefusalTests(unittest.TestCase):
     def test_plan_picks_own_source_is_no_refusal(self):
         source = Path(REPO, "bin/plan-pick").read_text()
         self.assertIn("plan-pick worker:", source)
+        self.assertIn("PLAN_PICK_ALLOW_CI_WAIT", source)
         self.assertIsNone(pp.shim_refusal(source))
 
     def test_guard_and_missing_host_refusals_still_match(self):
@@ -2214,6 +2216,105 @@ class ShimRefusalTests(unittest.TestCase):
     def test_worker_refusal_keeps_its_words(self):
         self.assertEqual(pp.shim_refusal("plan-pick worker: gradle is not allowed"),
                          "gradle is not allowed")
+
+    def test_worker_shim_refused_line_keeps_the_command(self):
+        line = "worker shim refused: sleep 240 (over 30s; workers push and exit, the parent waits)"
+        self.assertEqual(pp.shim_refusal(line),
+                         "sleep 240 (over 30s; workers push and exit, the parent waits)")
+
+
+class CiWaitBriefTests(unittest.TestCase):
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.repo = Path(tempfile.mkdtemp())
+        (self.repo / "bin").mkdir()
+        (self.repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        (self.repo / "config.json").write_text(json.dumps(
+            {"lanes": [{"lane": "a", "pool": None, "command": "echo worker-done"}]}))
+        self.pools = Path(self.home, "pools.json")
+        self.pools.write_text("{}")
+        self.launches = Path(self.home, "launches.jsonl")
+
+    def cli(self, brief, *args, extra=None):
+        (self.repo / "brief.txt").write_text(brief)
+        env = {"HOME": self.home, "PATH": "/usr/bin:/bin",
+               "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG,
+               "PLAN_PICK_LAUNCHES": str(self.launches),
+               "VPS_STATE_BIN": str(Path(self.home, "no-vps-state"))}
+        env.update(extra or {})
+        return subprocess.run([sys.executable, str(self.repo / "bin" / "plan-pick"),
+                               "--pools", str(self.pools), *args],
+                              cwd=self.repo, capture_output=True, text=True, env=env, timeout=30)
+
+    def refused(self, brief):
+        out = self.cli(brief, "--run")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertEqual(out.stdout, "")
+        lines = out.stderr.strip().splitlines()
+        self.assertEqual(len(lines), 1, out.stderr)
+        self.assertIn("workers push and exit; the parent waits", lines[0])
+        self.assertIn("PLAN_PICK_ALLOW_CI_WAIT=1", lines[0])
+        self.assertIn("brief.txt", lines[0])
+        self.assertFalse(self.launches.exists(), "nothing launched")
+        return lines[0]
+
+    def test_real_brief_lines_that_ask_for_waiting_are_refused(self):
+        for phrase, line in (("read CI", "Push and read CI, then report."),
+                             ("Stop when CI is green", "Stop when CI is green and the verifier has run."),
+                             ("sleep 240", "sleep 240; gh pr checks")):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), self.refused(f"Rung: medium\n{line}\n").lower())
+
+    def test_every_waiting_phrase_is_named_and_refused(self):
+        for phrase in ("wait for CI", "watch CI", "until checks pass", "read the PR checks", "gh pr checks"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase.lower(), self.refused(f"Rung: medium\nPush, open the PR, then {phrase}.\n").lower())
+
+    def test_a_brief_that_forbids_waiting_runs_the_worker(self):
+        out = self.cli("Rung: medium\nPush, open the PR, then exit. Do not wait on CI.\n", "--run")
+        self.assertEqual((out.returncode, out.stdout), (0, "worker-done\n"), out.stderr)
+
+    def test_reviewer_escape_is_the_only_way_a_waiting_brief_launches(self):
+        out = self.cli("Rung: medium\nStop when CI is green.\n", "--run",
+                       extra={"PLAN_PICK_ALLOW_CI_WAIT": "1"})
+        self.assertEqual((out.returncode, out.stdout), (0, "worker-done\n"), out.stderr)
+
+    def test_the_phrases_are_a_function_of_the_brief_text(self):
+        self.assertEqual(pp.ci_wait_phrase("Stop when CI is green and the verifier has run"),
+                         "Stop when CI is green")
+        self.assertEqual(pp.ci_wait_phrase("sleep 240; gh pr checks"), "sleep 240")
+        self.assertEqual(pp.ci_wait_phrase("Push and read CI"), "read CI")
+        self.assertIsNone(pp.ci_wait_phrase("Do not wait for CI; push, open the PR, then exit"))
+        self.assertIsNone(pp.ci_wait_phrase("Push, open the PR, then exit"))
+
+
+class SleepingWorkerTests(unittest.TestCase):
+    def test_a_sleeping_worker_is_recorded_as_environment(self):
+        home = tempfile.mkdtemp()
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text((Path(REPO) / "bin" / "plan-pick").read_text())
+        shutil.copytree(Path(REPO) / "bin" / "worker-shims", repo / "bin" / "worker-shims")
+        (repo / "config.json").write_text(json.dumps({
+            "rungs": {"light": [{"lane": "a"}], "medium": [{"lane": "a"}], "hard": [{"lane": "a"}]},
+            "lanes": [{"lane": "a", "pool": None, "command": "sleep 240"}]}))
+        (repo / "brief.txt").write_text("Rung: medium\nPush, open the PR, then exit.\n")
+        pools = Path(home, "pools.json")
+        pools.write_text("{}")
+        launches = Path(home, "launches.jsonl")
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"),
+                              "--pools", str(pools), "--run"],
+                             cwd=repo, capture_output=True, text=True, timeout=60,
+                             env={"HOME": home, "PATH": "/usr/bin:/bin",
+                                  "TOKEN_LADDER_LOCAL_CONFIG": ISOLATED_LOCAL_CONFIG,
+                                  "PLAN_PICK_LAUNCHES": str(launches),
+                                  "VPS_STATE_BIN": str(Path(home, "no-vps-state"))})
+        self.assertEqual(out.returncode, 1, out.stderr)
+        self.assertIn("worker shim refused: sleep 240", out.stdout)
+        self.assertIn("worker-shim refusal (sleep 240", out.stderr)
+        attempt = next(iter(json.loads(Path(home, "rung-attempts.json").read_text()).values()))
+        self.assertEqual(attempt["failure"], "environment")
+        self.assertTrue(attempt["refused"].startswith("sleep 240"), attempt)
 
 
 class ServerHoldTests(unittest.TestCase):
