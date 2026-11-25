@@ -1800,14 +1800,28 @@ def save_credits(entries, path):
     return data
 
 
-def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers=BALANCES):
+def credit_limits(cfg=None):
+    cfg = load_config() if cfg is None else cfg
+    limits = {}
+    for plan in plans_from(cfg if isinstance(cfg, dict) else {}):
+        name, limit = plan.get("credit"), number(plan.get("usd_per_cycle"))
+        if isinstance(name, str) and limit is not None and limit > 0:
+            limits[name] = limit
+    return limits
+
+
+def refresh_credits(names, now, path=CREDITS, get=http_json, key=pi_key, readers=BALANCES, limits=None):
+    limits = credit_limits() if limits is None else limits
     updates = {}
     for name in names:
         reader = readers.get(name)
         if not reader:
             continue
         try:
-            updates[name] = dict(reading(reader, get, key), at=now)
+            entry = dict(reading(reader, get, key), at=now)
+            if name in limits:
+                entry["limit_usd"] = limits[name]
+            updates[name] = entry
         except Exception as exc:
             print(f"plan-pick: cannot read {name} credit: {type(exc).__name__}", file=sys.stderr)
     return save_credits(updates, path)

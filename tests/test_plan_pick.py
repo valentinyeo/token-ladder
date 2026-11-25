@@ -823,6 +823,16 @@ class PassCreditTests(unittest.TestCase):
         self.assertEqual(data["vercel"]["resets_at"], "2026-12-05T08:00:00.000Z")
         self.assertEqual(data["vercel"]["at"], T)
 
+    def test_the_cycle_allowance_is_published_for_other_tools(self):
+        data = pp.refresh_credits(["vercel"], T, self.path, self.api, lambda p: "k")
+        self.assertEqual(data["vercel"]["limit_usd"], 110)
+        self.assertEqual(pp.read_credits(self.path)["vercel"]["limit_usd"], 110)
+
+    def test_a_plan_without_a_cycle_allowance_publishes_no_limit(self):
+        limits = pp.credit_limits({"plans": [{"name": "x", "credit": "vercel"}]})
+        data = pp.refresh_credits(["vercel"], T, self.path, self.api, lambda p: "k", limits=limits)
+        self.assertNotIn("limit_usd", data["vercel"])
+
     def test_new_spend_is_rounded_without_pinning_the_dashboard_snapshot(self):
         def api(url, key):
             response = self.api(url, key)

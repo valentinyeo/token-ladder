@@ -131,6 +131,8 @@ A three-output-token chat confirmed `https://api.commandcode.ai/provider/v1` and
 
 The Vercel AI Gateway lane spends Token Pass credit only, and the OpenRouter lane uses one upstream provider, so neither can fall to Baseten when its credit runs low.
 The gateway carries two lanes, both pinned to Token Pass: the DeepSeek lane and, right after it, a `zai/glm-5.3-flash` judge lane. The Token Pass already covers that model, so the judge adds no cost, and a DeepSeek-authored PR still has a judge from another family.
+The Token Pass cycle total is `usd_per_cycle` on the vercel plan in `config.json` `plans`: $110, set by VSTA-126. `/v1/credits` returns `token_pass.remaining` and `token_pass.resets_at` only, with no total or limit field, so `config.json` is the one number. Every `plan-pick` credit refresh publishes it as `limit_usd` on the `vercel` entry in `~/.local/state/token-ladder/lane-credits.json`, and other tools read that instead of keeping their own copy.
+
 `ci/lanes.json` holds both pins: `gateway` on the gateway lanes, `provider` on the OpenRouter lane.
 `ci/ladder-call` sends them as `providerOptions.gateway` and `provider` in the request body.
 The two pi lanes on those providers load `tools/pi-lane-pins.mjs` with `-e`, and that extension writes the same two fields from the same file through pi's `before_provider_request` hook.
