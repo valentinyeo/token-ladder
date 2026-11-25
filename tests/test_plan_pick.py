@@ -1885,6 +1885,35 @@ class CommandTests(unittest.TestCase):
         self.assertIn("Pool: google. Shared with chats; the antigravity lane burns the full quota. "
                       "Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
 
+    def test_plans_prints_the_agy_percentage_and_both_groups(self):
+        usage = {"state": "ON", "used_pct": 39.0, "used": 3, "limit": None, "pace_ratio": 0.5,
+                 "unit": "local history entries today (UTC)", "shared_with_chats": True,
+                 "estimated": False, "source": "agy /usage",
+                 "gemini": {"weekly_remaining_pct": 61, "five_hour_remaining_pct": 84},
+                 "claude_gpt": {"weekly_remaining_pct": 100, "five_hour_remaining_pct": 100}}
+        out = self.run_cli({"google": usage}, "--plans")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Used: 39%. Limit: 100%. Pace: 0.50x.", out.stdout)
+        self.assertIn("Gemini: 61% weekly left, 84% 5h left.", out.stdout)
+        self.assertIn("Claude and GPT: 100% weekly left, 100% 5h left.", out.stdout)
+        self.assertNotIn("estimated", out.stdout)
+        self.assertNotIn("Used up", out.stdout)
+
+    def test_plans_marks_an_estimated_number(self):
+        usage = {"state": "unknown", "used": 3, "limit": None, "pace_ratio": None,
+                 "unit": "local history entries today (UTC)", "shared_with_chats": True,
+                 "estimated": True}
+        out = self.run_cli({"google": usage}, "--plans")
+        self.assertIn("Used: 3 local history entries today (UTC), estimated.", out.stdout)
+
+    def test_plans_never_names_a_guessed_used_up_time(self):
+        usage = {"state": "OFF", "used": 3, "limit": None, "pace_ratio": None,
+                 "unit": "local history entries today (UTC)", "shared_with_chats": True,
+                 "estimated": True, "used_up": True, "used_up_at": "2026-11-22T09:05:00Z"}
+        out = self.run_cli({"google": usage}, "--plans")
+        self.assertNotIn("Used up at", out.stdout)
+        self.assertIn("Used up (provider quota error at 2026-11-22T09:05:00Z).", out.stdout)
+
     def test_limited_unknown_lane_fails(self):
         out = self.cli("--limited", "baseten")
         self.assertEqual(out.returncode, 2)

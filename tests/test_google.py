@@ -1,6 +1,7 @@
 import builtins
 import json
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -16,6 +17,15 @@ REFRESH = "I1122 09:00:00.000000      47 quota_manager.go:45] doRefreshQuota: st
 RECOVERED = "I1122 09:20:00.000000      47 quota_manager.go:61] doRefreshQuota: refresh complete, quota available"
 EXHAUSTED = ("E1122 09:05:00.123456      47 quota_manager.go:120] doRefreshQuota: refresh failed: "
              "rpc error: code = ResourceExhausted desc = quota exceeded for gemini-3.8-flash")
+LENGTH_429 = ("I1125 11:38:01.554922 6876 llm_monitor.go:636] LLM Monitor sir_flash_lite: "
+              "Trajectory formatted, length: 429")
+USAGE_NOW = tl.iso_to_ts("2026-11-25T11:00:00Z")
+USAGE = "\n".join([
+    "Gemini Models\tWeekly Limit Remaining\t61%\t2026-11-30T20:03:27Z",
+    "Gemini Models\tFive Hour Limit Remaining\t84%\t2026-11-25T15:01:27Z",
+    "Claude and GPT models\tWeekly Limit Remaining\t100%\t2026-12-02T10:58:19Z",
+    "Claude and GPT models\tFive Hour Limit Remaining\t100%\t2026-11-25T15:58:19Z",
+])
 
 
 class GooglePoolTests(unittest.TestCase):
@@ -43,6 +53,23 @@ class GooglePoolTests(unittest.TestCase):
 
     def write_log(self, *lines):
         self.log.write_text("\n".join(lines) + "\n")
+
+    def fake_agy(self, text="", returncode=0):
+        binary = self.home / ".local/bin/agy"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        cache = self.home / ".local/state/token-ladder/agy-usage.json"
+        if cache.exists():
+            cache.unlink()
+        done = subprocess.CompletedProcess([], returncode, stdout=text, stderr="")
+        patcher = patch.object(tl.subprocess, "run", return_value=done)
+        return patcher.start(), patcher
+
+    def usage(self, text=USAGE, returncode=0, now=USAGE_NOW):
+        mocked, patcher = self.fake_agy(text, returncode)
+        self.addCleanup(patcher.stop)
+        return tl.read_google(now), mocked
 
     def test_counts_only_today_through_now_and_keeps_quota_unknown(self):
         self.history.write_text(FIXTURE.read_text())
@@ -91,8 +118,10 @@ class GooglePoolTests(unittest.TestCase):
                 patch.object(tl.urllib.request, "urlopen", side_effect=AssertionError("no network")):
             got = tl.read_google(NOW)
         self.assertEqual(got["used"], 3)
-        self.assertEqual([call.args[0] for call in opened.call_args_list],
-                         [str(self.history), str(self.log)])
+        opened_paths = [call.args[0] for call in opened.call_args_list]
+        self.assertIn(str(self.history), opened_paths)
+        self.assertIn(str(self.log), opened_paths)
+        self.assertNotIn(str(token), opened_paths)
         self.assertEqual(self.history.read_bytes(), before)
         self.assertEqual(token.read_text(), "sentinel-token-value")
         self.assertNotIn("sentinel", json.dumps(got))
@@ -190,3 +219,124 @@ class GooglePoolTests(unittest.TestCase):
                "used_up": True, "used_up_at": "2026-11-22T09:05:00Z"}
         self.assertEqual(tl.pool_line("google", got),
                          "Google: ? used, reset unknown, OFF (used up at 2026-11-22T09:05:00Z)")
+
+    def test_agy_usage_reports_the_real_quota_and_both_groups(self):
+        got, mocked = self.usage()
+        self.assertEqual(got["used_pct"], 39)
+        self.assertEqual(got["five_hour_used_pct"], 16)
+        self.assertFalse(got["estimated"])
+        self.assertEqual(got["source"], "agy /usage")
+        self.assertEqual(got["state"], "ON")
+        self.assertNotIn("used_up", got)
+        self.assertEqual(got["resets_at"], tl.iso_to_ts("2026-11-30T20:03:27Z"))
+        self.assertEqual(got["five_hour_resets_at"], tl.iso_to_ts("2026-11-25T15:01:27Z"))
+        self.assertIsNotNone(got["pace_ratio"])
+        self.assertEqual(got["gemini"], {"weekly_remaining_pct": 61,
+                                         "weekly_resets_at": tl.iso_to_ts("2026-11-30T20:03:27Z"),
+                                         "five_hour_remaining_pct": 84,
+                                         "five_hour_resets_at": tl.iso_to_ts("2026-11-25T15:01:27Z")})
+        self.assertEqual(got["claude_gpt"], {"weekly_remaining_pct": 100,
+                                             "weekly_resets_at": tl.iso_to_ts("2026-12-02T10:58:19Z"),
+                                             "five_hour_remaining_pct": 100,
+                                             "five_hour_resets_at": tl.iso_to_ts("2026-11-25T15:58:19Z")})
+        argv = mocked.call_args.args[0]
+        self.assertTrue(argv[0].endswith("/.local/bin/agy"))
+        self.assertEqual(argv[1:], ["-p", "/usage", "--print-timeout", "45s"])
+        self.assertEqual(mocked.call_args.kwargs["timeout"], 60)
+        self.assertIn("cwd", mocked.call_args.kwargs)
+        json.dumps(got, allow_nan=False)
+
+    def test_pools_json_publishes_both_groups_and_the_estimate_flag(self):
+        got, _ = self.usage()
+        pools = tl.current_pools({}, USAGE_NOW)
+        self.assertEqual(pools["google"]["gemini"]["weekly_remaining_pct"], 61)
+        self.assertEqual(pools["google"]["claude_gpt"]["five_hour_remaining_pct"], 100)
+        self.assertFalse(pools["google"]["estimated"])
+        self.assertEqual(json.loads(json.dumps(pools))["google"]["used_pct"], 39)
+
+    def test_agy_zero_weekly_remaining_marks_the_pool_used_up_with_that_reset(self):
+        zero = USAGE.replace("Weekly Limit Remaining\t61%", "Weekly Limit Remaining\t0%")
+        got, _ = self.usage(zero)
+        self.assertTrue(got["used_up"])
+        self.assertEqual(got["used_up_window"], "week")
+        self.assertEqual(got["used_up_resets_at"], tl.iso_to_ts("2026-11-30T20:03:27Z"))
+        self.assertEqual(got["used_up_at"], "2026-11-25T11:00:00Z")
+        self.assertEqual(got["used_pct"], 100)
+        self.assertEqual(got["state"], "OFF")
+
+    def test_agy_zero_five_hour_remaining_marks_the_pool_used_up_with_its_own_reset(self):
+        zero = USAGE.replace("Five Hour Limit Remaining\t84%", "Five Hour Limit Remaining\t0%")
+        got, _ = self.usage(zero)
+        self.assertTrue(got["used_up"])
+        self.assertEqual(got["used_up_window"], "five_hour")
+        self.assertEqual(got["used_up_resets_at"], tl.iso_to_ts("2026-11-25T15:01:27Z"))
+        self.assertEqual(got["five_hour_used_pct"], 100)
+        self.assertEqual(got["state"], "OFF")
+
+    def test_agy_failure_keeps_the_quota_unknown_and_never_used_up(self):
+        self.write_log(LENGTH_429)
+        got, _ = self.usage("", returncode=1)
+        self.assertEqual(got["state"], "unknown")
+        self.assertNotIn("used_up", got)
+        self.assertTrue(got["estimated"])
+        self.assertIsNone(got["used_pct"])
+        self.assertNotIn("gemini", got)
+
+    def test_agy_garbage_output_is_unknown(self):
+        got, _ = self.usage("Approaching limit...\nno quota rows here\n")
+        self.assertEqual(got["state"], "unknown")
+        self.assertNotIn("used_up", got)
+        self.assertTrue(got["estimated"])
+
+    def test_agy_reading_wins_over_a_quota_error_in_the_log(self):
+        self.write_log("E1125 10:00:00.123456      47 quota_manager.go:120] doRefreshQuota: failed: RESOURCE_EXHAUSTED")
+        got, _ = self.usage(now=tl.iso_to_ts("2026-11-25T12:00:00Z"))
+        self.assertNotIn("used_up", got)
+        self.assertEqual(got["used_pct"], 39)
+
+    def test_second_read_reuses_the_cached_reading(self):
+        got, mocked = self.usage()
+        again = tl.read_google(USAGE_NOW + 60)
+        self.assertEqual(mocked.call_count, 1)
+        self.assertEqual(again["used_pct"], got["used_pct"])
+        self.assertFalse(again["estimated"])
+
+    def test_a_stale_cache_is_replaced_by_a_fresh_reading(self):
+        _, mocked = self.usage()
+        dropped = USAGE.replace("Weekly Limit Remaining\t61%", "Weekly Limit Remaining\t41%")
+        mocked.return_value = subprocess.CompletedProcess([], 0, stdout=dropped, stderr="")
+        fresh = tl.read_google(USAGE_NOW + tl.AGY_TTL + 1)
+        self.assertEqual(mocked.call_count, 2)
+        self.assertEqual(fresh["used_pct"], 59)
+
+    def test_todays_trajectory_length_is_not_a_quota_error(self):
+        self.write_log(LENGTH_429)
+        got = tl.read_google(tl.iso_to_ts("2026-11-25T12:00:00Z"))
+        self.assertEqual(got["state"], "unknown")
+        self.assertNotIn("used_up", got)
+
+    def test_a_bare_number_never_marks_the_pool_used_up(self):
+        for line in ("I1125 10:00:00.000000      47 llm_monitor.go:636] LLM Monitor: length: 429",
+                     "I1125 10:00:00.000000      47 quota_manager.go:120] doRefreshQuota: retry in 429 ms",
+                     "I1125 10:00:00.000000      47 quota_manager.go:120] doRefreshQuota: model 429 unavailable"):
+            with self.subTest(line=line):
+                self.write_log(line)
+                self.assertNotIn("used_up", tl.read_google(tl.iso_to_ts("2026-11-25T12:00:00Z")))
+
+    def test_a_qualified_429_still_counts_as_a_quota_error(self):
+        for line in ("status 429", "HTTP 429", "code: 429", "code = 429", "429 Too Many Requests"):
+            with self.subTest(line=line):
+                self.write_log(f"E1125 10:00:00.000000      47 quota_manager.go:120] doRefreshQuota: failed: {line}")
+                got = tl.read_google(tl.iso_to_ts("2026-11-25T12:00:00Z"))
+                self.assertTrue(got["used_up"])
+                self.assertEqual(got["used_up_at"], "2026-11-25T10:00:00Z")
+
+    def test_pool_line_marks_an_estimated_percentage(self):
+        got = {"used_pct": 39.0, "resets_at": None, "state": "unknown", "estimated": True}
+        self.assertEqual(tl.pool_line("google", got),
+                         "Google: 39% (estimated) used, reset unknown, unknown (assume 70% used for planning)")
+
+    def test_pool_line_names_both_agy_groups_with_the_source(self):
+        got, _ = self.usage()
+        self.assertIn("(agy /usage; Gemini 61% weekly left, 84% 5h left; "
+                      "Claude and GPT 100% weekly left, 100% 5h left)", tl.pool_line("google", got))

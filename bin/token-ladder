@@ -840,8 +840,19 @@ GOOGLE_LOG = ".gemini/antigravity-cli/cli.log"
 GOOGLE_LOG_LINE = re.compile(r"^[IWEF](\d{2})(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?")
 GOOGLE_QUOTA_LINE = re.compile(r"quota_manager\.go|dorefreshquota|retrieveuserquotasummary|quota[ _-]?summary", re.I)
 GOOGLE_QUOTA_ERROR = re.compile(
-    r"resource[ _-]?exhausted|rate[ _-]?limit|too many requests|\b429\b|quota[ _-]?(?:exceeded|exhausted)",
+    r"resource[ _-]?exhausted|rate[ _-]?limit|too many requests|quota[ _-]?(?:exceeded|exhausted)|"
+    r"(?:status|http|code)\s*[:=]?\s*429\b|\b429\s+too many requests",
     re.I)
+AGY_PRINT_TIMEOUT_S = 45
+AGY_KILL_MARGIN_S = 15
+AGY_ARGS = ["-p", "/usage", "--print-timeout", f"{AGY_PRINT_TIMEOUT_S}s"]
+AGY_TIMEOUT = AGY_PRINT_TIMEOUT_S + AGY_KILL_MARGIN_S
+AGY_TTL = 120
+AGY_GROUPS = {"gemini models": "gemini", "claude and gpt models": "claude_gpt"}
+AGY_WINDOWS = {"weekly limit remaining": "week", "five hour limit remaining": "five_hour"}
+AGY_ROW = re.compile(
+    r"^(?P<group>[^\t]+?)\t(?P<window>[^\t]+?)\t(?P<remaining>\d{1,3})%\t"
+    r"(?P<reset>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z)$")
 
 
 def google_quota_used_up(now):
@@ -870,10 +881,113 @@ def google_quota_used_up(now):
     return {"used_up_at": newest[0].strftime("%Y-%m-%dT%H:%M:%SZ"), "state": "OFF", "used_up": True}
 
 
+def agy_usage_cache():
+    return os.path.join(HOME, ".local/state/token-ladder/agy-usage.json")
+
+
+def agy_binary():
+    path = os.path.join(HOME, ".local/bin/agy")
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
+
+
+def run_agy_usage():
+    binary = agy_binary()
+    if binary is None:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as cwd:
+            out = subprocess.run([binary] + AGY_ARGS, cwd=cwd, capture_output=True, text=True,
+                                 timeout=AGY_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def agy_usage(now):
+    cache = agy_usage_cache()
+    try:
+        with open(cache) as f:
+            cached = json.load(f)
+        at, text = cached.get("at"), cached.get("text")
+        if (isinstance(at, (int, float)) and not isinstance(at, bool) and isinstance(text, str) and text
+                and 0 <= now - at <= AGY_TTL):
+            return text
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    text = run_agy_usage()
+    if text:
+        try:
+            os.makedirs(os.path.dirname(cache), exist_ok=True)
+            tmp = cache + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"at": now, "text": text}, f)
+            os.replace(tmp, cache)
+        except OSError:
+            pass
+    return text
+
+
+def parse_agy_usage(text):
+    groups = {}
+    for line in (text or "").splitlines():
+        row = AGY_ROW.match(line.strip())
+        if not row:
+            continue
+        group = AGY_GROUPS.get(row.group("group").strip().lower())
+        span = AGY_WINDOWS.get(" ".join(row.group("window").strip().lower().split()))
+        remaining = int(row.group("remaining"))
+        if group is None or span is None or not 0 <= remaining <= 100:
+            continue
+        try:
+            reset = iso_to_ts(row.group("reset"))
+        except (ValueError, OverflowError, AttributeError):
+            continue
+        groups.setdefault(group, {})[span] = {"remaining_pct": remaining, "resets_at": reset}
+    return groups
+
+
+def agy_group_readout(group):
+    week, five = group.get("week") or {}, group.get("five_hour") or {}
+    return {"weekly_remaining_pct": week.get("remaining_pct"),
+            "weekly_resets_at": week.get("resets_at"),
+            "five_hour_remaining_pct": five.get("remaining_pct"),
+            "five_hour_resets_at": five.get("resets_at")}
+
+
+def agy_pool(groups, now, cfg):
+    gemini = groups.get("gemini") or {}
+    week, five = gemini.get("week"), gemini.get("five_hour") or {}
+    pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
+            "pace_ratio": None, "elapsed_pct": None, "window_minutes": 10080,
+            "five_hour_used_pct": None, "five_hour_resets_at": None,
+            "chat_only": False, "shared_with_chats": True, "estimated": False, "source": "agy /usage"}
+    for key in ("gemini", "claude_gpt"):
+        if groups.get(key):
+            pool[key] = agy_group_readout(groups[key])
+    if week is None:
+        return pool
+    week_used = 100 - week["remaining_pct"]
+    week_bar = window(week_used, week["resets_at"], 10080, now)
+    five_bar = (window(100 - five["remaining_pct"], five["resets_at"], 300, now) if five else None)
+    bars = pool_state(week_bar, five_bar, cfg, now)
+    pool.update(used_pct=week_used, resets_at=week_bar["resets_at"], hours_left=week_bar["hours_left"],
+                state=bars["state"], pace_ratio=bars["pace_ratio"], elapsed_pct=week_bar["time_gone"])
+    if five:
+        pool["five_hour_used_pct"] = 100 - five["remaining_pct"]
+        pool["five_hour_resets_at"] = five["resets_at"]
+    zero = [(span, bar) for span, bar in (("week", week), ("five_hour", five))
+            if bar and bar["remaining_pct"] == 0]
+    if zero:
+        span, bar = zero[0]
+        pool.update(state="OFF", used_up=True, used_up_window=span, used_up_resets_at=bar["resets_at"],
+                    used_up_at=datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    return pool
+
+
 def read_google(now):
     pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
             "pace_ratio": None, "chat_only": False, "shared_with_chats": True, "used": None, "limit": None,
-            "unit": "local history entries today (UTC)", "estimated": True,
+            "unit": "local history entries today (UTC)",
             "source": "agy local history timestamps; Antigravity quota unavailable"}
     start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
     used, seen = 0, False
@@ -893,6 +1007,11 @@ def read_google(now):
         seen = False
     if seen:
         pool["used"] = used
+    groups = parse_agy_usage(agy_usage(now))
+    if groups.get("gemini"):
+        pool.update(agy_pool(groups, now, load_config()))
+        return pool
+    pool["estimated"] = True
     quota = google_quota_used_up(now)
     if quota:
         pool.update(quota)
@@ -968,11 +1087,22 @@ def pool_line(name, pool):
     used = "?" if pool["used_pct"] is None else f"{pool['used_pct']:.0f}%"
     reset = (datetime.fromtimestamp(pool["resets_at"], timezone.utc).isoformat()
              if pool.get("resets_at") is not None else "unknown")
+    if pool.get("estimated") and pool["used_pct"] is not None:
+        used += " (estimated)"
     state = pool["state"]
     if pool.get("used_up") and pool.get("used_up_at"):
         state += f" (used up at {pool['used_up_at']})"
     elif state == "unknown":
         state += f" (assume {load_config().get('unknown_assumed_pct', 70):g}% used for planning)"
+    if pool.get("gemini"):
+        groups = [f"{label} {pool[key]['weekly_remaining_pct']:g}% weekly left, "
+                  f"{pool[key]['five_hour_remaining_pct']:g}% 5h left"
+                  for key, label in (("gemini", "Gemini"), ("claude_gpt", "Claude and GPT"))
+                  if isinstance(pool.get(key), dict)
+                  and pool[key].get("weekly_remaining_pct") is not None
+                  and pool[key].get("five_hour_remaining_pct") is not None]
+        if groups:
+            state += f" ({pool.get('source')}; " + "; ".join(groups) + ")"
     if pool.get("credits") is not None:
         state += f" (on approved credits, {pool['credits']:,.0f} left)"
     return f"{name.capitalize()}: {used} used, reset {reset}, {state}"
@@ -1381,7 +1511,8 @@ def _fmt_used_limit(item, openrouter=None):
         pct = max(0.0, min(100.0, spent / usd_per_cycle * 100))
         return f"{_usd_text(spent)} / ${usd_per_cycle:g} ({_usd_text(credits_usd)} left)", pct
     if used_pct is not None:
-        return f"{_pct_text(used_pct)} / 100%", max(0.0, min(100.0, used_pct))
+        mark = " (estimated)" if usage.get("estimated") else ""
+        return f"{_pct_text(used_pct)} / 100%{mark}", max(0.0, min(100.0, used_pct))
     if used is not None or limit is not None or unit:
         u_s = f"{used:g}" if used is not None else "unknown"
         l_s = f"{limit:g}" if limit is not None else "unknown"
