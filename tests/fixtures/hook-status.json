@@ -1,0 +1,28 @@
+{
+  "ts": 1795608980.0,
+  "claude": {"week": {"used": 74.0}},
+  "codex": {"week": {"used": 41.0}},
+  "pools": {
+    "claude": {"used_pct": 74.0, "estimated": false},
+    "codex": {"used_pct": 41.0, "estimated": false},
+    "grok": {"used_pct": 47.3},
+    "google": {
+      "used_pct": 43,
+      "estimated": false,
+      "gemini": {"weekly_remaining_pct": 57, "five_hour_remaining_pct": 69}
+    }
+  },
+  "config": {
+    "plans": [
+      {"name": "Claude", "vendor": "anthropic"},
+      {"name": "ChatGPT / Codex", "vendor": "openai"},
+      {"name": "Cursor", "vendor": "cursor"},
+      {"name": "Vercel AI Gateway Token Pass", "vendor": "vercel", "usd_per_cycle": 150},
+      {"name": "DeepSeek direct", "vendor": "deepseek"},
+      {"name": "OpenCode Go Plus", "vendor": "opencode"},
+      {"name": "Google Antigravity plan", "vendor": "google", "pool": "google"},
+      {"name": "CommandCode GOAT", "vendor": "commandcode"},
+      {"name": "OpenRouter", "vendor": "openrouter"}
+    ]
+  }
+}
