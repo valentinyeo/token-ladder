@@ -199,7 +199,14 @@ This records the current UTC time and source `Valentin dashboard screenshot`. Us
 plan-pick --set-credit opencode 24.64 --credit-at 2026-11-22T22:00Z --credit-source "Valentin dashboard screenshot"
 ```
 
-Without live credit, available credit is the anchor less recorded `opencode-go` pi message costs since that time, grouped by run.
+Without live credit, available credit is the anchor less OpenCode's own billed usage since that time, read from the console usage export at `https://opencode.ai/console/api/v2/usage/export?range=30d`.
+The service-account key comes from 1Password item `OpenCode Check usage` (vault `Yeo UX Agents`) through `yeo-key --env`, so it never reaches a command line, a log or a test.
+The export has one row per UTC day, provider and model, with `cost_usd` for the row, and no column that says whether a row drew on the Go allowance or on prepaid credit.
+Every row in this workspace is `provider=opencode-go`, and this path only runs once the monthly window is at 100%, so no row can be allowance-covered and every row after the anchor bills prepaid credit.
+Because a row is a whole day, an anchor set from a fresh reading also records that day's export total as `day` and `day_usd` in `lane-credits.json`.
+The deduction is then that day's total now minus the recorded figure, plus every later day in full, so `plan-pick` stops at `anchor minus OpenCode usage export` and calls it no estimate.
+An anchor with no day total (one set with `--credit-at` in the past) falls back to recorded `opencode-go` pi message costs for the anchor day only, and that figure is labelled an estimate.
+When the export read fails, the deduction is recorded run costs as before, also an estimate.
 Other providers and messages at or before the anchor are excluded. Copied message IDs are counted once.
 Launch records are matched to pi runs by directory and launch time. An unmatched launch or a run with missing or invalid costs deducts a conservative $0.50 default, once per run, plus any known costs.
 The plan labels anchored balances, the observation time and source, deductions, and the number of defaulted runs. It never estimates costs from token counts.
@@ -210,7 +217,7 @@ Anchors older than seven days, future anchors, and invalid balances close prepai
 | Rule | Enforced by |
 |---|---|
 | Use prepaid credit already held down to its floor; never top up automatically. OpenCode stops at $2 until monthly renewal, and a live read above the floor clears that lock. | `PrepaidCreditTests.test_prepaid_credit_floor_is_inclusive_and_configurable`, `test_floor_lock_clears_on_a_live_read_above_the_floor_and_names_the_date`, `test_live_credit_above_the_floor_leaves_a_rate_limit_lock_alone`, `test_live_reader_executes_read_only_commands_and_keeps_zero_credit` in `tests/test_plan_pick.py` |
-| Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Live credit or an anchor no older than seven days can authorize Extra Usage. Deduct run costs, or $0.50 per unknown-cost run. | `AnchoredCreditTests`, `CommandTests.test_set_credit_and_usage_logs_drive_selection_without_browser_credit`, `PrepaidCreditTests` |
+| Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Live credit or an anchor no older than seven days can authorize Extra Usage. Deduct OpenCode's own billed usage from the console usage export, and fall back to run costs with $0.50 per unknown-cost run when that read fails. | `AnchoredCreditTests`, `UsageExportTests`, `CommandTests.test_set_credit_and_usage_logs_drive_selection_without_browser_credit`, `PrepaidCreditTests` |
 | DeepSeek direct is retired; no more top-ups or worker/CI selection. | `PrepaidCreditTests.test_deepseek_direct_is_retired_from_workers_and_ci` |
 
 ### Lane history
