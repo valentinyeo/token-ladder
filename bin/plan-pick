@@ -47,6 +47,8 @@ LAUNCHES = os.environ.get("PLAN_PICK_LAUNCHES") or os.path.expanduser("~/.local/
 CREDITS = os.path.expanduser("~/.local/state/token-ladder/lane-credits.json")
 EMERGENCY = os.path.expanduser("~/.local/state/token-ladder/claude-emergency.json")
 STATUS = os.path.expanduser("~/.local/state/token-ladder/status.json")
+AGENT_PLANS = os.path.expanduser("~/.local/state/multiprompt/agent-providers.json")
+AGENT_PLANS_STALE_SECONDS = 24 * 60 * 60
 CLAUDE_HELPER_STALE_SECONDS = 15 * 60
 PI = os.path.expanduser("~/.npm-global/bin/pi")
 PI_SESSIONS = os.path.expanduser("~/.pi/agent/sessions")
@@ -233,10 +235,14 @@ def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=N
     return {"allowed": not why, "reason": f"{lane['lane']}: {why or 'allowed'}"}
 
 
-def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None, strict_pace=False):
+def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None, strict_pace=False,
+         held=None):
     pools = pools if isinstance(pools, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
     now = time.time() if now is None else now
+    held = held_agent_lanes(now) if held is None else held
+    clause = agent_hold_clause(lanes, held)
+    lanes = lanes_with_agent_holds(lanes, held)
     skipped, ahead = {}, {}
     for lane in lanes:
         name = lane["lane"]
@@ -259,7 +265,7 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
             reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(pool, warn)}"
         if skipped:
             reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
-        return {"plan": name, "command": lane["command"], "reason": reason}
+        return {"plan": name, "command": lane["command"], "reason": reason + clause}
     codex = pools.get("codex")
     codex_ahead = isinstance(codex, dict) and (number(codex.get("pace_ratio")) or 0) > 1.3
     frees = {}
@@ -282,13 +288,13 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
                        " so wait for it and run plan-pick --run again")
         else:
             reason += "; wait for the next plan reset"
-        return {"plan": "none", "command": None, "reason": reason, "next_free": next_free}
+        return {"plan": "none", "command": None, "reason": reason + clause, "next_free": next_free}
     name = min(ahead, key=ahead.get)
     lane = next(lane for lane in lanes if lane["lane"] == name)
     others = ", ".join(f"{p} ({w})" for p, w in skipped.items() if p != name)
     return {"plan": name, "command": lane["command"],
             "reason": f"every lane is ahead of pace, used up or limited; least ahead is {name} ({skipped[name]})"
-            + (f"; skipped {others}" if others else "")}
+            + (f"; skipped {others}" if others else "") + clause}
 
 
 def parse_until(text):
@@ -453,12 +459,11 @@ def load_config():
     return cfg
 
 
-def lane_first_until(lane):
-    raw = lane.get("first_until")
-    if not isinstance(raw, str):
+def iso_stamp(value):
+    if not isinstance(value, str):
         return None
     try:
-        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        stamp = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
     if stamp.tzinfo is None:
@@ -467,6 +472,10 @@ def lane_first_until(lane):
         return stamp.timestamp()
     except (ValueError, OverflowError, OSError):
         return None
+
+
+def lane_first_until(lane):
+    return iso_stamp(lane.get("first_until"))
 
 
 def lanes_with_first(lanes, now=None):
@@ -484,6 +493,64 @@ def lanes_from(cfg, now=None):
     usable = [lane for lane in lanes if isinstance(lane, dict) and isinstance(lane.get("lane"), str)
               and isinstance(lane.get("command"), str)]
     return lanes_with_first(usable, now)
+
+
+AGENT_PLANS_NOTED = set()
+
+
+def agent_plans_path():
+    return os.environ.get("PLAN_PICK_AGENT_PLANS") or AGENT_PLANS
+
+
+def agent_plans_malformed(path):
+    if path in AGENT_PLANS_NOTED:
+        return
+    AGENT_PLANS_NOTED.add(path)
+    print(f"plan-pick: agent plan file {path} is malformed, so the lane order is unchanged", file=sys.stderr)
+
+
+def held_agent_lanes(now=None, path=None):
+    now = time.time() if now is None else now
+    path = path or agent_plans_path()
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except OSError:
+        return {}
+    except ValueError:
+        agent_plans_malformed(path)
+        return {}
+    by_provider = data.get("by_provider") if isinstance(data, dict) else None
+    stamp = iso_stamp(data.get("updated")) if isinstance(data, dict) else None
+    if not isinstance(by_provider, dict) or stamp is None:
+        agent_plans_malformed(path)
+        return {}
+    if now - stamp > AGENT_PLANS_STALE_SECONDS:
+        return {}
+    held = {}
+    for name, chats in by_provider.items():
+        count = number(chats)
+        if isinstance(name, str) and count is not None and count > 0:
+            held[name.lower()] = count
+    return held
+
+
+def lane_held_by_agents(lane, held):
+    return held.get(lane["lane"].lower(), 0) > 0
+
+
+def lanes_with_agent_holds(lanes, held):
+    if not held:
+        return lanes
+    last = [lane for lane in lanes if lane_held_by_agents(lane, held)]
+    if not last:
+        return lanes
+    return [lane for lane in lanes if not lane_held_by_agents(lane, held)] + last
+
+
+def agent_hold_clause(lanes, held):
+    return "".join(f"; {lane['lane']} held by agent chats; tried last"
+                   for lane in lanes if lane_held_by_agents(lane, held))
 
 
 def lane_names(lane):

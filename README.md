@@ -44,6 +44,16 @@ For the default medium rung, the Cursor lane runs first while its `first_until` 
 | 6 | Codex | Subscription pool |
 | 7 | Cursor | Subscription pool; last after `first_until` |
 
+### Agent-held lanes
+
+When Multibot runs agent chats on a plan, `plan-pick` keeps that plan for them and tries its lane last. Multibot writes `~/.local/state/multiprompt/agent-providers.json` atomically after every workspace AI switch:
+
+```json
+{"updated": "2026-11-24T10:00:00Z", "chats": [{"workspace": "HT Product", "chat": "HT Bugs", "tmux": "live-abc", "provider": "antigravity", "model": "gemini-4-neon", "since": "2026-11-24T09:40:00Z"}], "by_provider": {"antigravity": 3, "codex": 1, "claude": 2}}
+```
+
+A lane is held when `by_provider[<lane>] > 0`, and provider names are the lane names above. A held lane keeps its rung eligibility but moves behind every lane that is not held, and the pick line says `antigravity held by agent chats; tried last`. `claude` is not a worker lane, so it never holds one. A missing or unreadable file, a file older than 24 hours by `updated`, or a count that is not a number changes nothing. A malformed file changes nothing and prints one note. `plan-pick` only reads the file. `PLAN_PICK_AGENT_PLANS` overrides the path, for tests.
+
 ### Worker rungs and first-review cost
 
 The goal is the cheapest model that passes its first review. Starting rungs per model need a later eval. This change supplies the measurement and climb mechanism, not that eval.

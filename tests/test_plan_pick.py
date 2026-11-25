@@ -26,6 +26,8 @@ LANES = [{"lane": "opencode", "pool": "opencode", "command": "run opencode"},
          {"lane": "deepseek", "pool": None, "command": "run deepseek"},
          {"lane": "codex", "pool": "codex", "command": "run codex"},
          {"lane": "cursor", "pool": "grok", "command": "run cursor"}]
+AGENT_LANES = [{"lane": "antigravity", "pool": "google", "shared_with_chats": True, "command": "run agy"},
+               {"lane": "codex", "pool": "codex", "command": "run codex"}]
 T = 1_800_000_000
 
 
@@ -462,6 +464,115 @@ class NoLaneTests(unittest.TestCase):
         self.assertIn("vercel frees at", got["reason"])
         self.assertIn("wait", got["reason"])
         self.assertNotIn("top", got["reason"].lower())
+
+
+class AgentPlanHoldTests(unittest.TestCase):
+    def setUp(self):
+        pp.AGENT_PLANS_NOTED.clear()
+        self.home = Path(tempfile.mkdtemp())
+
+    def plans_file(self, payload):
+        path = self.home / "agent-providers.json"
+        path.write_text(payload if isinstance(payload, str) else json.dumps(payload))
+        return path
+
+    def providers(self, updated=T, **counts):
+        return {"updated": datetime.fromtimestamp(updated, timezone.utc).isoformat(),
+                "chats": [{"workspace": "HT Product", "chat": "HT Bugs", "tmux": "live-abc",
+                           "provider": "antigravity", "model": "gemini-4-neon", "since": "2026-11-24T09:40:00Z"}],
+                "by_provider": counts}
+
+    def pick_with_file(self, payload, lanes=None, pools=None, now=T):
+        path = self.plans_file(payload)
+        with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}):
+            return pp.pick(AGENT_LANES if lanes is None else lanes, pools or {}, {}, now)
+
+    def test_held_plan_moves_behind_a_free_lane(self):
+        got = self.pick_with_file(self.providers(antigravity=3))
+        self.assertEqual((got["plan"], got["command"]), ("codex", "run codex"))
+        self.assertIn("antigravity held by agent chats; tried last", got["reason"])
+
+    def test_a_file_with_no_chats_keeps_the_shipped_order(self):
+        got = self.pick_with_file(self.providers(antigravity=0, codex=0))
+        self.assertEqual(got["plan"], "antigravity")
+        self.assertNotIn("held by agent chats", got["reason"])
+
+    def test_only_held_plans_left_still_run_the_first_of_them(self):
+        got = self.pick_with_file(self.providers(antigravity=2, codex=1))
+        self.assertEqual((got["plan"], got["command"]), ("antigravity", "run agy"))
+        self.assertIn("antigravity held by agent chats; tried last", got["reason"])
+
+    def test_claude_and_unknown_providers_never_hold_a_lane(self):
+        got = self.pick_with_file(self.providers(claude=4, baseten=2))
+        self.assertEqual(got["plan"], "antigravity")
+        self.assertNotIn("held by agent chats", got["reason"])
+
+    def test_counts_that_are_not_numbers_leave_the_order_alone(self):
+        got = self.pick_with_file({"updated": datetime.fromtimestamp(T, timezone.utc).isoformat(),
+                                   "by_provider": {"antigravity": "3", "codex": None}})
+        self.assertEqual(got["plan"], "antigravity")
+
+    def test_missing_file_keeps_the_shipped_order_without_a_note(self):
+        errors = io.StringIO()
+        with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(self.home / "absent.json")}), \
+                redirect_stderr(errors):
+            got = pp.pick(AGENT_LANES, {}, {}, T)
+        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(errors.getvalue(), "")
+
+    def test_malformed_file_keeps_the_shipped_order_and_notes_it_once(self):
+        path = self.plans_file("{not json")
+        errors = io.StringIO()
+        with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}), redirect_stderr(errors):
+            first = pp.pick(AGENT_LANES, {}, {}, T)
+            second = pp.pick(AGENT_LANES, {}, {}, T + 1)
+        self.assertEqual((first["plan"], second["plan"]), ("antigravity", "antigravity"))
+        self.assertNotIn("held by agent chats", first["reason"])
+        self.assertEqual(errors.getvalue().count("malformed"), 1)
+        self.assertIn(str(path), errors.getvalue())
+
+    def test_a_file_without_by_provider_is_malformed(self):
+        errors = io.StringIO()
+        path = self.plans_file({"version": 1, "updated": datetime.fromtimestamp(T, timezone.utc).isoformat(),
+                                "plans": {"antigravity": {"workspaces": ["mine"], "chats": 12}}})
+        with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}), redirect_stderr(errors):
+            got = pp.pick(AGENT_LANES, {}, {}, T)
+        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(errors.getvalue().count("malformed"), 1)
+
+    def test_a_file_older_than_a_day_is_ignored(self):
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, antigravity=3))["plan"],
+                         "antigravity")
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, antigravity=3))["plan"],
+                         "codex")
+
+    def test_a_held_lane_keeps_its_rung_eligibility(self):
+        cfg = {"rungs": {rung: [{"lane": "antigravity"}, {"lane": "codex"}] for rung in pp.RUNGS}}
+        ctx = {"rung": "hard", "rung_source": "brief line", "rung_reason": "rung hard", "ticket": None,
+               "job": "job", "state_path": str(self.home / "rung-attempts.json"),
+               "cache_path": str(self.home / "verifier-cache.json")}
+        path = self.plans_file(self.providers(antigravity=3))
+        with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}):
+            free, _, _ = pp.pick_rung(AGENT_LANES, {}, cfg, ctx, {}, 1.1, T)
+            stuck, _, _ = pp.pick_rung(AGENT_LANES, {}, cfg, ctx, {"codex": T + 600}, 1.1, T)
+        self.assertEqual(free["plan"], "codex")
+        self.assertIn("antigravity held by agent chats; tried last", free["reason"])
+        self.assertEqual(stuck["plan"], "antigravity")
+
+    def test_the_pick_line_says_the_held_lane_is_tried_last(self):
+        repo = Path(tempfile.mkdtemp())
+        (repo / "bin").mkdir()
+        (repo / "bin" / "plan-pick").write_text(Path(REPO, "bin" / "plan-pick").read_text())
+        (repo / "config.json").write_text(json.dumps({"lanes": AGENT_LANES}))
+        pools = repo / "pools.json"
+        pools.write_text("{}")
+        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools)],
+                             capture_output=True, text=True,
+                             env={"HOME": str(repo), "PATH": "/usr/bin:/bin",
+                                  "PLAN_PICK_AGENT_PLANS": str(self.plans_file(self.providers(antigravity=3)))})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.startswith("Worker plan: codex."), out.stdout)
+        self.assertIn("antigravity held by agent chats; tried last", out.stdout)
 
 
 class RunTests(unittest.TestCase):
