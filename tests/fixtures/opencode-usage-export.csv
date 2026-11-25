@@ -1,0 +1,6 @@
+day,user_type,user_id,user_name,provider,model,requests,input_tokens,output_tokens,cache_read_tokens,cache_write_5m_tokens,cache_write_1h_tokens,cost_micro_cents,cost_usd
+2026-11-25,service_account,svcacct_example,Example Account,opencode-go,glm-5.3-flash,1535,2319045,359285,20863452,0,0,115340281,1.15340281
+2026-11-25,service_account,svcacct_example,Example Account,opencode-go,deepseek-v4.1-flash,28909,55739120,15179261,2694549376,0,0,3197185666,31.97185666
+2026-11-24,service_account,svcacct_example,Example Account,opencode-go,glm-5.3-flash,3256,4739092,715638,40739824,0,0,229087752,2.29087752
+2026-11-24,service_account,svcacct_example,Example Account,opencode-go,deepseek-v4.1-flash,35438,67065678,16999004,2859380992,0,0,3635502792,36.35502792
+2026-11-23,service_account,svcacct_example,Example Account,opencode-go,deepseek-v4.1-flash,21256,34595670,11003122,1825065216,0,0,2128217319,21.28217319

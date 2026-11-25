@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
+import csv
 import fcntl
 import glob
 import hashlib
+import io
 import json
 import math
 import os
@@ -58,6 +60,13 @@ NON_WORK_FAILURES = ("lane", "silent", "environment", "no-pr")
 FAST_FAIL_BEFORE_WORK_S = 30
 POOLS_READ_TIMEOUT_S = 90
 FAST_FAIL_4XX_SOURCE = "fast-fail 4xx"
+YEO_KEY = "~/.local/bin/yeo-key"
+OPENCODE_USAGE_ITEM = "OpenCode Check usage"
+OPENCODE_USAGE_URL = "https://opencode.ai/console/api/v2/usage/export?range=30d"
+OPENCODE_USAGE_SOURCE = "anchor minus OpenCode usage export"
+OPENCODE_RUNS_SOURCE = "anchor minus recorded run costs (estimate)"
+DAY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+BASELINE_WINDOW_S = 120
 FAST_FAIL_4XX_KEY_SUFFIX = ":fast-fail-4xx"
 FAST_FAIL_REPEAT_WINDOW_S = 3600
 DEFAULT_FAST_FAIL_REPEAT_MINUTES = 60
@@ -1898,6 +1907,95 @@ def with_credits(pools, lanes, cfg, now=None, path=CREDITS, refresh=refresh_late
     return pools
 
 
+def utc_day(stamp):
+    return datetime.fromtimestamp(stamp, timezone.utc).strftime("%Y-%m-%d")
+
+
+def utc_day_end(day):
+    return datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() + 86400
+
+
+def usage_rows(text):
+    if not isinstance(text, str):
+        return None
+    reader = csv.DictReader(io.StringIO(text))
+    if not {"day", "provider", "cost_usd"} <= set(reader.fieldnames or []):
+        return None
+    rows = []
+    for row in reader:
+        day, provider = row.get("day"), row.get("provider")
+        if not isinstance(day, str) or not DAY_RE.fullmatch(day.strip()):
+            continue
+        if not isinstance(provider, str) or not provider.strip():
+            continue
+        try:
+            usd = float(row.get("cost_usd", ""))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(usd) or usd < 0:
+            continue
+        rows.append({"day": day.strip(), "provider": provider.strip(), "usd": usd})
+    return rows
+
+
+def usage_spend(rows, anchor_at, baseline=None):
+    day = utc_day(anchor_at)
+    after = sum(row["usd"] for row in rows if row["day"] > day)
+    day_total = sum(row["usd"] for row in rows if row["day"] == day)
+    gap = None if baseline is None else max(0.0, day_total - baseline)
+    return {"usd": after + (gap or 0.0), "gap_usd": gap, "day": day, "day_usd": day_total}
+
+
+def usage_baseline(rows, at, now):
+    if rows is None or not 0 <= now - at <= BASELINE_WINDOW_S or utc_day(at) != utc_day(now):
+        return None
+    return sum(row["usd"] for row in rows if row["day"] == utc_day(at))
+
+
+def fetch_usage_export(key):
+    request = urllib.request.Request(OPENCODE_USAGE_URL,
+                                     headers={"Authorization": f"Bearer {key}", "User-Agent": "token-ladder"})
+    with urllib.request.urlopen(request, timeout=20) as response:
+        return response.read().decode("utf-8", "replace")
+
+
+def usage_export_child():
+    key = os.environ.get("OPENCODE_API_KEY", "")
+    if not key:
+        print("plan-pick: OPENCODE_API_KEY missing", file=sys.stderr)
+        return 1
+    try:
+        sys.stdout.write(fetch_usage_export(key))
+    except (OSError, ValueError) as exc:
+        print(f"plan-pick: cannot read the OpenCode usage export: {type(exc).__name__}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def usage_export_command():
+    return [os.path.expanduser(YEO_KEY), "--env", OPENCODE_USAGE_ITEM, "--",
+            sys.executable or "python3", os.path.realpath(__file__), "--opencode-usage-export"]
+
+
+def usage_export_rows(command=None, run=subprocess.run):
+    command = usage_export_command() if command is None else command
+    try:
+        out = run(command, capture_output=True, text=True, timeout=90)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    return usage_rows(out.stdout)
+
+
+def anchor_entry(usd, at, source, now, rows):
+    entry = {"usd": usd, "at": at, "source": source}
+    baseline = usage_baseline(rows, at, now)
+    if baseline is not None:
+        entry.update(day=utc_day(at), day_usd=baseline)
+    return entry
+
+
 def history_rows(pacing_dir):
     try:
         with open(os.path.join(pacing_dir, "opencode-history.jsonl")) as fh:
@@ -1978,7 +2076,10 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
     live_credit = (credit is not None and math.isfinite(credit) and credit >= 0 and credit_at is not None
                    and math.isfinite(credit_at) and 0 <= now - credit_at <= 60)
     if live_credit:
-        save_credits({"opencode": {"usd": credit, "at": credit_at, "source": "OpenCode live console"}}, credits_path)
+        monthly_now = number(parse_opencode_windows((reading or {}).get("windows")).get("monthly"))
+        rows = usage_export_rows() if (monthly_now or 0) >= 100 else None
+        save_credits({"opencode": anchor_entry(credit, credit_at, "OpenCode live console", now, rows)},
+                     credits_path)
     live = bool(reading and reading.get("windows"))
     reading = reading if live else last_windows(pacing_dir)
     if not reading:
@@ -2029,11 +2130,28 @@ def opencode_pool(now, cfg, pacing_dir=PACING_DIR, sessions=PI_SESSIONS, launche
             result["note"] += "; live credit unavailable; balance anchor missing, invalid or older than 7 days; credit unknown; never top up"
             result["credit_unknown"] = True
             return result
-        spent, unknown = opencode_spend(credit_at, now, sessions, launches_path)
-        credit = max(0.0, round(credit - spent, 10))
+        rows = usage_export_rows()
+        spend = None if rows is None else usage_spend(rows, credit_at, number(anchor.get("day_usd")))
+        unknown = 0
+        if spend is None:
+            spent, unknown = opencode_spend(credit_at, now, sessions, launches_path)
+            source = OPENCODE_RUNS_SOURCE
+            basis = f"${spent:.2f} recorded run costs, usage export unavailable (estimate)"
+        elif spend["gap_usd"] is None:
+            runs, unknown = opencode_spend(credit_at, min(now, utc_day_end(spend["day"])), sessions, launches_path)
+            source = "anchor minus OpenCode usage export plus run costs on the anchor day (estimate)"
+            basis = (f"${spend['usd']:.2f} OpenCode usage export after the anchor day plus ${runs:.2f} run costs"
+                     " on the anchor day, which the export has no time split for (estimate)")
+            spent = spend["usd"] + runs
+        else:
+            source = OPENCODE_USAGE_SOURCE
+            spent = spend["usd"]
+            basis = f"${spent:.2f} OpenCode usage export since then"
+        credit = max(0.0, round(credit - spent, 2))
         stamp = datetime.fromtimestamp(credit_at, timezone.utc).isoformat()
+        result["credit_source"] = source
         result["note"] += (f"; anchored credit ${credit:.2f}: ${anchor['usd']:.2f} at {stamp}"
-                           f" ({anchor.get('source', 'unknown source')}) less ${spent:.2f} run costs")
+                           f" ({anchor.get('source', 'unknown source')}) less {basis}")
         if unknown:
             result["note"] += f"; includes conservative $0.50 default for {unknown} run(s) with unknown cost"
     floor = number(cfg.get("opencode_credit_floor_usd"))
@@ -2656,9 +2774,12 @@ def main(argv):
                         help="record an OpenCode prepaid balance anchor without reading live state")
     parser.add_argument("--credit-source", default="Valentin dashboard screenshot", help="balance anchor source")
     parser.add_argument("--credit-at", help="balance anchor time in ISO 8601 with timezone (default: now UTC)")
+    parser.add_argument("--opencode-usage-export", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--hours", type=float, help="how long --limited skips the lane (default from config)")
     parser.add_argument("--reason", help="optional reason recorded with --limited in lane-limits.json")
     args = parser.parse_args(argv)
+    if args.opencode_usage_export:
+        return usage_export_child()
     root = checkout_root()
     own_checkout_warning(root)
     if args.run:
@@ -2697,7 +2818,8 @@ def main(argv):
                 raise ValueError("invalid anchor")
         except (ValueError, OverflowError):
             parser.error("--set-credit requires opencode, a finite nonnegative USD balance, a nonfuture timezone-aware time and a source")
-        save_credits({lane: {"usd": usd, "at": at, "source": args.credit_source}}, CREDITS)
+        entry = anchor_entry(usd, at, args.credit_source, time.time(), usage_export_rows())
+        save_credits({lane: entry}, CREDITS)
         print(f"Stored {lane} balance anchor at {datetime.fromtimestamp(at, timezone.utc).isoformat()} ({args.credit_source}).")
         return 0
     if args.loop_interval:

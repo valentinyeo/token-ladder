@@ -1059,6 +1059,9 @@ class ClaudeHelperTests(unittest.TestCase):
 
 
 NOW = 1_800_000_000
+EXPORT_FILE = Path(REPO, 'tests/fixtures/opencode-usage-export.csv')
+EXPORT_NOW = datetime(2026, 11, 25, 20, tzinfo=timezone.utc).timestamp()
+EXPORT_ANCHOR = datetime(2026, 11, 25, 15, 11, tzinfo=timezone.utc).timestamp()
 
 
 def history(rows):
@@ -1098,11 +1101,21 @@ class AnchoredCreditTests(unittest.TestCase):
         patch = mock.patch.object(pp, 'CREDITS', str(self.credits))
         patch.start()
         self.addCleanup(patch.stop)
+        export = mock.patch.object(pp, 'usage_export_rows', return_value=None)
+        export.start()
+        self.addCleanup(export.stop)
         self.anchor()
 
-    def anchor(self, usd=24.64, at=NOW - 3600):
-        self.credits.write_text(json.dumps({'opencode': {'usd': usd, 'at': at,
-                                                        'source': 'Valentin dashboard screenshot'}}))
+    def anchor(self, usd=24.64, at=NOW - 3600, day_usd=None):
+        entry = {'usd': usd, 'at': at, 'source': 'Valentin dashboard screenshot'}
+        if day_usd is not None:
+            entry.update(day=pp.utc_day(at), day_usd=day_usd)
+        self.credits.write_text(json.dumps({'opencode': entry}))
+
+    def export(self, rows='fixture'):
+        if rows == 'fixture':
+            rows = pp.usage_rows(EXPORT_FILE.read_text())
+        return mock.patch.object(pp, 'usage_export_rows', return_value=rows)
 
     def run_log(self, name, rows, cwd='/tmp/brief'):
         path = self.store / name / 'run.jsonl'
@@ -1236,6 +1249,49 @@ class AnchoredCreditTests(unittest.TestCase):
             with self.subTest(live=live):
                 self.assertEqual(self.state(live)['state'], 'OFF')
 
+    def test_usage_export_takes_credit_rows_after_the_anchor_from_the_day_total(self):
+        self.anchor(usd=24.64, at=EXPORT_ANCHOR, day_usd=30.0)
+        with self.export():
+            got = self.state(now=EXPORT_NOW)
+        self.assertAlmostEqual(got['credits_usd'], 21.51, places=2)
+        self.assertEqual(got['credit_source'], 'anchor minus OpenCode usage export')
+        self.assertIn('OpenCode usage export', got['note'])
+        self.assertNotIn('estimate', got['note'])
+
+    def test_usage_export_counts_whole_days_after_the_anchor_and_run_costs_on_its_day(self):
+        day = datetime(2026, 11, 24, 9, tzinfo=timezone.utc).timestamp()
+        self.anchor(usd=100.0, at=day)
+        self.run_log('one', [lane_use(day + 3600, cost=1.0),
+                            lane_use(datetime(2026, 11, 25, 10, tzinfo=timezone.utc).timestamp(), cost=50.0)])
+        with self.export():
+            got = self.state(now=EXPORT_NOW)
+        self.assertAlmostEqual(got['credits_usd'], 65.87, places=2)
+        self.assertIn('estimate', got['note'])
+
+    def test_usage_export_failure_keeps_the_run_cost_estimate(self):
+        self.anchor(usd=24.64, at=EXPORT_ANCHOR)
+        self.run_log('one', [lane_use(EXPORT_ANCHOR + 600, cost=1.25)])
+        with self.export(None):
+            got = self.state(now=EXPORT_NOW)
+        self.assertAlmostEqual(got['credits_usd'], 23.39, places=2)
+        self.assertIn('estimate', got['note'])
+        self.assertEqual(got['credit_source'], 'anchor minus recorded run costs (estimate)')
+
+    def test_set_credit_records_the_export_day_total_for_a_current_anchor(self):
+        with self.export(), mock.patch.object(pp.time, 'time', return_value=EXPORT_NOW):
+            code = pp.main(['--set-credit', 'opencode', '18.54'])
+        self.assertEqual(code, 0)
+        anchor = json.loads(self.credits.read_text())['opencode']
+        self.assertEqual(anchor['day'], '2026-11-25')
+        self.assertAlmostEqual(anchor['day_usd'], 33.12525947, places=6)
+        self.assertEqual(anchor['source'], 'Valentin dashboard screenshot')
+
+    def test_set_credit_in_the_past_records_no_day_total(self):
+        with self.export(), mock.patch.object(pp.time, 'time', return_value=EXPORT_NOW):
+            code = pp.main(['--set-credit', 'opencode', '18.54', '--credit-at', '2026-11-24T09:00Z'])
+        self.assertEqual(code, 0)
+        self.assertEqual(set(json.loads(self.credits.read_text())['opencode']), {'usd', 'at', 'source'})
+
     def test_set_credit_cli_stores_utc_source_and_preserves_other_lanes(self):
         home = self.root / 'home'
         path = home / '.local/state/token-ladder/lane-credits.json'
@@ -1262,6 +1318,31 @@ class AnchoredCreditTests(unittest.TestCase):
         for value in ('nan', 'inf', '-1', 'garbage'):
             out = subprocess.run(command[:-1] + [value], capture_output=True, text=True, env=env)
             self.assertEqual(out.returncode, 2, out.stderr)
+
+
+class UsageExportTests(unittest.TestCase):
+    def test_rows_come_from_a_real_export_header(self):
+        rows = pp.usage_rows(EXPORT_FILE.read_text())
+        self.assertEqual(len(rows), 5)
+        self.assertEqual({row['provider'] for row in rows}, {'opencode-go'})
+        self.assertEqual({row['day'] for row in rows}, {'2026-11-23', '2026-11-24', '2026-11-25'})
+        self.assertAlmostEqual(sum(row['usd'] for row in rows), 93.05, places=2)
+
+    def test_a_row_without_a_day_or_a_valid_cost_is_dropped(self):
+        text = ('day,provider,cost_usd\n2026-11-25,opencode-go,1.5\nnot-a-day,opencode-go,2\n'
+                '2026-11-25,opencode-go,-1\n2026-11-25,opencode-go,nan\n2026-11-25,,3\n')
+        self.assertEqual([row['usd'] for row in pp.usage_rows(text)], [1.5])
+        for bad in ('', 'day,provider\n2026-11-25,opencode-go\n', None):
+            self.assertIsNone(pp.usage_rows(bad))
+
+    def test_the_key_reaches_the_reader_through_the_environment_not_the_command_line(self):
+        command = pp.usage_export_command()
+        self.assertIn('--env', command)
+        self.assertIn('OpenCode Check usage', command)
+        self.assertEqual(command[-1], '--opencode-usage-export')
+        with mock.patch.dict(os.environ, {'OPENCODE_API_KEY': ''}), redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(pp.usage_export_child(), 1)
 
 
 class OpencodePoolTests(unittest.TestCase):
