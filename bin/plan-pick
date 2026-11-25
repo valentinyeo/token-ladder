@@ -36,6 +36,14 @@ PROVIDER_HTTP = re.compile(r"^\s*[45]\d{2}\b|\bHTTP [45]\d{2}\b|statusCode[\"':\
 MODEL_REJECTED = re.compile(r"model request was rejected", re.I)
 PROVIDER_AUTH = re.compile(r"\b401\b|unauthorized|invalid[_ -]?api[_ -]?key|authentication failed", re.I)
 PI_AGENT_FAST = re.compile(r"stopReason[\"']:\s*[\"']error[\"']", re.I)
+LANE_TIMEOUT = re.compile(r"print[_ ]timeout|DEADLINE_EXCEEDED|deadline exceeded", re.I)
+NO_PR_BRIEF = re.compile(r"(?:do not|don't|never|no)[ \t]+(?:open|create|raise)[ \t]+(?:a |an |the )?(?:new )?(?:pr|pull request)\b"
+                         r"|never[ \t]+a[ \t]+new[ \t]+pr\b"
+                         r"|existing[ \t]+pr\b"
+                         r"|repo[ \t]+pr[ \t]+cap|open-pr[ \t]+cap"
+                         r"|no[ \t]+duplicate[ \t]+pr\b"
+                         r"|push[ \t]+to[ \t]+(?:this|that|the same)[ \t]+pr\b", re.I)
+NON_WORK_FAILURES = ("lane", "silent", "environment", "no-pr")
 FAST_FAIL_BEFORE_WORK_S = 30
 POOLS_READ_TIMEOUT_S = 90
 FAST_FAIL_4XX_SOURCE = "fast-fail 4xx"
@@ -1098,6 +1106,7 @@ def server_busy(path=None):
 def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, now=None, say=None,
               launches_path=LAUNCHES, not_vendor=None, burn=None, rung=None):
     say = say or (lambda text: print(f"plan-pick: {text}", file=sys.stderr, flush=True))
+    explicit_now = now
     now = time.time() if now is None else now
     hours = {"rate": (number(cfg.get("rate_limited_minutes")) or 5) / 60,
              "silent": number(cfg.get("limited_hours")) or DEFAULT_LIMITED_HOURS,
@@ -1126,7 +1135,7 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         if rung:
             lane = next(lane for lane in eligible if lane["lane"] == result["plan"])
             metadata = {"event": "start", "launch_id": launch_id,
-                        **{key: rung[key] for key in ("rung", "rung_source", "ticket", "job")},
+                        **{key: rung.get(key) for key in ("rung", "rung_source", "ticket", "job", "pr_expected")},
                         "model": lane["model"], "effort": lane["effort"]}
         log_launch(launches_path, result["plan"], now, not_vendor, metadata)
         code, tail, elapsed, work = unpack_run(runner(result["command"]))
@@ -1137,7 +1146,8 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         refused = None if pr_url else shim_refusal(tail)
         if refused:
             if rung:
-                launch_finish(launches_path, launch_id, rung, lane, code or 1, tail, cfg, now, refused=refused)
+                launch_finish(launches_path, launch_id, rung, lane, code or 1, tail, cfg, explicit_now,
+                              refused=refused)
             say(f"lane {result['plan']} stopped on a worker-shim refusal ({refused}); "
                 f"recorded as environment, no rung climb")
             return 1
@@ -1150,9 +1160,10 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         if fast and nonquota_http and kind != "blocked":
             kind = None
         effective_code = 1 if code == 0 and (kind is not None or fast is not None or info["error"] is not None) else code
-        lane_failure = kind is not None or fast is not None
+        timed_out = LANE_TIMEOUT.search(info["error"] or "")
+        lane_failure = kind is not None or fast is not None or bool(timed_out)
         if rung:
-            launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, now,
+            launch_finish(launches_path, launch_id, rung, lane, effective_code, tail, cfg, explicit_now,
                           lane_failure=lane_failure, silent=info["empty"])
         if kind is None:
             if fast is None:
@@ -1279,7 +1290,7 @@ def lease_ticket(path=None):
 
 
 def no_climb_attempt(prior):
-    if prior.get("failure") in ("lane", "silent", "environment"):
+    if prior.get("failure") in NON_WORK_FAILURES:
         return True
     return prior.get("failure") != "work" and prior.get("exit_code") == 75
 
@@ -1299,6 +1310,10 @@ def climb_reason(prior, cache_path):
     return None
 
 
+def brief_wants_pr(text):
+    return NO_PR_BRIEF.search(text or "") is None
+
+
 def rung_context(brief, launches_path, lease=None):
     try:
         with open(brief) as fh:
@@ -1315,7 +1330,7 @@ def rung_context(brief, launches_path, lease=None):
     cache_path = os.path.join(os.path.dirname(launches_path), "verifier-cache.json")
     ctx = {"rung": rung, "rung_source": "brief line" if matches else "default",
            "ticket": ticket, "job": key, "state_path": state_path, "cache_path": cache_path,
-           "rung_reason": f"rung {rung}"}
+           "pr_expected": brief_wants_pr(text), "rung_reason": f"rung {rung}"}
     prior = read_state(state_path).get(key)
     if prior and not no_climb_attempt(prior):
         reason = climb_reason(prior, cache_path)
@@ -1457,7 +1472,7 @@ def measured_output(fh, tail):
             found = True
             for key in totals:
                 totals[key] += usage[key]
-        if record.get("type") == "result" or "stats" in record:
+        if record.get("type") == "result" or "stats" in record or "conversation_id" in record:
             final = record.get("text", record.get("result", record.get("response", "")))
         elif record.get("type") == "message_end":
             message = record.get("message", {})
@@ -1483,15 +1498,17 @@ def measured_output(fh, tail):
     return output
 
 
-def attempt_failure(code, pr_url, lane_failure, refused=None, silent=False):
+def attempt_failure(code, pr_url, lane_failure, refused=None, silent=False, pr_expected=True):
     if refused:
         return "environment"
     if lane_failure and code != 0:
         return "lane"
     if silent and not pr_url:
         return "silent"
-    if code != 0 or not pr_url:
+    if code != 0:
         return "work"
+    if not pr_url:
+        return "work" if pr_expected else "no-pr"
     return None
 
 
@@ -1503,10 +1520,13 @@ def launch_finish(path, launch_id, ctx, lane, code, output, cfg, now=None, lane_
     if tokens is not None and all(number(price.get(k)) is not None for k in tokens):
         cost = sum(tokens[k] * price[k] for k in tokens) / 1_000_000
     pr_url = getattr(output, "pr_url", None)
+    pr_expected = ctx.get("pr_expected", True)
     finish = {"event": "finish", "launch_id": launch_id, "finished_at": time.time() if now is None else now,
               "exit_code": code, "pr_url": pr_url, "tokens": tokens,
               "cost_usd": cost, "cost_basis": "list-equivalent",
-              "failure": attempt_failure(code, pr_url, lane_failure, refused=refused, silent=silent)}
+              "pr_expected": pr_expected,
+              "failure": attempt_failure(code, pr_url, lane_failure, refused=refused, silent=silent,
+                                         pr_expected=pr_expected)}
     if refused:
         finish["refused"] = refused
     append_launch(path, finish)
@@ -1562,9 +1582,18 @@ def rung_report(path=LAUNCHES, last=50, verdict_reader=None):
         pass
     unfinished = len(set(starts) - {row["launch_id"] for row in finished})
     jobs = sorted(finished, key=lambda row: row["finished_at"])[-last:]
-    groups, passes, unknowns, missing_cost, hard_failed, total = {}, 0, 0, 0, 0, 0.0
+    groups, passes, unknowns, missing_cost, hard_failed, not_work, total = {}, 0, 0, 0, 0, 0, 0.0
     for row in jobs:
-        failed = row.get("exit_code") != 0 or not row.get("pr_url")
+        failure = row.get("failure")
+        if failure is None and row.get("pr_expected") is False:
+            failure = "no-pr"
+        lane_problem = failure in NON_WORK_FAILURES
+        if lane_problem:
+            failed = False
+        elif failure is not None:
+            failed = True
+        else:
+            failed = row.get("exit_code") != 0 or not row.get("pr_url")
         verdict = None
         if row.get("pr_url"):
             try:
@@ -1573,17 +1602,18 @@ def rung_report(path=LAUNCHES, last=50, verdict_reader=None):
                 errors += 1
         if failed:
             errors += 1
-        passed = not failed and verdict == "PASS"
-        known = failed or verdict is not None
+        passed = not failed and not lane_problem and verdict == "PASS"
+        known = not lane_problem and (failed or verdict is not None)
         cost = number(row.get("cost_usd"))
         if cost is not None and (not math.isfinite(cost) or cost < 0):
             cost = None
             errors += 1
+        not_work += int(lane_problem)
         passes += int(passed)
         unknowns += int(not known or cost is None)
         missing_cost += int(cost is None)
         total += cost or 0
-        hard_failed += int(row.get("rung") == "hard" and (failed or verdict == "FAIL"))
+        hard_failed += int(row.get("rung") == "hard" and (failed or (not lane_problem and verdict == "FAIL")))
         key = (row.get("rung", "unknown"), row.get("model") or "unknown")
         group = groups.setdefault(key, {"jobs": 0, "passes": 0, "known": 0, "costs": []})
         group["jobs"] += 1
@@ -1593,6 +1623,7 @@ def rung_report(path=LAUNCHES, last=50, verdict_reader=None):
             group["costs"].append(cost)
     return {"jobs": len(jobs), "passes": passes, "unknowns": unknowns, "errors": errors,
             "legacy_missing_finish": legacy, "unfinished": unfinished, "hard_failed": hard_failed,
+            "not_work": not_work,
             "missing_cost": missing_cost, "total_known_cost_usd": total,
             "cost_per_first_pass": total / passes if passes and not missing_cost else None,
             "groups": [{"rung": rung, "model": model, **group} for (rung, model), group in sorted(groups.items())]}
@@ -1604,7 +1635,7 @@ def rung_report_lines(report):
     yield (f"cost per first-pass job = {value} (list-equivalent); jobs={report['jobs']} passes={report['passes']} "
            f"unknowns={report['unknowns']} errors={report['errors']}; missing_cost={report['missing_cost']} "
            f"legacy_missing_finish={report['legacy_missing_finish']} unfinished={report['unfinished']} "
-           f"hard_failed={report['hard_failed']}")
+           f"hard_failed={report['hard_failed']} not_work={report['not_work']}")
     yield "rung model jobs first-pass (known reviews/run failures) average cost (list-equivalent)"
     for group in report["groups"]:
         rate = f"{group['passes'] / group['known']:.1%}" if group["known"] else "unknown"
