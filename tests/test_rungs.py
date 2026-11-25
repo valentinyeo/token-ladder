@@ -282,7 +282,8 @@ class RungPreviewTests(unittest.TestCase):
         self.assertIn("plan-pick: rung hard has no free lane; running at medium", ran.stderr)
         state = json.loads((self.launches.parent / "rung-attempts.json").read_text())["ticket:T-1"]
         self.assertEqual((state["rung"], state["rung_climbed"]), ("medium", "hard"))
-        self.assertIn("Rung: hard", self.cli(lease=True).stdout)
+        self.assertIn("Rung: medium (rung hard (prior run failed); rung hard has no free lane; running at medium)",
+                      self.cli(lease=True).stdout)
 
     def test_lane_limit_prior_leaves_plain_preview_and_run_on_the_brief_rung(self):
         self.prior(rung="hard", exit_code=3, pr_url=None, failure="lane")
