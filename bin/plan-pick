@@ -286,16 +286,40 @@ def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=N
     return {"allowed": not why, "reason": f"{lane['lane']}: {why or 'allowed'}"}
 
 
+LAST_RESORT_LANES = frozenset({"openrouter"})
+
+
+def lane_balance_score(lane, pools):
+    pool = lane_pool(lane, pools)
+    if not isinstance(pool, dict):
+        return 1.0
+    ratio = number(pool.get("pace_ratio"))
+    if ratio is not None:
+        return ratio
+    used_pct = number(pool.get("used_pct"))
+    if used_pct is not None:
+        return used_pct / 100.0
+    credit, limit = number(pool.get("credits_usd")), number(pool.get("limit_usd"))
+    if credit is not None and limit is not None and limit > 0:
+        return max(0.0, min(1.0, (limit - credit) / limit))
+    used, total = number(pool.get("used")), number(pool.get("limit"))
+    if used is not None and total is not None and total > 0:
+        return max(0.0, min(1.0, used / total))
+    return 1.0
+
+
 def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None, strict_pace=False,
-         held=None):
+         held=None, balance=False):
     pools = pools if isinstance(pools, dict) else {}
     limits = limits if isinstance(limits, dict) else {}
     now = time.time() if now is None else now
     held = held_agent_lanes(now) if held is None else held
     clause = agent_hold_clause(lanes, held, pools)
+    held_last = {lane["lane"] for lane in lanes if lane_held_by_agents(lane, held)
+                 and pool_hold_pressure(lane_pool(lane, pools))}
     lanes = lanes_with_agent_holds(lanes, held, pools)
-    skipped, ahead = {}, {}
-    for lane in lanes:
+    skipped, ahead, eligible = {}, {}, []
+    for index, lane in enumerate(lanes):
         name = lane["lane"]
         pool = lane_pool(lane, pools)
         no_pace = burn is not None and name == burn["lane"]
@@ -309,14 +333,30 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
             if why.startswith("pace"):
                 ahead[name] = number(pool.get("pace_ratio"))
             continue
-        if no_pace:
-            hh = datetime.fromtimestamp(burn["until"], timezone.utc).strftime("%H:%M")
-            reason = f"burn: {name} first until {hh} UTC"
+        first_active = (lane_first_until(lane) or 0) > now
+        if not balance or no_pace or first_active:
+            if no_pace:
+                hh = datetime.fromtimestamp(burn["until"], timezone.utc).strftime("%H:%M")
+                reason = f"burn: {name} first until {hh} UTC"
+            else:
+                reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(pool, warn)}"
+            if skipped:
+                reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
+            return {"plan": name, "command": lane["command"], "reason": reason + clause}
+        eligible.append((index, lane, pool))
+    if eligible:
+        primary = [item for item in eligible if item[1]["lane"] not in LAST_RESORT_LANES
+                   and item[1]["lane"] not in held_last]
+        group = primary or eligible
+        _, chosen_lane, chosen_pool = min(group, key=lambda item: (lane_balance_score(item[1], pools), item[0]))
+        if len(group) > 1:
+            peers = ", ".join(item[1]["lane"] for item in group)
+            reason = f"lowest pace among free lanes ({peers}): {pool_note(chosen_pool, warn)}"
         else:
-            reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(pool, warn)}"
+            reason = f"first lane that is not used up, limited or ahead of pace: {pool_note(chosen_pool, warn)}"
         if skipped:
             reason += "; skipped " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
-        return {"plan": name, "command": lane["command"], "reason": reason + clause}
+        return {"plan": chosen_lane["lane"], "command": chosen_lane["command"], "reason": reason + clause}
     codex = pools.get("codex")
     codex_ahead = isinstance(codex, dict) and (number(codex.get("pace_ratio")) or 0) > 1.3
     frees = {}
@@ -1283,7 +1323,8 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         if rung:
             result, rung, eligible = pick_rung(available, pools, cfg, rung, read_limits(limits_path), warn, now)
         else:
-            result = pick(available, pools, read_limits(limits_path), now, warn, burn)
+            result = pick(available, pools, read_limits(limits_path), now, warn, burn,
+                          balance=bool(cfg.get("balance_lanes")))
         if not result["command"]:
             log_launch(launches_path, None, now, not_vendor)
             record_no_lane(rung, now)
@@ -1578,7 +1619,8 @@ def pick_rung(lanes, pools, cfg, ctx, limits, warn, now=None):
 
     def attempt(rung):
         eligible = rung_lanes(lanes, cfg, rung)
-        return pick(eligible, pools, limits, now, warn, strict_pace=True), eligible
+        return pick(eligible, pools, limits, now, warn, strict_pace=True,
+                    balance=bool(cfg.get("balance_lanes"))), eligible
 
     result, eligible = attempt(ctx["rung"])
     while not result["command"] and ctx["rung"] != RUNGS[-1]:
@@ -2030,6 +2072,10 @@ def credit_pool(entry, now, cfg):
     if now - entry["at"] > stale_s:
         return None
     extra = {"credits_usd": entry["usd"], "credit_floor_usd": floor}
+    limit_usd = number(entry.get("limit_usd"))
+    if limit_usd is not None and limit_usd > 0:
+        extra["limit_usd"] = limit_usd
+        extra["used_pct"] = round(max(0.0, min(100.0, (limit_usd - entry["usd"]) / limit_usd * 100.0)), 2)
     if entry.get("resets_at") is not None:
         extra["resets_at"] = entry["resets_at"]
     if entry["usd"] < floor:
@@ -3120,7 +3166,8 @@ def main(argv):
         if rung:
             result, rung, _ = pick_rung(lanes, pools, cfg, rung, read_limits(), warn)
         else:
-            result = pick(lanes, pools, read_limits(), warn=warn, burn=burn)
+            result = pick(lanes, pools, read_limits(), warn=warn, burn=burn,
+                          balance=bool(cfg.get("balance_lanes")))
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         print(f"plan-pick: cannot pick rung: {exc}", file=sys.stderr)
         return 1

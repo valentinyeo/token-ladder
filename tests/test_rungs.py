@@ -563,3 +563,51 @@ class RungOutcomeRecordTests(unittest.TestCase):
             pp.launch_finish(self.log, "later", ctx, lane, 0, output, {})
         row = json.loads(Path(self.log).read_text().splitlines()[0])
         self.assertEqual(row["finished_at"], 5000.0)
+
+
+class BalanceLanesTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = pp.load_config()
+        self.lanes = pp.lanes_from(self.cfg)
+        self.ctx = {"rung": "medium", "rung_source": "default", "rung_reason": "rung medium"}
+
+    def test_config_enables_balance_lanes(self):
+        self.assertTrue(self.cfg.get("balance_lanes"))
+
+    def test_picks_most_behind_pace_and_keeps_openrouter_last_resort(self):
+        pools = {
+            "opencode": {"state": "ON", "pace_ratio": 0.95},
+            "google": {"state": "ON", "pace_ratio": 0.80},
+            "credit:vercel": pp.credit_pool({"at": 100, "usd": 17.38, "limit_usd": 110}, 100, self.cfg),
+            "credit:commandcode": {"state": "ON", "pace_ratio": 0.30},
+            "credit:openrouter": {"state": "ON", "credits_usd": 10.0, "credit_floor_usd": 2.0, "used_pct": 1.0},
+            "codex": {"state": "ON", "pace_ratio": 0.65},
+            "grok": {"state": "OFF"},
+        }
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
+        self.assertEqual(result["plan"], "commandcode")
+        self.assertIn("lowest pace among free lanes", result["reason"])
+        pools["credit:commandcode"] = {"state": "ON", "pace_ratio": 0.90}
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
+        self.assertEqual(result["plan"], "codex")
+        pools["codex"] = {"state": "ON", "pace_ratio": 0.95}
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
+        self.assertEqual(result["plan"], "antigravity")
+
+    def test_burn_override_still_wins_over_balance_lanes(self):
+        pools = {
+            "opencode": {"state": "ON", "pace_ratio": 0.95},
+            "google": {"state": "ON", "pace_ratio": 0.20},
+            "codex": {"state": "ON", "pace_ratio": 0.50},
+        }
+        burn = {"lane": "codex", "until": 3700}
+        ordered = pp.lanes_with_burn(self.lanes, burn)
+        result = pp.pick(ordered, pools, {}, 100, warn=1.1, burn=burn, balance=True)
+        self.assertEqual(result["plan"], "codex")
+        self.assertIn("burn:", result["reason"])
+
+    def test_credit_pool_computes_used_pct_from_limit_usd(self):
+        state = pp.credit_pool({"at": 100, "usd": 22.0, "limit_usd": 110.0}, 100, self.cfg)
+        self.assertEqual(state["used_pct"], 80.0)
+        self.assertAlmostEqual(pp.lane_balance_score({"lane": "vercel", "credit": "vercel"},
+                                                     {"credit:vercel": state}), 0.80)
