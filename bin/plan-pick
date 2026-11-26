@@ -102,6 +102,8 @@ DEFAULT_LOOP_AHEAD_RATIO = 1.0
 DEFAULT_LOOP_FAR_AHEAD_RATIO = 1.2
 DEFAULT_LOOP_USED_PCT = 95
 DEFAULT_LOOP_MIN_SECONDS = 1800
+HELD_PRESSURE_PACE = 1.0
+HELD_PRESSURE_USED_PCT = 50
 PLANS_NOTE = "Included means no extra cost: never quote API pricing or ask for a spend cap for these."
 VPS_STATE = "~/.local/share/vstack/skills/vps-state/vps-state"
 SERVER_CHECK_TIMEOUT = 15
@@ -113,12 +115,24 @@ def number(value):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+def lane_pool(lane, pools):
+    return pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+
+
+def pool_is_used_up(pool):
+    if not isinstance(pool, dict):
+        return False
+    used = number(pool.get("used_pct"))
+    return bool(pool.get("used_up") or pool.get("state") == "OFF"
+                or (pool.get("funding") != "prepaid" and (used or 0) >= 100))
+
+
 def skip_reason(pool, warn, no_pace=False):
     if not isinstance(pool, dict):
         return None
     if pool.get("credit_unknown"):
         return "credit unknown" + (f": {pool['note']}" if pool.get("note") else "")
-    if pool.get("state") == "OFF" or (pool.get("funding") != "prepaid" and (number(pool.get("used_pct")) or 0) >= 100):
+    if pool_is_used_up(pool):
         return "used up" + (f": {pool['note']}" if pool.get("note") else "")
     ratio = number(pool.get("pace_ratio"))
     if not no_pace and ratio is not None and ratio > warn:
@@ -235,7 +249,7 @@ def limit_note(skip):
 
 def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
     name = lane["lane"]
-    pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+    pool = lane_pool(lane, pools)
     if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
         return "chat-only pool, never workers"
     skip = parse_limit(limits, name, now)
@@ -260,7 +274,7 @@ def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=N
         if lane["lane"] not in allowed:
             return {"allowed": False,
                     "reason": f"{lane['lane']}: not in rung {rung['rung']} ({rung['rung_reason']})"}
-    pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+    pool = lane_pool(lane, pools)
     why = lane_skip_reason(lane, pools, limits, now, warn)
     if not why and lane.get("credit") and not isinstance(pool, dict):
         why = "credit unknown"
@@ -277,12 +291,12 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
     limits = limits if isinstance(limits, dict) else {}
     now = time.time() if now is None else now
     held = held_agent_lanes(now) if held is None else held
-    clause = agent_hold_clause(lanes, held)
-    lanes = lanes_with_agent_holds(lanes, held)
+    clause = agent_hold_clause(lanes, held, pools)
+    lanes = lanes_with_agent_holds(lanes, held, pools)
     skipped, ahead = {}, {}
     for lane in lanes:
         name = lane["lane"]
-        pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+        pool = lane_pool(lane, pools)
         no_pace = burn is not None and name == burn["lane"]
         skip = parse_limit(limits, name, now)
         if skip is not None:
@@ -308,7 +322,7 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
     for lane in lanes:
         name = lane["lane"]
         skip = parse_limit(limits, name, now)
-        pool = pools.get(lane.get("pool")) or pools.get(f"credit:{lane.get('credit')}")
+        pool = lane_pool(lane, pools)
         if skip and (not codex_ahead or (not skip_reason(pool, warn, no_pace=True) and not (
                 isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats")))):
             frees[name] = skip["until"]
@@ -575,18 +589,58 @@ def lane_held_by_agents(lane, held):
     return held.get(lane["lane"].lower(), 0) > 0
 
 
-def lanes_with_agent_holds(lanes, held):
+def pool_hold_pressure(pool):
+    if not isinstance(pool, dict):
+        return False
+    if pool_is_used_up(pool):
+        return True
+    used, ratio = number(pool.get("used_pct")), number(pool.get("pace_ratio"))
+    return (used is not None and used >= HELD_PRESSURE_USED_PCT) or (
+        ratio is not None and ratio > HELD_PRESSURE_PACE)
+
+
+def pool_hold_note(pool):
+    if not isinstance(pool, dict):
+        return "usage unknown"
+    if pool_is_used_up(pool):
+        return "used up"
+    used, ratio = number(pool.get("used_pct")), number(pool.get("pace_ratio"))
+    over_pace = (ratio is not None and ratio > HELD_PRESSURE_PACE
+                 and (used is None or used < HELD_PRESSURE_USED_PCT))
+    if over_pace:
+        return f"pace {ratio:.2f}x"
+    if used is not None:
+        return f"{used:g}% used"
+    if ratio is not None:
+        return f"pace {ratio:.2f}x"
+    return "usage unknown"
+
+
+def lanes_with_agent_holds(lanes, held, pools):
     if not held:
         return lanes
-    last = [lane for lane in lanes if lane_held_by_agents(lane, held)]
+    last = {lane["lane"] for lane in lanes if lane_held_by_agents(lane, held)
+            and pool_hold_pressure(lane_pool(lane, pools))}
     if not last:
         return lanes
-    return [lane for lane in lanes if not lane_held_by_agents(lane, held)] + last
+    front = [lane for lane in lanes if lane["lane"] not in last]
+    return front + [lane for lane in lanes if lane["lane"] in last]
 
 
-def agent_hold_clause(lanes, held):
-    return "".join(f"; {lane['lane']} held by agent chats; tried last"
-                   for lane in lanes if lane_held_by_agents(lane, held))
+def agent_hold_clause(lanes, held, pools):
+    parts = []
+    for lane in lanes:
+        if not lane_held_by_agents(lane, held):
+            continue
+        count = held[lane["lane"].lower()]
+        pool = lane_pool(lane, pools)
+        chats = f"{count:g} agent chat" + ("" if count == 1 else "s")
+        note = pool_hold_note(pool)
+        if pool_hold_pressure(pool):
+            parts.append(f"; {lane['lane']} held by {chats}, {note}: tried last")
+        else:
+            parts.append(f"; {lane['lane']} held by {chats}, but {note}: normal order")
+    return "".join(parts)
 
 
 def lane_names(lane):

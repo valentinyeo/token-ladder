@@ -55,13 +55,13 @@ For the default medium rung, the Cursor lane runs first while its `first_until` 
 
 ### Agent-held lanes
 
-When Multibot runs agent chats on a plan, `plan-pick` keeps that plan for them and tries its lane last. Multibot writes `~/.local/state/multiprompt/agent-providers.json` atomically after every workspace AI switch:
+When Multibot runs agent chats on a plan, `plan-pick` keeps that plan for them and tries its lane last while the plan is under pressure. Multibot writes `~/.local/state/multiprompt/agent-providers.json` atomically after every workspace AI switch:
 
 ```json
 {"updated": "2026-11-24T10:00:00Z", "chats": [{"workspace": "HT Product", "chat": "HT Bugs", "tmux": "live-abc", "provider": "antigravity", "model": "gemini-4-neon", "since": "2026-11-24T09:40:00Z"}], "by_provider": {"antigravity": 3, "codex": 1, "claude": 2}}
 ```
 
-A lane is held when `by_provider[<lane>] > 0`, and provider names are the lane names above. A held lane keeps its rung eligibility but moves behind every lane that is not held, and the pick line says `antigravity held by agent chats; tried last`. `claude` is not a worker lane, so it never holds one. A missing or unreadable file, a file older than 24 hours by `updated`, or a count that is not a number changes nothing. A malformed file changes nothing and prints one note. `plan-pick` only reads the file. `PLAN_PICK_AGENT_PLANS` overrides the path, for tests.
+A lane is held when `by_provider[<lane>] > 0`, and provider names are the lane names above. A held lane keeps its rung eligibility and moves behind every lane that still has room only while its own pool is under pressure: `pace_ratio` above 1.0, `used_pct` at 50 or more, or used up. With plenty left it keeps its normal place. A pool with no reading counts as no pressure. The pick line says which: `antigravity held by 3 agent chats, 62% used: tried last` or `antigravity held by 3 agent chats, but 0% used: normal order`. `claude` is not a worker lane, so it never holds one. A missing or unreadable file, a file older than 24 hours by `updated`, or a count that is not a number changes nothing. A malformed file changes nothing and prints one note. `plan-pick` only reads the file. `PLAN_PICK_AGENT_PLANS` overrides the path, for tests.
 
 ### Worker rungs and first-review cost
 
