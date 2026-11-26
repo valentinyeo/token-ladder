@@ -1676,7 +1676,7 @@ class AuthorModelTests(unittest.TestCase):
         def runner(command):
             self.ran.append(command)
             if "cat " in command:
-                self.briefs.append(Path(command.split("cat ", 1)[1].split('"', 1)[0]).read_text())
+                self.briefs.append(Path(command.split("cat ", 1)[1].split(")", 1)[0]).read_text())
             return outcomes.pop(0)
         return pp.run_lanes(lanes, {}, {}, 1.1, runner, self.limits, T, self.said.append,
                             launches_path=str(self.launches), brief=str(self.brief))
@@ -1704,7 +1704,7 @@ class AuthorModelTests(unittest.TestCase):
     def test_a_lane_without_a_model_gets_no_line_and_says_so(self):
         self.run_lane([{"lane": "opencode", "pool": None, "command": "run opencode"}], [(0, "done")])
         self.assertEqual(self.ran, ["run opencode"])
-        self.assertIn("runs no readable --model, so it gets no Author model line", " ".join(self.said))
+        self.assertIn("gets no Author model line (no readable --model or unknown family)", " ".join(self.said))
         self.assertNotIn("author_model", self.logged()[0])
 
     def test_the_family_comes_from_the_model_not_the_lane_name(self):

@@ -21,7 +21,10 @@ from datetime import datetime, timezone
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(HERE), "ci"))
-from model_families import model_family
+try:
+    from model_families import model_family
+except ImportError:
+    model_family = None
 
 DEFAULT_PACE_WARN = 1.1
 DEFAULT_LIMITED_HOURS = 1.0
@@ -1023,7 +1026,7 @@ LANE_MODEL = re.compile(r"--model(?:=|\s+)([\w./:+-]+)")
 
 def author_model(command):
     match = LANE_MODEL.search(command or "")
-    if not match:
+    if not match or model_family is None:
         return None
     model = match[1].rsplit("/", 1)[-1]
     try:
@@ -1237,7 +1240,7 @@ def run_lanes(lanes, pools, cfg, warn, runner=run_worker, limits_path=LIMITS, no
         value = author_model(result["command"])
         metadata = {"author_model": value} if value else None
         if not value:
-            say(f"lane {result['plan']} runs no readable --model, so it gets no Author model line")
+            say(f"lane {result['plan']} gets no Author model line (no readable --model or unknown family)")
         command, brief_copy = lane_brief(result["command"], brief, value)
         launch_id = uuid.uuid4().hex
         if rung:
