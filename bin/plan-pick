@@ -16,6 +16,7 @@ import sys
 import time
 import tempfile
 import uuid
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -2120,7 +2121,12 @@ def usage_export_child():
     try:
         sys.stdout.write(fetch_usage_export(key))
     except (OSError, ValueError) as exc:
-        print(f"plan-pick: cannot read the OpenCode usage export: {type(exc).__name__}", file=sys.stderr)
+        cause = type(exc).__name__
+        if isinstance(exc, urllib.error.HTTPError):
+            cause = f"HTTP {exc.code}"
+        elif isinstance(exc, urllib.error.URLError) and isinstance(exc.reason, OSError):
+            cause = f"URLError ({type(exc.reason).__name__})"
+        print(f"plan-pick: cannot read the OpenCode usage export: {cause}", file=sys.stderr)
         return 1
     return 0
 
