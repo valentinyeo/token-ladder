@@ -572,10 +572,11 @@ class AgentPlanHoldTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("malformed"), 1)
 
     def test_a_file_older_than_a_day_is_ignored(self):
-        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, antigravity=3))["plan"],
-                         "antigravity")
-        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, antigravity=3))["plan"],
-                         "codex")
+        pressed = {"google": {"used_pct": 62}}
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, antigravity=3),
+                                             pools=pressed)["plan"], "antigravity")
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, antigravity=3),
+                                             pools=pressed)["plan"], "codex")
 
     def test_a_held_lane_keeps_its_rung_eligibility(self):
         cfg = {"rungs": {rung: [{"lane": "antigravity"}, {"lane": "codex"}] for rung in pp.RUNGS}}
