@@ -1908,7 +1908,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(got["plan"], "antigravity")
         self.assertIn("opencode (limited until", got["reason"])
         self.cli("--limited", "antigravity")
-        self.assertEqual(json.loads(self.run_cli({}, "--json").stdout)["plan"], "openrouter")
+        self.assertEqual(json.loads(self.run_cli({}, "--json").stdout)["plan"], "codex")
 
     def test_run_skips_a_400_lane_end_to_end(self):
         cfg = {"lanes": [{"lane": "a", "pool": None, "command": "echo '400 model request was rejected'; exit 1"},
@@ -1973,14 +1973,15 @@ class CommandTests(unittest.TestCase):
         self.assertIn("used up", out.stderr)
 
     def test_not_vendor_skips_the_authors_vendor(self):
-        got = json.loads(self.run_cli({"codex": pool()}, "--json", "--not-vendor", "deepseek").stdout)
+        pools = {"google": pool(), "codex": pool()}
+        got = json.loads(self.run_cli(pools, "--json", "--not-vendor", "deepseek").stdout)
         self.assertEqual(got["plan"], "antigravity")
-        line = self.run_cli({"codex": pool()}, "--not-vendor", "deepseek").stdout
+        line = self.run_cli(pools, "--not-vendor", "deepseek").stdout
         self.assertTrue(line.startswith("Worker plan: antigravity. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
 
     def test_not_vendor_excludes_google_for_a_google_author(self):
         self.cli("--limited", "opencode")
-        got = json.loads(self.run_cli({"codex": pool()}, "--json", "--not-vendor", "Google").stdout)
+        got = json.loads(self.run_cli({"codex": pool(ratio=1.0)}, "--json", "--not-vendor", "Google").stdout)
         self.assertEqual(got["plan"], "vercel")
 
     def test_not_vendor_excludes_each_lane_by_its_own_vendor(self):
@@ -2000,7 +2001,7 @@ class CommandTests(unittest.TestCase):
     def test_not_vendor_also_applies_to_json(self):
         out = self.plan_not_from("vercel", ("opencode", "antigravity"), "--json")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(json.loads(out.stdout)["plan"], "openrouter")
+        self.assertEqual(json.loads(out.stdout)["plan"], "codex")
 
     def test_not_vendor_accumulates_repeats_and_comma_lists(self):
         cfg = {"lanes": [{"lane": name, "vendor": name, "command": f"echo {name}-ran"}

@@ -166,6 +166,7 @@
   ],
   "opencode_monthly_slack_pct": 25,
   "antigravity_reserve_share_pct": 100,
+  "balance_lanes": true,
   "limited_hours": 1,
   "pool_off_pct": 95,
   "claude_floor_percent": 15,
