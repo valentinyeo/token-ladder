@@ -488,20 +488,50 @@ class AgentPlanHoldTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}):
             return pp.pick(AGENT_LANES if lanes is None else lanes, pools or {}, {}, now)
 
-    def test_held_plan_moves_behind_a_free_lane(self):
-        got = self.pick_with_file(self.providers(antigravity=3))
+    def test_held_plan_moves_behind_a_free_lane_when_its_pool_is_pressed(self):
+        got = self.pick_with_file(self.providers(antigravity=3), pools={"google": {"used_pct": 62}})
         self.assertEqual((got["plan"], got["command"]), ("codex", "run codex"))
-        self.assertIn("antigravity held by agent chats; tried last", got["reason"])
+        self.assertIn("antigravity held by 3 agent chats, 62% used: tried last", got["reason"])
+
+    def test_a_held_lane_with_plenty_left_keeps_its_rung_order(self):
+        got = self.pick_with_file(self.providers(antigravity=3),
+                                  pools={"google": {"used_pct": 0, "pace_ratio": 0.2}})
+        self.assertEqual((got["plan"], got["command"]), ("antigravity", "run agy"))
+        self.assertIn("antigravity held by 3 agent chats, but 0% used: normal order", got["reason"])
+
+    def test_a_held_lane_without_a_reader_keeps_its_rung_order(self):
+        got = self.pick_with_file(self.providers(antigravity=1))
+        self.assertEqual(got["plan"], "antigravity")
+        self.assertIn("antigravity held by 1 agent chat, but usage unknown: normal order", got["reason"])
+
+    def test_half_used_presses_a_held_lane(self):
+        got = self.pick_with_file(self.providers(antigravity=2),
+                                  pools={"google": {"used_pct": 50, "pace_ratio": 0.9}})
+        self.assertEqual(got["plan"], "codex")
+        self.assertIn("50% used: tried last", got["reason"])
+
+    def test_pace_above_one_presses_a_held_lane(self):
+        got = self.pick_with_file(self.providers(antigravity=2),
+                                  pools={"google": {"used_pct": 10, "pace_ratio": 1.1}})
+        self.assertEqual(got["plan"], "codex")
+        self.assertIn("pace 1.10x: tried last", got["reason"])
+
+    def test_a_used_up_held_lane_goes_last(self):
+        got = self.pick_with_file(self.providers(antigravity=2),
+                                  pools={"google": {"used_pct": 10, "state": "OFF"}})
+        self.assertEqual(got["plan"], "codex")
+        self.assertIn("used up: tried last", got["reason"])
 
     def test_a_file_with_no_chats_keeps_the_shipped_order(self):
         got = self.pick_with_file(self.providers(antigravity=0, codex=0))
         self.assertEqual(got["plan"], "antigravity")
         self.assertNotIn("held by agent chats", got["reason"])
 
-    def test_only_held_plans_left_still_run_the_first_of_them(self):
-        got = self.pick_with_file(self.providers(antigravity=2, codex=1))
+    def test_only_pressed_plans_left_still_run_the_first_of_them(self):
+        got = self.pick_with_file(self.providers(antigravity=2, codex=1),
+                                  pools={"google": {"used_pct": 70}, "codex": {"used_pct": 80}})
         self.assertEqual((got["plan"], got["command"]), ("antigravity", "run agy"))
-        self.assertIn("antigravity held by agent chats; tried last", got["reason"])
+        self.assertIn("antigravity held by 2 agent chats, 70% used: tried last", got["reason"])
 
     def test_claude_and_unknown_providers_never_hold_a_lane(self):
         got = self.pick_with_file(self.providers(claude=4, baseten=2))
@@ -542,10 +572,11 @@ class AgentPlanHoldTests(unittest.TestCase):
         self.assertEqual(errors.getvalue().count("malformed"), 1)
 
     def test_a_file_older_than_a_day_is_ignored(self):
-        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, antigravity=3))["plan"],
-                         "antigravity")
-        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, antigravity=3))["plan"],
-                         "codex")
+        pressed = {"google": {"used_pct": 62}}
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, antigravity=3),
+                                             pools=pressed)["plan"], "antigravity")
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, antigravity=3),
+                                             pools=pressed)["plan"], "codex")
 
     def test_a_held_lane_keeps_its_rung_eligibility(self):
         cfg = {"rungs": {rung: [{"lane": "antigravity"}, {"lane": "codex"}] for rung in pp.RUNGS}}
@@ -553,27 +584,37 @@ class AgentPlanHoldTests(unittest.TestCase):
                "job": "job", "state_path": str(self.home / "rung-attempts.json"),
                "cache_path": str(self.home / "verifier-cache.json")}
         path = self.plans_file(self.providers(antigravity=3))
+        pools = {"google": {"used_pct": 62}}
         with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}):
-            free, _, _ = pp.pick_rung(AGENT_LANES, {}, cfg, ctx, {}, 1.1, T)
-            stuck, _, _ = pp.pick_rung(AGENT_LANES, {}, cfg, ctx, {"codex": T + 600}, 1.1, T)
+            free, _, _ = pp.pick_rung(AGENT_LANES, pools, cfg, ctx, {}, 1.1, T)
+            stuck, _, _ = pp.pick_rung(AGENT_LANES, pools, cfg, ctx, {"codex": T + 600}, 1.1, T)
         self.assertEqual(free["plan"], "codex")
-        self.assertIn("antigravity held by agent chats; tried last", free["reason"])
+        self.assertIn("antigravity held by 3 agent chats, 62% used: tried last", free["reason"])
         self.assertEqual(stuck["plan"], "antigravity")
 
-    def test_the_pick_line_says_the_held_lane_is_tried_last(self):
+    def cli(self, pools):
         repo = Path(tempfile.mkdtemp())
         (repo / "bin").mkdir()
         (repo / "bin" / "plan-pick").write_text(Path(REPO, "bin", "plan-pick").read_text())
         (repo / "config.json").write_text(json.dumps({"lanes": AGENT_LANES}))
-        pools = repo / "pools.json"
-        pools.write_text("{}")
-        out = subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools)],
-                             capture_output=True, text=True,
-                             env={"HOME": str(repo), "PATH": "/usr/bin:/bin",
-                                  "PLAN_PICK_AGENT_PLANS": str(self.plans_file(self.providers(antigravity=3)))})
+        pools_path = repo / "pools.json"
+        pools_path.write_text(json.dumps(pools))
+        return subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools_path)],
+                              capture_output=True, text=True,
+                              env={"HOME": str(repo), "PATH": "/usr/bin:/bin",
+                                   "PLAN_PICK_AGENT_PLANS": str(self.plans_file(self.providers(antigravity=3)))})
+
+    def test_the_pick_line_says_a_pressed_held_lane_is_tried_last(self):
+        out = self.cli({"google": {"used_pct": 62}})
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(out.stdout.startswith("Worker plan: codex."), out.stdout)
-        self.assertIn("antigravity held by agent chats; tried last", out.stdout)
+        self.assertIn("antigravity held by 3 agent chats, 62% used: tried last", out.stdout)
+
+    def test_the_pick_line_says_a_relaxed_held_lane_keeps_its_place(self):
+        out = self.cli({"google": {"used_pct": 0, "pace_ratio": 0.2}})
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(out.stdout.startswith("Worker plan: antigravity."), out.stdout)
+        self.assertIn("antigravity held by 3 agent chats, but 0% used: normal order", out.stdout)
 
 
 class RunTests(unittest.TestCase):
