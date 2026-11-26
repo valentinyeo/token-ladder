@@ -14,6 +14,8 @@ The systemd user units in `systemd/` run `collect` every five minutes. Copy them
 
 `plan-pick --run` asks the server first: it calls `vps-state --can-launch worker --no-write --brief` before launching a lane. On HOLD it starts nothing, logs lane `server-hold`, prints the vps-state line and exits 75 with the reason, so run it again in a few minutes. A missing binary, a timeout or any other exit never blocks a launch. Plain picks, `--json`, `--claude-helper` and `--lane-ok` skip the check.
 
+`--run` supplies each lane's own `Author model:` line. Before it launches a lane it reads that lane's `--model`, names the family the same way the verifier reads the model name (`deepseek-v4.1-flash` is `deepseek`, `gpt-6.1-sol` is `openai`, `glm-5.3-flash` is `zai`, `gemini-4-neon-high` is `google`, `composer-2.5` is `cursor`), exports `PLAN_PICK_AUTHOR_MODEL=<family>/<model>` for that lane, and appends `Your PR body must contain exactly: Author model: <family>/<model>` to a temporary copy of `brief.txt` that the lane reads. The value follows the lane that actually ran, so a fallback lane declares its own model. After the lane reports a pull request, `plan-pick` reads the body with `gh pr view`, rewrites a wrong or misspelled `Author model:` line, adds a missing one with `gh pr edit`, and prints one line saying what it changed. A body that already carries the exact line is left alone. A lane with no readable `--model` gets no line and says so.
+
 ## What the reader exposes
 
 ```sh

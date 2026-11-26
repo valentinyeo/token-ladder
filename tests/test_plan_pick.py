@@ -1657,6 +1657,148 @@ class WorkerEnvTests(unittest.TestCase):
         self.assertIn("no board login", tail)
 
 
+class AuthorModelTests(unittest.TestCase):
+    URL = "https://github.com/valentinyeo/token-ladder/pull/999"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.brief = self.dir / "brief.txt"
+        self.brief.write_text("Rung: medium\n\ncd /tmp/w320 || exit 1\n")
+        self.limits = str(self.dir / "limits.json")
+        self.launches = self.dir / "launches.jsonl"
+        self.ran, self.said, self.briefs = [], [], []
+
+    def lane(self, name, model):
+        return {"lane": name, "pool": None, "command": f'pi -p --model {model} "$(cat brief.txt)" </dev/null'}
+
+    def run_lane(self, lanes, outcomes):
+        def runner(command):
+            self.ran.append(command)
+            if "cat " in command:
+                self.briefs.append(Path(command.split("cat ", 1)[1].split(")", 1)[0]).read_text())
+            return outcomes.pop(0)
+        return pp.run_lanes(lanes, {}, {}, 1.1, runner, self.limits, T, self.said.append,
+                            launches_path=str(self.launches), brief=str(self.brief))
+
+    def test_each_lane_names_its_own_model_in_the_env_and_the_brief(self):
+        code = self.run_lane([self.lane("opencode", "deepseek-v4.1-flash"),
+                              self.lane("vercel-zai", "zai/glm-5.3-flash")],
+                             [(1, "429 Too Many Requests"), (0, "done")])
+        self.assertEqual(code, 0)
+        self.assertTrue(self.ran[0].startswith("export PLAN_PICK_AUTHOR_MODEL=deepseek/deepseek-v4.1-flash; "),
+                        self.ran[0])
+        self.assertTrue(self.ran[1].startswith("export PLAN_PICK_AUTHOR_MODEL=zai/glm-5.3-flash; "), self.ran[1])
+        self.assertIn("Your PR body must contain exactly: Author model: deepseek/deepseek-v4.1-flash",
+                      self.briefs[0])
+        self.assertIn("Your PR body must contain exactly: Author model: zai/glm-5.3-flash", self.briefs[1])
+        self.assertNotIn("zai/glm-5.3-flash", self.briefs[0])
+        self.assertIn("Rung: medium", self.briefs[0])
+        self.assertEqual(self.brief.read_text(), "Rung: medium\n\ncd /tmp/w320 || exit 1\n")
+        self.assertEqual([entry["author_model"] for entry in self.logged()],
+                         ["deepseek/deepseek-v4.1-flash", "zai/glm-5.3-flash"])
+
+    def logged(self):
+        return [json.loads(line) for line in self.launches.read_text().splitlines()]
+
+    def test_a_lane_without_a_model_gets_no_line_and_says_so(self):
+        self.run_lane([{"lane": "opencode", "pool": None, "command": "run opencode"}], [(0, "done")])
+        self.assertEqual(self.ran, ["run opencode"])
+        self.assertIn("gets no Author model line (no readable --model or unknown family)", " ".join(self.said))
+        self.assertNotIn("author_model", self.logged()[0])
+
+    def test_the_family_comes_from_the_model_not_the_lane_name(self):
+        cases = {"pi -p --model deepseek-v4.1-flash": "deepseek/deepseek-v4.1-flash",
+                 "pi -p --model zai/glm-5.3-flash": "zai/glm-5.3-flash",
+                 "pi -p --model opencode-go/deepseek-v4.1-flash-1017": "deepseek/deepseek-v4.1-flash-1017",
+                 "hax --json --model=gpt-6.1-sol": "openai/gpt-6.1-sol",
+                 "agy --print --model gemini-4-neon-high": "google/gemini-4-neon-high",
+                 "cursor-agent --model composer-2.5": "cursor/composer-2.5",
+                 "run opencode": None,
+                 "pi --model mystery-9": None}
+        for command, expected in cases.items():
+            with self.subTest(command=command):
+                self.assertEqual(pp.author_model(command), expected)
+
+    def test_a_wrong_author_model_line_is_rewritten(self):
+        body = "## Why\n\nstuff\n\nAuthor model: anthropic/claude-opus-4\n\nTicket: VSTA-320\n"
+        got, said = pp.author_model_body(body, "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(got, body.replace("anthropic/claude-opus-4", "deepseek/deepseek-v4.1-flash"))
+        self.assertEqual(said, "rewritten from anthropic/claude-opus-4 to deepseek/deepseek-v4.1-flash")
+
+    def test_a_misspelled_author_model_line_is_rewritten(self):
+        got, said = pp.author_model_body("body\nAuthor-Model: anthropic\n", "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(got, "body\nAuthor model: deepseek/deepseek-v4.1-flash\n")
+        self.assertEqual(said, "rewritten from anthropic to deepseek/deepseek-v4.1-flash")
+
+    def test_a_correct_author_model_line_is_left_alone(self):
+        for body in ("Author model: deepseek/deepseek-v4.1-flash\n",
+                     "body\n\nAuthor model: deepseek/deepseek-v4.1-flash\nTicket: VSTA-320\n"):
+            with self.subTest(body=body):
+                self.assertIsNone(pp.author_model_body(body, "deepseek/deepseek-v4.1-flash"))
+
+    def test_a_missing_author_model_line_is_added(self):
+        got, said = pp.author_model_body("body\n", "deepseek/deepseek-v4.1-flash")
+        self.assertEqual(got, "body\n\nAuthor model: deepseek/deepseek-v4.1-flash")
+        self.assertEqual(said, "added: deepseek/deepseek-v4.1-flash")
+
+    def test_gh_edits_only_that_pr(self):
+        run = mock.Mock(side_effect=[
+            subprocess.CompletedProcess([], 0, stdout="body\n\nAuthor model: anthropic/claude-sonnet\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr="")])
+        got = pp.fix_author_model(self.URL, "deepseek/deepseek-v4.1-flash", say=self.said.append, run=run)
+        self.assertIn("rewritten from anthropic/claude-sonnet", got)
+        self.assertEqual([call.args[0] for call in run.call_args_list],
+                         [["gh", "pr", "view", self.URL, "--json", "body", "--jq", ".body"],
+                          ["gh", "pr", "edit", self.URL, "--body-file", "-"]])
+        self.assertEqual(run.call_args_list[1].kwargs["input"],
+                         "body\n\nAuthor model: deepseek/deepseek-v4.1-flash\n")
+        self.assertEqual(self.said,
+                         [f"{self.URL}: Author model line rewritten from anthropic/claude-sonnet "
+                          f"to deepseek/deepseek-v4.1-flash"])
+
+    def test_a_correct_pr_body_is_not_edited(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 0, stdout="body\n\nAuthor model: deepseek/deepseek-v4.1-flash\n", stderr=""))
+        self.assertIsNone(pp.fix_author_model(self.URL, "deepseek/deepseek-v4.1-flash",
+                                             say=self.said.append, run=run))
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(self.said, [])
+
+    def test_a_gh_failure_is_said_and_does_not_stop_the_run(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="no auth"))
+        self.assertIsNone(pp.fix_author_model(self.URL, "deepseek/deepseek-v4.1-flash",
+                                             say=self.said.append, run=run))
+        self.assertIn("cannot set the Author model line: no auth", self.said[0])
+
+    def test_a_lane_that_opens_a_pr_gets_that_pr_fixed(self):
+        tail = type("Tail", (str,), {"pr_url": self.URL})(f"opened {self.URL}")
+
+        def runner(command):
+            self.ran.append(command)
+            return 0, tail
+        with mock.patch.object(pp, "fix_author_model") as fix:
+            code = pp.run_lanes([self.lane("opencode", "deepseek-v4.1-flash")], {}, {}, 1.1, runner,
+                                self.limits, T, self.said.append, launches_path=str(self.launches),
+                                brief=str(self.brief))
+        self.assertEqual(code, 0)
+        fix.assert_called_once_with(self.URL, "deepseek/deepseek-v4.1-flash", say=self.said.append)
+
+    def test_the_worker_process_carries_the_exported_value(self):
+        command, path = pp.lane_brief('echo "$PLAN_PICK_AUTHOR_MODEL"', str(self.brief),
+                                      "deepseek/deepseek-v4.1-flash")
+        self.addCleanup(pp.drop_brief, path)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code, tail = pp.run_command(command)
+        self.assertEqual(code, 0)
+        self.assertIn("deepseek/deepseek-v4.1-flash", out.getvalue())
+
+    def test_an_inherited_author_model_is_not_passed_on(self):
+        env = pp.worker_env({"PATH": "/usr/bin", "PLAN_PICK_AUTHOR_MODEL": "anthropic/claude-sonnet"})
+        self.assertNotIn("PLAN_PICK_AUTHOR_MODEL", env)
+
+
 class CommandTests(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp()
