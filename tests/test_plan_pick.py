@@ -464,6 +464,35 @@ class PickTests(unittest.TestCase):
         self.assertEqual(pick({"codex": pool("ON", 1.5)}, limits, warn=1.0)["plan"], "cursor")
 
 
+class TierFirstTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = pp.load_config()
+        self.medium = pp.rung_lanes(pp.lanes_from(self.cfg), self.cfg, "medium")
+        self.hard = pp.rung_lanes(pp.lanes_from(self.cfg), self.cfg, "hard")
+
+    def test_medium_prefers_a_cheap_deepseek_lane_over_a_lower_pace_codex(self):
+        pools = {"opencode": {"state": "ON", "pace_ratio": 0.95},
+                 "credit:commandcode": {"state": "ON", "pace_ratio": 0.86},
+                 "credit:vercel": {"state": "ON", "pace_ratio": 0.90},
+                 "codex": {"state": "ON", "pace_ratio": 0.50}, "grok": {"state": "OFF"}}
+        got = pp.pick(self.medium, pools, {}, T, balance=True)
+        self.assertEqual(got["plan"], "commandcode")
+        self.assertIn("lowest pace among free lanes (opencode, vercel, commandcode)", got["reason"])
+
+    def test_medium_falls_back_to_codex_when_every_cheap_deepseek_lane_is_gone(self):
+        limits = {name: T + 60 for name in ("opencode", "vercel", "commandcode")}
+        pools = {"codex": {"state": "ON", "pace_ratio": 0.50}, "grok": {"state": "OFF"},
+                 "credit:openrouter": {"state": "OFF"}}
+        got = pp.pick(self.medium, pools, limits, T, balance=True)
+        self.assertEqual(got["plan"], "codex")
+
+    def test_hard_still_picks_codex(self):
+        pools = {"codex": {"state": "ON", "pace_ratio": 0.50},
+                 "credit:commandcode": {"state": "ON", "pace_ratio": 0.10}, "grok": {"state": "OFF"}}
+        got = pp.pick(self.hard, pools, {}, T, balance=True)
+        self.assertEqual(got["plan"], "codex")
+
+
 class NoLaneTests(unittest.TestCase):
     def test_no_lane_names_the_next_free_lane_and_never_asks_to_pay(self):
         limits = {"vercel": T + 600, "deepseek": T + 3600, "opencode": T + 7200, "openrouter": T + 900}
