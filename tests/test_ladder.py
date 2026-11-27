@@ -233,3 +233,43 @@ class AgentHookTests(unittest.TestCase):
         result = self.hook()
         self.assertEqual(result.returncode, 0)
         self.assertEqual(json.loads(result.stdout)["hookSpecificOutput"]["permissionDecision"], "deny")
+
+
+class AntigravityHookTests(unittest.TestCase):
+    def test_worker_print_flags_are_refused_through_wrappers(self):
+        reason = ("Token ladder: Antigravity is orchestrator-only (chat-only); never run agy workers. "
+                  "Delegate via plan-pick --run to pi-deepseek or codex.")
+        for command in ('agy --print "implement this"', 'agy -p "implement this"',
+                        'agy --print=implement', 'agy -pimplement',
+                        'timeout 60 agy --print "implement this"',
+                        'env FOO=1 nohup ~/.local/bin/agy -p "implement this"',
+                        'cd repo && agy --print "implement this"',
+                        'bash -lc \'agy -p "implement this"\'',
+                        "bash -c -- 'agy --print code'",
+                        "bash -lc -- 'agy --print code'",
+                        "sh -c -e -- 'agy -p code'"):
+            with self.subTest(command=command):
+                self.assertEqual(tl.bash_refusal(command, {}), reason)
+
+    def test_read_only_diagnostics_and_quota_collector_are_allowed(self):
+        for command in ('agy /usage', 'agy --version', 'agy --status', 'agy /status',
+                        'agy -p /usage --print-timeout 45s', 'agy --print=/usage',
+                        'echo "agy --print implement"',
+                        "bash -c -- 'agy --print /usage'"):
+            with self.subTest(command=command):
+                self.assertIsNone(tl.bash_refusal(command, {}))
+
+    def test_bash_hook_returns_the_worker_refusal(self):
+        result = subprocess.run([sys.executable, tl.__file__, "hook-bash"],
+                                input=json.dumps({"tool_input": {"command": 'timeout 60 agy -p "code"'}}),
+                                text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        decision = json.loads(result.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
+        self.assertIn("orchestrator-only", decision["permissionDecisionReason"])
+
+    def test_google_usage_line_marks_chat_only_without_hiding_usage(self):
+        pool = {"used_pct": 39, "five_hour_used_pct": 16, "chat_only": True}
+        self.assertEqual(tl.plan_google_part(pool), "Antigravity Gemini 39% wk, 5h 16% (chat-only)")
+        pool["chat_only"] = False
+        self.assertEqual(tl.plan_google_part(pool), "Antigravity Gemini 39% wk, 5h 16%")

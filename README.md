@@ -1,6 +1,6 @@
 # token-ladder
 
-Token Ladder reads subscription usage for Claude, Codex (including `hax`), Grok and Google Antigravity. The Google Antigravity plan is shared by chats and the `antigravity` worker lane.
+Token Ladder reads subscription usage for Claude, Codex (including `hax`), Grok and Google Antigravity. The Google Antigravity plan is chat-only for orchestrators, never code workers.
 
 `collect` runs on a timer and writes the state. `pools --json` prints the current pool states for any caller. `grok-set` records a Grok reading. Nothing here chooses a plan, reserves a pool, launches a session or holds a lease: those rules live in `spawn-worker` code and in the valentin-mode skill.
 
@@ -46,12 +46,11 @@ For the default medium rung, the Cursor lane runs first while its `first_until` 
 | Order | Lane | Included usage / credit |
 |---|---|---|
 | 1 | OpenCode Go | Plan windows, then prepaid credit |
-| 2 | Antigravity (`agy`) | Google Antigravity plan quota, burned fully by the lane |
-| 3 | Vercel Token Pass | Token Pass balance only |
-| 4 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week |
-| 5 | OpenRouter | Prepaid credit |
-| 6 | Codex | Subscription pool |
-| 7 | Cursor | Subscription pool; last after `first_until` |
+| 2 | Vercel Token Pass | Token Pass balance only |
+| 3 | CommandCode GOAT | $10/month; up to $100 Flash/month, $20/5h, $50/week |
+| 4 | OpenRouter | Prepaid credit |
+| 5 | Codex | Subscription pool |
+| 6 | Cursor | Subscription pool; last after `first_until` |
 
 ### Agent-held lanes
 
@@ -61,7 +60,7 @@ When Multibot runs agent chats on a plan, `plan-pick` keeps that plan for them a
 {"updated": "2026-11-24T10:00:00Z", "chats": [{"workspace": "HT Product", "chat": "HT Bugs", "tmux": "live-abc", "provider": "antigravity", "model": "gemini-4-neon", "since": "2026-11-24T09:40:00Z"}], "by_provider": {"antigravity": 3, "codex": 1, "claude": 2}}
 ```
 
-A lane is held when `by_provider[<lane>] > 0`, and provider names are the lane names above. A held lane keeps its rung eligibility and moves behind every lane that still has room only while its own pool is under pressure: `pace_ratio` above 1.0, `used_pct` at 50 or more, or used up. With plenty left it keeps its normal place. A pool with no reading counts as no pressure. The pick line says which: `antigravity held by 3 agent chats, 62% used: tried last` or `antigravity held by 3 agent chats, but 0% used: normal order`. `claude` is not a worker lane, so it never holds one. A missing or unreadable file, a file older than 24 hours by `updated`, or a count that is not a number changes nothing. A malformed file changes nothing and prints one note. `plan-pick` only reads the file. `PLAN_PICK_AGENT_PLANS` overrides the path, for tests.
+A lane is held when `by_provider[<lane>] > 0`, and provider names are the lane names above. A held lane keeps its rung eligibility and moves behind every lane that still has room only while its own pool is under pressure: `pace_ratio` above 1.0, `used_pct` at 50 or more, or used up. With plenty left it keeps its normal place. A pool with no reading counts as no pressure. The pick line says which: `codex held by 3 agent chats, 62% used: tried last` or `codex held by 3 agent chats, but 0% used: normal order`. `claude` is not a worker lane, so it never holds one. A missing or unreadable file, a file older than 24 hours by `updated`, or a count that is not a number changes nothing. A malformed file changes nothing and prints one note. `plan-pick` only reads the file. `PLAN_PICK_AGENT_PLANS` overrides the path, for tests.
 
 ### Worker rungs and first-review cost
 
@@ -79,7 +78,7 @@ The values are `light`, `medium`, and `hard`. No line means `medium`. Invalid or
 
 - Light uses DeepSeek Flash lanes and the pinned Vercel GLM 5.3 Flash lane, at low effort.
 - Medium keeps the existing order, including the temporary Cursor priority.
-- Hard allows only Codex `gpt-6.1-sol` at high effort and Antigravity `gemini-4-neon-high`.
+- Hard allows only Codex `gpt-6.1-sol` at high effort.
 
 Pool limits, credit floors, manual skips, and pace apply within each rung. No capacity in light or medium climbs to the next rung. A climbed rung with no free lane falls back to the highest lower rung that has one and says so in one line (`rung hard has no free lane; running at medium`), and the climb stays recorded, so the next run tries the higher rung first. `--run` exits 75 only when no rung has a free lane, meaning wait. Rung picks never use the legacy least-ahead-of-pace fallback or bypass pace through a burn override.
 
@@ -101,17 +100,13 @@ The command reads each PR's earliest verifier PASS/FAIL comment through `gh api 
 
 Never use Hypertask `brain-*` labels or any ticket difficulty tag to select a rung. Never make an extra model call to judge difficulty. Only the brief and recorded outcomes select the rung.
 
-### Antigravity worker lane
+### Antigravity is orchestrator-only
 
-`agy models` on this server lists `gemini-4-neon-high`, Gemini 4 Neon (High), and that slug is the lane's model. The lane runs `agy --print "$(cat brief.txt)" --model gemini-4-neon-high --dangerously-skip-permissions --print-timeout 45m --output-format json` in the brief directory, with the worker timeout also recorded as the lane's `print_timeout` field.
+Antigravity stays in `plans` and `lanes` for quota tracking, dashboard cards and lane-status checks. Its plan, lane and Google pool are `chat_only`, and no worker rung includes it. Missing or stale pool metadata cannot override the lane's chat-only flag. Reserve, burn and shared-chat settings cannot enable it for workers.
 
-No `--add-dir` is needed. A probe run in one directory created a file in a separate clone and read `git status --short` there, and a second run answered `gh version 2.103.3 (2026-10-26)`. `agy` keeps a 0s print timeout by default, which waits forever; the lane sets 45m instead.
+The bash hook refuses `agy --print` and `agy -p` worker launches, including wrapped commands. Delegate through `plan-pick --run` to the configured pi lanes or Codex instead. Read-only `agy /usage`, `agy -p /usage`, version and status commands remain allowed. Prompt usage lines mark Antigravity `(chat-only)`.
 
-Google documents this use. [Headless mode](https://antigravity.google/docs/cli/headless/) describes print mode for scripting and CI pipelines, including `-p`, `--output-format json`, `--print-timeout`, `--dangerously-skip-permissions` and a worked CI example, so automated headless runs are supported rather than banned. The [terms](https://antigravity.google/terms) ban third-party access to the service: "Using third party software, tools, or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this Agreement." This lane runs Google's own `agy` and never lifts a credential into another client, so it stays inside that line. The [plans page](https://antigravity.google/docs/plans.md) lists CLI access in the baseline of every plan and describes five-hour and weekly quotas; it publishes no numeric daily limit.
-
-No extra cost holds only while overages are off. [CLI AI credits](https://antigravity.google/docs/cli/credits/) says the `useG1Credits` setting and the **AI Credit Overages** setting decide whether exhausted quota spends purchased credits, so that setting must stay on **Never**. The lane never changes it and never buys credit.
-
-The lane burns the whole Antigravity quota by default. `antigravity_reserve_share_pct` is 100, so no daily limit is held back for chats, and there is no default per-day run cap. The lane stops only when today's newest quota line in `~/.gemini/antigravity-cli/cli.log` is a `RESOURCE_EXHAUSTED` or quota-exceeded error; then the next lane runs. Lower `antigravity_reserve_share_pct` below 100 to keep part of a known daily limit for chats, or set `antigravity_max_daily_runs` to cap launched runs per UTC day from the `antigravity` entries in `~/.local/state/token-ladder/launches.jsonl`. Neither number is a quota reading: the local history cannot separate chats from workers.
+### Worker limits
 
 A run that fails on `RESOURCE_EXHAUSTED`, 429 or a quota error marks the lane limited for `rate_limited_minutes` (default 5) and launches the next lane. Provider challenges and fast failures before work use `fast_fail_minutes` (default 5). A second fast 4xx failure on the same lane within an hour parks it for `fast_fail_repeat_minutes` (default 60) instead, so a lane that always 400s stops killing the next worker too. Empty credit still uses `credit_limited_hours` (default 12); silent failures use `limited_hours`. An `agy` quota error written to `cli.log` also marks the `google` pool OFF. A print timeout is not a quota error, even when the agent's work summary mentions quota.
 
@@ -142,7 +137,7 @@ Change the pin in `ci/lanes.json` and both paths follow.
 
 ## Google Antigravity usage
 
-`plan-pick --plans` shows the `google` pool as shared with chats, with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`. The `antigravity` worker lane reads this pool and burns it fully by default, as described under [Antigravity worker lane](#antigravity-worker-lane).
+`plan-pick --plans` shows the `google` pool as chat-only / orchestrator-only, with used, limit and pace fields. `--plans --json` adds a `usage` object to its plan. `token-ladder pools --json` also includes `google`, with `chat_only: true` and `shared_with_chats: false`. See [Antigravity is orchestrator-only](#antigravity-is-orchestrator-only).
 
 ### Antigravity quota
 
@@ -356,7 +351,7 @@ Right call for this week: helpers move from Codex to Claude until Claude catches
 | OpenCode Go Plus ($40/month) | `opencode-read --print` and `--credits --print`; `plan-pick --plans` | Separate monthly, weekly and 5-hour windows; $200 included allowance; live or anchored prepaid credit above $2 after included allowance is gone; never top up |
 | OpenRouter | `GET https://openrouter.ai/api/v1/key` | dollars spent vs cap (pay as you go, last resort) |
 | Cursor | `plan-pick --plans`: Composer 2.5 and Grok 4.7, local and Cursor cloud agents, no extra cost | display only, reserved for the grok bot |
-| Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; shared with chats and the antigravity lane |
+| Google Antigravity | Local history timestamps only, no credentials or quota API | UTC-day history count; quota, limit and pace unknown; chat-only, never workers |
 
 ## Core idea: pace, not percent
 
@@ -405,7 +400,7 @@ The Codex account has 3 "Full reset" credits. Each one refills the 5-hour and we
 |---|---|
 | 1 | Oct 22, 22:27 (Berlin) |
 | 2 | Oct 29, 19:47 |
-| 3 | Nov 7, 00:20 |
+| 2 | Nov 7, 00:20 |
 
 This changes the math. Codex running dry before its weekly reset is fine: that is when a reset pays off most. An expired reset is a full week of Codex thrown away.
 
