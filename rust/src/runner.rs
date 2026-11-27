@@ -1,5 +1,5 @@
 use crate::config::{
-    home_dir, iso_stamp, parse_stamp, Config, Credits, LaneSpec, Limits, Pools, StatePaths,
+    home_dir, iso_stamp, parse_stamp, Config, Credits, LaneSpec, Limits, Pools, StatePaths, Status,
 };
 use crate::domain::{Rung, RungContext, RUNGS};
 use crate::picker::{self, PickContext};
@@ -141,6 +141,7 @@ pub struct RunRequest<'a> {
     pub cfg: &'a Config,
     pub pools: &'a Pools,
     pub credits: &'a Credits,
+    pub status: Option<&'a Status>,
     pub paths: &'a StatePaths,
     pub brief: PathBuf,
     pub excluded: Vec<String>,
@@ -185,6 +186,10 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
         let stamp = now.max(0.0) as i64;
         let ctx = PickContext::new(&cfg, request.pools, request.credits, &limits, stamp)
             .excluding(request.excluded.clone());
+        let ctx = match request.status {
+            Some(status) => ctx.with_status(status),
+            None => ctx,
+        };
         let result = picker::pick(&ctx, &rung_ctx);
         if !result.picked() {
             let row = launch_row(

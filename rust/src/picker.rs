@@ -15,6 +15,7 @@ pub struct LaneContext<'a> {
     pub credits: &'a Credits,
     pub limits: &'a Limits,
     pub now: i64,
+    pub status: Option<&'a Status>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,9 +39,15 @@ impl<'a> PickContext<'a> {
                 credits,
                 limits,
                 now,
+                status: None,
             },
             excluded: Vec::new(),
         }
+    }
+
+    pub fn with_status(mut self, status: &'a Status) -> Self {
+        self.lane.status = Some(status);
+        self
     }
 
     pub fn excluding(mut self, excluded: Vec<String>) -> Self {
@@ -64,6 +71,75 @@ pub fn vendor_exclusions(values: &[String]) -> Vec<String> {
 
 pub fn is_orchestrator(lane: &LaneSpec, pools: &Pools) -> bool {
     lane.role() == Role::Orchestrator || lane_pool(lane, pools).is_some_and(|pool| pool.chat_only)
+}
+
+fn burn_key(lane: &LaneSpec) -> Option<&'static str> {
+    let lane_name = lane.lane.to_ascii_lowercase();
+    let vendor = lane
+        .vendor
+        .as_deref()
+        .map(|vendor| vendor.to_ascii_lowercase());
+    if lane_name == "codex" || vendor.as_deref() == Some("openai") {
+        return Some("codex");
+    }
+    if lane_name == "claude" || vendor.as_deref() == Some("anthropic") {
+        return Some("claude");
+    }
+    None
+}
+
+pub fn bonus_reset_hours(lane: &LaneSpec, ctx: &LaneContext<'_>) -> Option<f64> {
+    let key = burn_key(lane)?;
+    if let Some(status) = ctx.status {
+        if let Some(entry) = status.burn.as_ref().and_then(|burn| burn.entry(key)) {
+            if entry.burn_now {
+                return Some(entry.reset_hours.unwrap_or(0.0));
+            }
+            if entry.reset_hours.is_some() {
+                return None;
+            }
+        }
+    }
+    ctx.cfg.burn_now(key, ctx.now)
+}
+
+fn lane_used_pct(lane: &LaneSpec, ctx: &LaneContext<'_>) -> Option<f64> {
+    if let Some(pool) = lane_pool(lane, ctx.pools) {
+        if let Some(used) = pool.used_pct {
+            return Some(used);
+        }
+    }
+    let key = burn_key(lane)?;
+    ctx.status
+        .and_then(|status| status.account(key))
+        .and_then(|read| read.week.as_ref())
+        .and_then(|week| week.used)
+}
+
+pub fn burn_lane(
+    lane: &LaneSpec,
+    ctx: &LaneContext<'_>,
+    excluded: &[String],
+) -> Option<f64> {
+    if !lane.role().runs_workers() || is_orchestrator(lane, ctx.pools) {
+        return None;
+    }
+    if lane
+        .names()
+        .iter()
+        .any(|name| excluded.iter().any(|skip| skip == name))
+    {
+        return None;
+    }
+    if limit_skip(ctx.limits.get(&lane.lane), ctx.now).is_some() {
+        return None;
+    }
+    if lane_pool(lane, ctx.pools).is_some_and(Pool::is_off) {
+        return None;
+    }
+    let hours = bonus_reset_hours(lane, ctx)?;
+    let used = lane_used_pct(lane, ctx)?;
+    (used < ctx.cfg.reset_use_at_percent).then_some(hours)
 }
 
 pub fn expiring_value_per_day(
@@ -270,6 +346,7 @@ pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
     let rung = rung_ctx.rung;
     let mut rated: Vec<Rated<'_>> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
+    let mut burn: Vec<(&LaneSpec, f64)> = Vec::new();
     for (index, lane) in ctx.lane.cfg.lanes.iter().enumerate() {
         if !lane.usable() {
             continue;
@@ -277,6 +354,9 @@ pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
         let eligibility = lane_eligibility(lane, &ctx.lane, &ctx.excluded);
         if !eligibility.is_ready() {
             skipped.push((lane.lane.clone(), eligibility.reason()));
+        }
+        if let Some(hours) = burn_lane(lane, &ctx.lane, &ctx.excluded) {
+            burn.push((lane, hours));
         }
         rated.push(Rated {
             index,
@@ -311,7 +391,9 @@ pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
     let heavy_under_pace = heavy
         .iter()
         .find(|item| item.pace.is_some_and(|pace| pace < HEAVY_FALLBACK_PACE));
-    let chosen: Option<&Rated<'_>> = match rung {
+    burn.sort_by(|left, right| left.1.partial_cmp(&right.1).unwrap_or(Ordering::Equal));
+    let burn_first: Option<(&LaneSpec, f64)> = burn.first().copied();
+    let normal: Option<&Rated<'_>> = match rung {
         Rung::Light => primary.first().or_else(|| last_resort.first()),
         Rung::Medium => primary
             .first()
@@ -319,17 +401,27 @@ pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
             .or(heavy_under_pace),
         Rung::Hard => heavy.first(),
     };
+    let chosen: Option<(&LaneSpec, Option<&Rated<'_>>)> = match (&burn_first, normal) {
+        (Some((lane, _)), _) => Some((lane, None)),
+        (None, Some(item)) => Some((item.lane, Some(item))),
+        (None, None) => None,
+    };
     let clause = skipped_clause(&skipped);
     match chosen {
-        Some(item) => {
-            let tier = item.lane.role();
+        Some((lane, item)) => {
+            let tier = lane.role();
+            let why = match (&burn_first, item) {
+                (Some((_, hours)), _) => format!(
+                    "burn complimentary reset in {hours:.0}h before expiry"
+                ),
+                (None, Some(item)) => item.eligibility.reason(),
+                (None, None) => String::new(),
+            };
             let reason = format!(
                 "rung {rung}: {tier} lane {} ({}){}",
-                item.lane.lane,
-                item.eligibility.reason(),
-                clause
+                lane.lane, why, clause
             );
-            PickResult::lane(item.lane.lane.clone(), item.lane.command.clone(), reason, rung_ctx)
+            PickResult::lane(lane.lane.clone(), lane.command.clone(), reason, rung_ctx)
         }
         None => {
             let tier = match rung {
@@ -527,7 +619,7 @@ pub fn claude_helper_allowed(status: &Status, cfg: &Config, now: i64) -> (bool, 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::config::{Config, CreditEntry, LaneSpec, LimitEntry, Pool, Stampish};
+    use crate::config::{BonusReset, Config, CreditEntry, LaneSpec, LimitEntry, Pool, Stampish};
     use std::collections::HashMap;
 
     const NOW: i64 = 1_795_783_606;
@@ -574,6 +666,28 @@ mod tests {
         HashMap::new()
     }
 
+    const HOUR: i64 = 3_600;
+
+    fn with_bonus(cfg: &mut Config, plan: &str, hours: i64) {
+        let reset = BonusReset {
+            expires: Some(crate::config::iso_stamp(NOW + hours * HOUR)),
+        };
+        if plan == "codex" {
+            cfg.codex_resets.push(reset);
+        } else {
+            cfg.claude_resets.push(reset);
+        }
+    }
+
+    fn quiet_codex_pool(pace: f64) -> Pool {
+        Pool {
+            state: Some("ON".to_string()),
+            pace_ratio: Some(pace),
+            used_pct: Some(56.0),
+            ..Pool::default()
+        }
+    }
+
     fn credit_lane_pool(pace: f64) -> Pool {
         Pool {
             state: Some("ON".to_string()),
@@ -581,6 +695,135 @@ mod tests {
             used_pct: Some(pace * 60.0),
             ..Pool::default()
         }
+    }
+
+    fn medium_stack_with_bonus(hours: i64) -> (Config, Pools, Credits) {
+        let (mut cfg, mut pools, credits) = workhorse_stack();
+        cfg.rungs.medium = vec![
+            crate::config::RungLane {
+                lane: "commandcode".to_string(),
+                ..crate::config::RungLane::default()
+            },
+            crate::config::RungLane {
+                lane: "vercel".to_string(),
+                ..crate::config::RungLane::default()
+            },
+            crate::config::RungLane {
+                lane: "codex".to_string(),
+                ..crate::config::RungLane::default()
+            },
+        ];
+        with_bonus(&mut cfg, "codex", hours);
+        pools.insert("codex".to_string(), quiet_codex_pool(1.30));
+        (cfg, pools, credits)
+    }
+
+    #[test]
+    fn codex_bonus_reset_inside_the_window_is_promoted_first_on_medium() {
+        let (cfg, pools, credits) = medium_stack_with_bonus(18);
+        let limits = empty_limits();
+        let ctx = context(&cfg, &pools, &credits, &limits);
+        let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+        assert_eq!(result.plan, "codex");
+        assert!(
+            result.reason.contains("burn complimentary reset in 18h before expiry"),
+            "{}",
+            result.reason
+        );
+        assert!(result.reason.starts_with("rung medium: heavy lane codex"));
+    }
+
+    #[test]
+    fn codex_bonus_reset_is_promoted_on_hard_too() {
+        let (cfg, pools, credits) = medium_stack_with_bonus(18);
+        let limits = empty_limits();
+        let ctx = context(&cfg, &pools, &credits, &limits);
+        let result = pick(&ctx, &RungContext::fixed(Rung::Hard));
+        assert_eq!(result.plan, "codex");
+        assert!(result.reason.contains("burn complimentary reset in 18h"));
+    }
+
+    #[test]
+    fn codex_bonus_reset_beyond_the_window_leaves_the_deepseek_stack_alone() {
+        let (cfg, pools, credits) = medium_stack_with_bonus(72);
+        let limits = empty_limits();
+        let ctx = context(&cfg, &pools, &credits, &limits);
+        let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+        assert!(
+            result.plan == "commandcode" || result.plan == "vercel",
+            "{}",
+            result.plan
+        );
+        assert!(!result.reason.contains("burn complimentary reset"));
+    }
+
+    #[test]
+    fn orchestrator_bonus_reset_never_becomes_a_worker_lane() {
+        let (cfg, mut pools, credits) = workhorse_stack();
+        let mut cfg = cfg;
+        with_bonus(&mut cfg, "claude", 10);
+        pools.insert(
+            "claude".to_string(),
+            Pool {
+                state: Some("ON".to_string()),
+                used_pct: Some(40.0),
+                ..Pool::default()
+            },
+        );
+        let limits = empty_limits();
+        let ctx = context(&cfg, &pools, &credits, &limits);
+        for rung in [Rung::Light, Rung::Medium, Rung::Hard] {
+            let result = pick(&ctx, &RungContext::fixed(rung));
+            assert_ne!(result.plan, "claude");
+        }
+        let claude = crate::config::LaneSpec {
+            lane: "claude".to_string(),
+            vendor: Some("anthropic".to_string()),
+            chat_only: true,
+            command: "run claude".to_string(),
+            ..crate::config::LaneSpec::default()
+        };
+        assert!(burn_lane(&claude, &ctx.lane, &[]).is_none());
+        assert_eq!(bonus_reset_hours(&claude, &ctx.lane), Some(10.0));
+    }
+
+    #[test]
+    fn a_used_up_pool_keeps_its_bonus_reset_out_of_the_pick() {
+        let (cfg, mut pools, credits) = medium_stack_with_bonus(18);
+        pools.insert(
+            "codex".to_string(),
+            Pool {
+                state: Some("ON".to_string()),
+                pace_ratio: Some(0.50),
+                used_pct: Some(96.0),
+                ..Pool::default()
+            },
+        );
+        let limits = empty_limits();
+        let ctx = context(&cfg, &pools, &credits, &limits);
+        let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+        assert_ne!(result.plan, "codex");
+    }
+
+    #[test]
+    fn status_burn_marks_the_lane_before_the_config_window_does() {
+        let (cfg, pools, credits) = medium_stack_with_bonus(72);
+        let limits = empty_limits();
+        let status = Status {
+            burn: Some(crate::config::BurnPlan {
+                codex: crate::config::BurnEntry {
+                    reset_hours: Some(18.0),
+                    burn_now: true,
+                    ..crate::config::BurnEntry::default()
+                },
+                ..crate::config::BurnPlan::default()
+            }),
+            ..Status::default()
+        };
+        let ctx = context(&cfg, &pools, &credits, &limits).with_status(&status);
+        let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+        assert_eq!(result.plan, "codex");
+        assert!(result.reason.contains("burn complimentary reset in 18h"));
     }
 
     fn workhorse_stack() -> (Config, Pools, Credits) {
@@ -658,6 +901,7 @@ mod tests {
             credits: &credits,
             limits: &limits,
             now: NOW,
+            status: None,
         };
         let (allowed, why) = lane_ok(&ctx, "antigravity", None);
         assert!(!allowed);
@@ -1014,6 +1258,7 @@ mod tests {
             credits: &credits,
             limits: &limits,
             now: NOW,
+            status: None,
         };
         let rung = RungContext::fixed(Rung::Light);
         assert!(lane_ok(&ctx, "commandcode", Some(&rung)).0);

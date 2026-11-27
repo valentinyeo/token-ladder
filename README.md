@@ -414,6 +414,17 @@ Reset rules:
 
 To check: whether the reset list can be read (and a reset used) through the Codex login on the server, or only by clicking in the ChatGPT settings.
 
+Register the dates the Rust program reads:
+
+```
+token-ladder reset-add codex 2026-12-01T18:00:00Z
+token-ladder reset-add claude 2026-12-01T18:00:00Z --config config.json
+```
+
+`reset-add` validates the ISO-8601 timestamp, drops entries that already expired, writes `config.local.json` atomically, and prints the active resets. `token-ladder status` and `hook-prompt` show them too (`Codex bonus reset in 14h (burn now)`).
+
+A reset inside `reset_burn_hours` (default 36) on a worker lane pushes that lane first on `medium` and `hard`, ahead of the tier order and the pace skip, while the pool is under `reset_use_at_percent` (default 95). Orchestrator pools (Claude, Antigravity) are never picked as workers, so their resets only show up in the lines above.
+
 ## Memory constraint (measured 2026-10-10)
 
 The VPS has 94 GB. 28 Claude CLI processes use 10.7 GB (about 380 MB each, up to 690 MB for long sessions). 58 hax and Codex processes use 565 MB in total (about 10 MB each).
