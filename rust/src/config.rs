@@ -9,6 +9,7 @@ pub const DEFAULT_CREDIT_FLOOR_USD: f64 = 2.0;
 pub const DEFAULT_POOL_WARN_PCT: f64 = 80.0;
 pub const DEFAULT_POOL_OFF_PCT: f64 = 95.0;
 pub const DEFAULT_LIMITED_HOURS: f64 = 1.0;
+pub const DEFAULT_CREDIT_LIMITED_HOURS: f64 = 12.0;
 pub const DEFAULT_LOOP_BASE_SECONDS: u64 = 7200;
 pub const DEFAULT_LOOP_AHEAD_SECONDS: u64 = 10800;
 pub const DEFAULT_LOOP_FAR_AHEAD_SECONDS: u64 = 14400;
@@ -300,6 +301,8 @@ pub struct Config {
     pub pool_off_pct: f64,
     #[serde(default = "default_limited_hours")]
     pub limited_hours: f64,
+    #[serde(default = "default_credit_limited_hours")]
+    pub credit_limited_hours: f64,
     #[serde(default)]
     pub loop_interval: LoopRule,
     #[serde(default)]
@@ -328,6 +331,10 @@ fn default_limited_hours() -> f64 {
     DEFAULT_LIMITED_HOURS
 }
 
+fn default_credit_limited_hours() -> f64 {
+    DEFAULT_CREDIT_LIMITED_HOURS
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -339,6 +346,7 @@ impl Default for Config {
             pool_warn_pct: DEFAULT_POOL_WARN_PCT,
             pool_off_pct: DEFAULT_POOL_OFF_PCT,
             limited_hours: DEFAULT_LIMITED_HOURS,
+            credit_limited_hours: DEFAULT_CREDIT_LIMITED_HOURS,
             loop_interval: LoopRule::default(),
             codex_credits: CodexCredits::default(),
             balance_lanes: false,
@@ -693,6 +701,17 @@ impl StatePaths {
         } else {
             legacy
         }
+    }
+
+    pub fn launches(&self) -> PathBuf {
+        match std::env::var_os("PLAN_PICK_LAUNCHES") {
+            Some(path) if !path.is_empty() => PathBuf::from(path),
+            _ => self.root.join("launches.jsonl"),
+        }
+    }
+
+    pub fn rung_attempts(&self) -> PathBuf {
+        self.root.join("rung-attempts.json")
     }
 }
 

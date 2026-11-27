@@ -4,6 +4,7 @@ pub mod config;
 pub mod domain;
 pub mod hooks;
 pub mod picker;
+pub mod runner;
 
 pub use config::{
     load_json_or_default, Config, CreditEntry, Credits, LaneSpec, Limits, Pool, Pools, State,
@@ -16,3 +17,4 @@ pub use picker::{
     claude_helper_allowed, lane_ok, loop_interval_answer, loop_interval_seconds, pick,
     vendor_exclusions, LaneContext, LoopAnswer, PickContext,
 };
+pub use runner::{author_model, job_key, mark_limited, set_credit, RunRequest, RunnerError};

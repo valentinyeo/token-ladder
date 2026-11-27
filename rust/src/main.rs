@@ -7,15 +7,17 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use token_ladder::config::{
-    iso_stamp, trim_float, Config, Credits, Limits, Pool, Pools, State, StatePaths, Status,
+    iso_stamp, trim_float, Config, Credits, Limits, Pool, Pools, State, StatePaths,
 };
 use token_ladder::domain::{PickResult, Rung, RungContext};
 use token_ladder::hooks;
 use token_ladder::picker::{self, LaneContext, PickContext};
+use token_ladder::runner::{self, RunRequest};
 
 const ALLOWED_EXIT: u8 = 0;
 const REFUSED_EXIT: u8 = 3;
 const FAILED_EXIT: u8 = 1;
+const USAGE_EXIT: u8 = 2;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -28,6 +30,7 @@ struct Cli {
     command: Command,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand, Debug)]
 enum Command {
     Status,
@@ -66,6 +69,20 @@ struct PickArgs {
     loop_interval: bool,
     #[arg(long = "claude-helper")]
     claude_helper: bool,
+    #[arg(long = "run")]
+    run: bool,
+    #[arg(long, value_name = "LANE")]
+    limited: Option<String>,
+    #[arg(long, value_name = "LANE_USD", num_args = 2)]
+    set_credit: Option<Vec<String>>,
+    #[arg(long = "credit-at", value_name = "ISO8601")]
+    credit_at: Option<String>,
+    #[arg(long = "credit-source", value_name = "TEXT")]
+    credit_source: Option<String>,
+    #[arg(long, value_name = "N")]
+    hours: Option<f64>,
+    #[arg(long, value_name = "TEXT")]
+    reason: Option<String>,
     #[arg(long, value_name = "FILE")]
     pools: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
@@ -183,23 +200,19 @@ fn load_pools(path: Option<&Path>, state: &State, config: &Config) -> Result<Poo
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .map_err(|error| format!("cannot read pools from {}: {error}", path.display()))?;
-            parse_pools(&text, config)
+            parse_pools(&text)
         }
         None => Ok(with_credit_pools(state.pools().clone(), state, config)),
     }
 }
 
-fn parse_pools(text: &str, config: &Config) -> Result<Pools, String> {
+fn parse_pools(text: &str) -> Result<Pools, String> {
     let value: Value = serde_json::from_str(text).map_err(|error| format!("bad pool JSON: {error}"))?;
-    match serde_json::from_value::<Pools>(value.clone()) {
-        Ok(pools) => Ok(pools),
-        Err(_) => {
-            let status: Status =
-                serde_json::from_value(value).map_err(|error| format!("bad pool JSON: {error}"))?;
-            let _ = config;
-            Ok(status.pools)
-        }
+    if let Some(wrapper) = value.as_object().and_then(|object| object.get("pools")) {
+        return serde_json::from_value::<Pools>(wrapper.clone())
+            .map_err(|error| format!("bad pool JSON: {error}"));
     }
+    serde_json::from_value::<Pools>(value).map_err(|error| format!("bad pool JSON: {error}"))
 }
 
 fn with_credit_pools(mut pools: Pools, state: &State, config: &Config) -> Pools {
@@ -383,13 +396,14 @@ fn plans_report(config: &Config, state: &State, pools: &Pools, json: bool) -> Ex
     for plan in &config.plans {
         let pool = plan.pool.as_deref().and_then(|name| pools.get(name));
         let credit = plan.credit.as_deref().and_then(|name| state.credits.get(name));
+        let chat_only = plan.chat_only || pool.is_some_and(|pool| pool.chat_only);
         let mut row = serde_json::json!({
             "name": plan.name,
             "vendor": plan.vendor,
         });
         if let Some(row) = row.as_object_mut() {
             row.insert("pool".to_string(), serde_json::json!(plan.pool));
-            row.insert("chat_only".to_string(), serde_json::json!(plan.chat_only));
+            row.insert("chat_only".to_string(), serde_json::json!(chat_only));
             row.insert(
                 "extra_cost".to_string(),
                 serde_json::json!(plan.extra_cost),
@@ -400,7 +414,6 @@ fn plans_report(config: &Config, state: &State, pools: &Pools, json: bool) -> Ex
                 object.insert("used_pct".to_string(), serde_json::json!(pool.used_pct));
                 object.insert("pace_ratio".to_string(), serde_json::json!(pool.pace_ratio));
                 object.insert("state".to_string(), serde_json::json!(pool.state_label()));
-                object.insert("chat_only".to_string(), serde_json::json!(pool.chat_only));
             }
         }
         if let Some(credit) = credit {
@@ -471,10 +484,125 @@ fn plans_report(config: &Config, state: &State, pools: &Pools, json: bool) -> Ex
     ExitCode::from(ALLOWED_EXIT)
 }
 
+fn limited_command(
+    args: &PickArgs,
+    config: &Config,
+    lane: &str,
+    now: i64,
+) -> Result<ExitCode, String> {
+    if config.lane(lane).is_none() {
+        let names: Vec<String> = config.lanes.iter().map(|spec| spec.lane.clone()).collect();
+        eprintln!(
+            "plan-pick: unknown lane {lane}; lanes: {}",
+            names.join(", ")
+        );
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let hours = args.hours.unwrap_or(config.limited_hours);
+    let reason = args.reason.as_deref().unwrap_or("manual skip");
+    let until = runner::mark_limited(
+        &state_paths().limits(),
+        lane,
+        hours,
+        now as f64,
+        reason,
+        "manual",
+        "",
+    )
+    .map_err(|error| error.to_string())?;
+    println!(
+        "Lane {lane} is skipped until {}.",
+        runner::until_text(until, now as f64)
+    );
+    Ok(ExitCode::from(ALLOWED_EXIT))
+}
+
+fn set_credit_command(
+    args: &PickArgs,
+    config: &Config,
+    values: &[String],
+    now: i64,
+) -> Result<ExitCode, String> {
+    let Some(lane) = values.first() else {
+        return Ok(ExitCode::from(USAGE_EXIT));
+    };
+    let Some(text) = values.get(1) else {
+        return Ok(ExitCode::from(USAGE_EXIT));
+    };
+    let known = runner::credit_names(config);
+    if !known.iter().any(|name| name == lane) {
+        eprintln!(
+            "plan-pick: --set-credit needs a credit lane, one of: {}",
+            known.join(", ")
+        );
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let Ok(usd) = text.trim().parse::<f64>() else {
+        eprintln!("plan-pick: --set-credit needs a number of USD, got {text}");
+        return Ok(ExitCode::from(USAGE_EXIT));
+    };
+    let at = runner::stamp_or_now(args.credit_at.as_deref(), now as f64)
+        .map_err(|error| error.to_string())?;
+    let source = args
+        .credit_source
+        .clone()
+        .unwrap_or_else(|| "manual anchor".to_string());
+    if !usd.is_finite() || usd < 0.0 || at > now as f64 || source.trim().is_empty() {
+        eprintln!(
+            "plan-pick: --set-credit needs a finite nonnegative USD balance, a nonfuture time and a source"
+        );
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    runner::set_credit(&state_paths().credits(), lane, usd, at, &source)
+        .map_err(|error| error.to_string())?;
+    println!(
+        "Stored {lane} balance anchor at {} ({}).",
+        iso_stamp(at as i64),
+        source
+    );
+    Ok(ExitCode::from(ALLOWED_EXIT))
+}
+
+fn run_command(
+    args: &PickArgs,
+    config: &Config,
+    state: &State,
+    now: i64,
+) -> Result<ExitCode, String> {
+    if args.brief.as_path() != Path::new(runner::DEFAULT_BRIEF) {
+        eprintln!("plan-pick: --run reads brief.txt; use --brief only for dry runs");
+        return Ok(ExitCode::from(USAGE_EXIT));
+    }
+    let paths = state_paths();
+    let credits = state.credits.clone();
+    let pools = load_pools(args.pools.as_deref(), state, config)?;
+    let request = RunRequest {
+        cfg: config,
+        pools: &pools,
+        credits: &credits,
+        paths: &paths,
+        brief: PathBuf::from(runner::DEFAULT_BRIEF),
+        excluded: picker::vendor_exclusions(&args.not_vendor),
+        now: now as f64,
+    };
+    runner::run(&request)
+        .map(ExitCode::from)
+        .map_err(|error| error.to_string())
+}
+
 fn pick_command(args: &PickArgs) -> Result<ExitCode, String> {
     let config = load_config(args.config.as_deref())?;
     let state = State::load(&state_paths());
     let now = now_epoch();
+    if let Some(lane) = args.limited.as_deref() {
+        return limited_command(args, &config, lane, now);
+    }
+    if let Some(values) = args.set_credit.as_deref() {
+        return set_credit_command(args, &config, values, now);
+    }
+    if args.run {
+        return run_command(args, &config, &state, now);
+    }
     let pools = load_pools(args.pools.as_deref(), &state, &config)?;
     let credits = state.credits.clone();
     let limits = state.limits.clone();
@@ -621,8 +749,9 @@ fn main() -> ExitCode {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use token_ladder::config::Stampish;
     use token_ladder::config::LimitEntry;
+    use token_ladder::config::Stampish;
+    use token_ladder::config::Status;
     use token_ladder::domain::Role;
     use token_ladder::LaneSpec;
 
@@ -700,16 +829,18 @@ mod tests {
 
     #[test]
     fn parse_pools_accepts_a_bare_pool_map_and_a_status_document() {
-        let config = Config::default();
-        let bare = parse_pools(r#"{"codex": {"state": "ON", "used_pct": 56}}"#, &config).unwrap();
+        let bare = parse_pools(r#"{"codex": {"state": "ON", "used_pct": 56}}"#).unwrap();
         assert_eq!(bare["codex"].state_label(), "ON");
         let document = parse_pools(
             r#"{"ts": 1795783606.0, "pools": {"claude": {"state": "OFF"}}}"#,
-            &config,
         )
         .unwrap();
         assert_eq!(document["claude"].state_label(), "OFF");
-        assert!(parse_pools("nope", &config).is_err());
+        let unstamped = parse_pools(r#"{"pools": {"codex": {"state": "ON"}}}"#).unwrap();
+        assert_eq!(unstamped.len(), 1);
+        assert_eq!(unstamped["codex"].state_label(), "ON");
+        assert!(!unstamped.contains_key("pools"));
+        assert!(parse_pools("nope").is_err());
     }
 
     #[test]
@@ -765,6 +896,13 @@ mod tests {
             not_vendor: vec![],
             loop_interval: false,
             claude_helper: false,
+            run: false,
+            limited: None,
+            set_credit: None,
+            credit_at: None,
+            credit_source: None,
+            hours: None,
+            reason: None,
             pools: None,
             config: None,
         };
@@ -794,6 +932,13 @@ mod tests {
             not_vendor: vec![],
             loop_interval: false,
             claude_helper: false,
+            run: false,
+            limited: None,
+            set_credit: None,
+            credit_at: None,
+            credit_source: None,
+            hours: None,
+            reason: None,
             pools: None,
             config: None,
         };
