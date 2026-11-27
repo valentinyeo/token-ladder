@@ -17,6 +17,8 @@ pub const DEFAULT_LOOP_AHEAD_RATIO: f64 = 1.0;
 pub const DEFAULT_LOOP_FAR_AHEAD_RATIO: f64 = 1.2;
 pub const DEFAULT_LOOP_USED_PCT: f64 = 95.0;
 pub const DEFAULT_LOOP_MIN_SECONDS: u64 = 1800;
+pub const DEFAULT_CREDIT_STALE_HOURS: f64 = 6.0;
+pub const DEFAULT_CREDIT_REFRESH_MINUTES: f64 = 30.0;
 pub const COMMANDCODE_PLAN_CREDITS: f64 = 70.0;
 pub const COMMANDCODE_CREDITS_TO_USD: f64 = 100.0 / COMMANDCODE_PLAN_CREDITS;
 pub const STATE_DIR: &str = ".local/state/token-ladder";
@@ -309,6 +311,22 @@ pub struct Config {
     pub codex_credits: CodexCredits,
     #[serde(default)]
     pub balance_lanes: bool,
+    #[serde(default = "default_credit_stale_hours")]
+    pub credit_stale_hours: f64,
+    #[serde(default = "default_credit_refresh_minutes")]
+    pub credit_refresh_minutes: f64,
+    #[serde(default)]
+    pub opencode_reader_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub measured_burn: Option<serde_json::Value>,
+}
+
+fn default_credit_stale_hours() -> f64 {
+    DEFAULT_CREDIT_STALE_HOURS
+}
+
+fn default_credit_refresh_minutes() -> f64 {
+    DEFAULT_CREDIT_REFRESH_MINUTES
 }
 
 fn default_pace_warn_ratio() -> f64 {
@@ -350,6 +368,10 @@ impl Default for Config {
             loop_interval: LoopRule::default(),
             codex_credits: CodexCredits::default(),
             balance_lanes: false,
+            credit_stale_hours: DEFAULT_CREDIT_STALE_HOURS,
+            credit_refresh_minutes: DEFAULT_CREDIT_REFRESH_MINUTES,
+            opencode_reader_command: None,
+            measured_burn: None,
         }
     }
 }
@@ -410,25 +432,25 @@ impl Config {
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct Pool {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub used_pct: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pace_ratio: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets_at: Option<Stampish>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hours_left: Option<f64>,
     #[serde(default)]
     pub chat_only: bool,
     #[serde(default)]
     pub shared_with_chats: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_usd: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credit_floor_usd: Option<f64>,
     #[serde(default)]
     pub credit_unknown: bool,
@@ -436,14 +458,34 @@ pub struct Pool {
     pub estimated: bool,
     #[serde(default)]
     pub used_up: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_minutes: Option<u64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub five_hour_used_pct: Option<f64>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gemini: Option<PoolGroup>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_gpt: Option<PoolGroup>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_resets_at: Option<Stampish>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_up_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_up_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_up_resets_at: Option<Stampish>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]

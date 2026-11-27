@@ -164,8 +164,12 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
     let attempts_path = request.paths.rung_attempts();
     let caller = caller_name();
     let started_at = request.now;
+    let mut now = started_at;
     let mut tried: Vec<String> = Vec::new();
     loop {
+        if !tried.is_empty() {
+            now = crate::usage::now_epoch();
+        }
         let lanes: Vec<LaneSpec> = request
             .cfg
             .lanes
@@ -178,13 +182,13 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
             ..request.cfg.clone()
         };
         let limits: Limits = read_limits(&limits_path)?;
-        let now = request.now.max(0.0) as i64;
-        let ctx = PickContext::new(&cfg, request.pools, request.credits, &limits, now)
+        let stamp = now.max(0.0) as i64;
+        let ctx = PickContext::new(&cfg, request.pools, request.credits, &limits, stamp)
             .excluding(request.excluded.clone());
         let result = picker::pick(&ctx, &rung_ctx);
         if !result.picked() {
             let row = launch_row(
-                request.now,
+                now,
                 None,
                 &rung_ctx,
                 &caller,
@@ -194,7 +198,7 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
                 &result.reason,
             );
             append_launch(&launches_path, &row)?;
-            record_no_lane(&attempts_path, &job, request.now, &rung_ctx)?;
+            record_no_lane(&attempts_path, &job, now, &rung_ctx)?;
             eprintln!("plan-pick: no lane left, nothing ran. {}", result.reason);
             return Ok(NO_LANE_EXIT);
         }
@@ -215,7 +219,7 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
         let pr_url = last_pr_url(&attempt.output);
         if let Some(refused) = shim_refusal(&attempt.output).filter(|_| pr_url.is_none()) {
             let row = launch_row(
-                request.now,
+                now,
                 Some(&lane_name),
                 &rung_ctx,
                 &caller,
@@ -250,13 +254,13 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
                 &limits_path,
                 &lane_name,
                 hours,
-                request.now,
+                now,
                 why,
                 kind.source(),
                 &attempt.output,
             )?;
             let row = launch_row(
-                request.now,
+                now,
                 Some(&lane_name),
                 &rung_ctx,
                 &caller,
@@ -285,7 +289,7 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
             eprintln!(
                 "plan-pick: {reason} (exit {}); skipped until {}, trying the next lane",
                 attempt.code,
-                until_text(until, request.now)
+                until_text(until, now)
             );
             tried.push(lane_name);
             continue;
@@ -297,7 +301,7 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
             Some("work".to_string())
         };
         let row = launch_row(
-            request.now,
+            now,
             Some(&lane_name),
             &rung_ctx,
             &caller,

@@ -6,9 +6,12 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use token_ladder::collect;
 use token_ladder::config::{
     iso_stamp, trim_float, Config, Credits, Limits, Pool, Pools, State, StatePaths,
 };
+use token_ladder::ledger;
+use token_ladder::usage;
 use token_ladder::domain::{PickResult, Rung, RungContext};
 use token_ladder::hooks;
 use token_ladder::picker::{self, LaneContext, PickContext};
@@ -34,11 +37,41 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Status,
+    Collect,
+    Mode(ModeArgs),
+    Route(RouteArgs),
+    GrokSet(GrokSetArgs),
     Pools(PoolsArgs),
     Pick(PickArgs),
     HookBash,
     HookPrompt,
     HookAgent,
+}
+
+#[derive(Args, Debug)]
+struct ModeArgs {
+    #[arg(value_name = "claude|codex|auto")]
+    mode: String,
+}
+
+#[derive(Args, Debug)]
+struct RouteArgs {
+    #[arg(long, value_name = "OWNER/NAME")]
+    repo: String,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
+struct GrokSetArgs {
+    #[arg(value_name = "USED_PCT")]
+    used_pct: Option<f64>,
+    #[arg(long, value_name = "USED_PCT")]
+    pct: Option<f64>,
+    #[arg(long = "reset", value_name = "ISO8601")]
+    reset: Option<String>,
+    #[arg(long = "resets-at", value_name = "ISO8601")]
+    resets_at: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -87,6 +120,14 @@ struct PickArgs {
     pools: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
+    #[arg(long = "read-credits", value_name = "LANE", num_args = 0..)]
+    read_credits: Option<Vec<String>>,
+    #[arg(long = "opencode-usage-export")]
+    opencode_usage_export: bool,
+    #[arg(long)]
+    burn: bool,
+    #[arg(long = "pace-log", value_name = "FILE", num_args = 0..=1, default_missing_value = "")]
+    pace_log: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -591,9 +632,18 @@ fn run_command(
 }
 
 fn pick_command(args: &PickArgs) -> Result<ExitCode, String> {
+    if args.opencode_usage_export {
+        return Ok(usage_export_command());
+    }
     let config = load_config(args.config.as_deref())?;
     let state = State::load(&state_paths());
     let now = now_epoch();
+    if args.burn {
+        return Ok(burn_command(args, &config));
+    }
+    if args.pace_log.is_some() {
+        return pace_log_command(args, &config);
+    }
     if let Some(lane) = args.limited.as_deref() {
         return limited_command(args, &config, lane, now);
     }
@@ -602,6 +652,9 @@ fn pick_command(args: &PickArgs) -> Result<ExitCode, String> {
     }
     if args.run {
         return run_command(args, &config, &state, now);
+    }
+    if args.read_credits.is_some() {
+        return read_credits_command(args, &config);
     }
     let pools = load_pools(args.pools.as_deref(), &state, &config)?;
     let credits = state.credits.clone();
@@ -679,9 +732,160 @@ fn print_pick(result: &PickResult, json: bool) {
     }
 }
 
+fn raw_config(path: Option<&Path>) -> Result<Value, String> {
+    let path = match path {
+        Some(path) => path.to_path_buf(),
+        None => token_ladder::config::config_path(),
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut value: Value = serde_json::from_str(&text)
+        .map_err(|error| format!("cannot parse {}: {error}", path.display()))?;
+    let local = match std::env::var_os("TOKEN_LADDER_LOCAL_CONFIG") {
+        Some(_) => token_ladder::config::local_config_path(),
+        None => {
+            let beside = path.with_file_name("config.local.json");
+            if beside.is_file() {
+                Some(beside)
+            } else {
+                None
+            }
+        }
+    };
+    if let Some(local) = local.filter(|local| local.is_file()) {
+        if let Ok(text) = std::fs::read_to_string(&local) {
+            if let Ok(overlay) = serde_json::from_str::<Value>(&text) {
+                token_ladder::config::merge_objects(&mut value, overlay);
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn collect_request<'a>(env: &'a usage::Env, cfg: &'a Value, now: f64) -> collect::CollectRequest<'a> {
+    collect::CollectRequest { env, cfg, now }
+}
+
+fn collect_command(path: Option<&Path>) -> Result<ExitCode, String> {
+    let env = usage::Env::from_process();
+    let cfg = raw_config(path)?;
+    let now = usage::now_epoch();
+    collect::collect(&collect_request(&env, &cfg, now))?;
+    Ok(ExitCode::from(ALLOWED_EXIT))
+}
+
+fn mode_command(args: &ModeArgs, path: Option<&Path>) -> Result<ExitCode, String> {
+    let env = usage::Env::from_process();
+    let cfg = raw_config(path)?;
+    let now = usage::now_epoch();
+    let code = collect::set_mode(&collect_request(&env, &cfg, now), &args.mode)?;
+    Ok(ExitCode::from(code.clamp(0, 255) as u8))
+}
+
+fn route_command(args: &RouteArgs) -> ExitCode {
+    let env = usage::Env::from_process();
+    let (destination, command, mode) = collect::routes(&env, &args.repo);
+    if args.json {
+        let payload = serde_json::json!({
+            "destination": destination,
+            "command": command,
+            "mode": mode,
+            "repo": args.repo,
+        });
+        println!("{payload}");
+    } else {
+        println!("{destination}\t{command}");
+    }
+    ExitCode::from(ALLOWED_EXIT)
+}
+
+fn grok_set_command(args: &GrokSetArgs) -> Result<ExitCode, String> {
+    let Some(pct) = args.pct.or(args.used_pct) else {
+        return Err("usage: token-ladder grok-set <used_pct> [--reset <iso>]".to_string());
+    };
+    let env = usage::Env::from_process();
+    let reset = args.reset.as_deref().or(args.resets_at.as_deref());
+    match collect::grok_set(&env, pct, reset, usage::now_epoch()) {
+        Ok(message) => {
+            println!("{message}");
+            Ok(ExitCode::from(ALLOWED_EXIT))
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            Ok(ExitCode::from(USAGE_EXIT))
+        }
+    }
+}
+
+fn usage_export_command() -> ExitCode {
+    let env = usage::Env::from_process();
+    match ledger::fetch_usage_export(&env) {
+        Ok(text) => {
+            print!("{text}");
+            ExitCode::from(ALLOWED_EXIT)
+        }
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(FAILED_EXIT)
+        }
+    }
+}
+
+fn burn_command(args: &PickArgs, config: &Config) -> ExitCode {
+    let env = usage::Env::from_process();
+    let report = ledger::burn_report(&env, config, usage::now_epoch());
+    if args.json {
+        println!("{report}");
+    } else {
+        for line in ledger::burn_lines(&report) {
+            println!("{line}");
+        }
+    }
+    ExitCode::from(ALLOWED_EXIT)
+}
+
+fn pace_log_command(args: &PickArgs, config: &Config) -> Result<ExitCode, String> {
+    let state = State::load(&state_paths());
+    let pools = load_pools(args.pools.as_deref(), &state, config)?;
+    let env = usage::Env::from_process();
+    let path = match args.pace_log.as_deref() {
+        Some(text) if !text.is_empty() => PathBuf::from(text),
+        _ => ledger::launches_path(&env),
+    };
+    let report = ledger::pace_log(&pools, config, usage::now_epoch(), &path);
+    if args.json {
+        println!("{report}");
+    } else {
+        for line in ledger::pace_log_lines(&report) {
+            println!("{line}");
+        }
+    }
+    Ok(ExitCode::from(ALLOWED_EXIT))
+}
+
+fn read_credits_command(args: &PickArgs, config: &Config) -> Result<ExitCode, String> {
+    let env = usage::Env::from_process();
+    let names = match args.read_credits.as_deref() {
+        Some(names) if !names.is_empty() => names.to_vec(),
+        _ => ledger::credit_lane_names(config),
+    };
+    let (line, failures) = ledger::read_credits_command(&env, config, &names, usage::now_epoch())?;
+    for failure in failures {
+        eprintln!("{failure}");
+    }
+    if !line.is_empty() {
+        println!("{line}");
+    }
+    Ok(ExitCode::from(ALLOWED_EXIT))
+}
+
 fn run(cli: Cli) -> Result<ExitCode, String> {
     match &cli.command {
         Command::Status => Ok(status_command()),
+        Command::Collect => collect_command(None),
+        Command::Mode(args) => mode_command(args, None),
+        Command::Route(args) => Ok(route_command(args)),
+        Command::GrokSet(args) => grok_set_command(args),
         Command::Pools(args) => pools_command(args),
         Command::Pick(args) => pick_command(args),
         Command::HookBash => Ok(hook_bash()),
@@ -905,6 +1109,10 @@ mod tests {
             reason: None,
             pools: None,
             config: None,
+            read_credits: None,
+            opencode_usage_export: false,
+            burn: false,
+            pace_log: None,
         };
         assert_eq!(rung_for(&args).unwrap().rung, Rung::Hard);
         let flagged = PickArgs {
@@ -941,6 +1149,10 @@ mod tests {
             reason: None,
             pools: None,
             config: None,
+            read_credits: None,
+            opencode_usage_export: false,
+            burn: false,
+            pace_log: None,
         };
         let rung = rung_for(&args).unwrap();
         assert_eq!(rung.rung, Rung::Medium);
