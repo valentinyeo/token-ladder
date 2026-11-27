@@ -96,6 +96,8 @@ struct PickArgs {
     plans: bool,
     #[arg(long = "lane-ok", value_name = "LANE_OR_VENDOR")]
     lane_ok: Option<String>,
+    #[arg(long = "cloud")]
+    cloud: bool,
     #[arg(long = "not-vendor", value_name = "VENDOR")]
     not_vendor: Vec<String>,
     #[arg(long = "loop-interval")]
@@ -904,6 +906,10 @@ fn plan_pick(rest: Vec<String>) -> ExitCode {
             return ExitCode::from(FAILED_EXIT);
         }
     };
+    if args.cloud && args.lane_ok.is_none() {
+        eprintln!("plan-pick: --cloud requires --lane-ok");
+        return ExitCode::from(USAGE_EXIT);
+    }
     match pick_command(&args) {
         Ok(code) => code,
         Err(message) => {
@@ -1097,6 +1103,7 @@ mod tests {
             rung: None,
             plans: false,
             lane_ok: None,
+            cloud: false,
             not_vendor: vec![],
             loop_interval: false,
             claude_helper: false,
@@ -1137,6 +1144,7 @@ mod tests {
             rung: None,
             plans: false,
             lane_ok: None,
+            cloud: false,
             not_vendor: vec![],
             loop_interval: false,
             claude_helper: false,

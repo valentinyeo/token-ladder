@@ -213,7 +213,7 @@ Anchors older than seven days, future anchors, and invalid balances close prepai
 
 | Rule | Enforced by |
 |---|---|
-| Use prepaid credit already held down to its floor; never top up automatically. OpenCode stops at $2 until monthly renewal, and a live read above the floor clears that lock. | `PrepaidCreditTests.test_prepaid_credit_floor_is_inclusive_and_configurable`, `test_floor_lock_clears_on_a_live_read_above_the_floor_and_names_the_date`, `test_live_credit_above_the_floor_leaves_a_rate_limit_lock_alone`, `test_live_reader_executes_read_only_commands_and_keeps_zero_credit` in `tests/test_plan_pick.py` |
+| Use prepaid credit already held down to its floor; never top up automatically. A lane at or under its credit floor is skipped. | `credit_floor_skip` in `rust/src/picker.rs` (unit test `pool_off_and_credit_floor_are_both_refused`) and `rust/tests/runner.rs` (`run_marks_empty_credit_limited_with_the_credit_hours`); judgment, review |
 | Monthly 100% means the included allowance is used up, regardless of weekly and 5-hour readings. Live credit or an anchor no older than seven days can authorize Extra Usage. Deduct OpenCode's own billed usage from the console usage export, and fall back to run costs with $0.50 per unknown-cost run when that read fails. | `AnchoredCreditTests`, `UsageExportTests`, `CommandTests.test_set_credit_and_usage_logs_drive_selection_without_browser_credit`, `PrepaidCreditTests` |
 | DeepSeek direct is retired; no more top-ups or worker/CI selection. | `PrepaidCreditTests.test_deepseek_direct_is_retired_from_workers_and_ci` |
 
@@ -459,7 +459,7 @@ Every prompt also shows the shared 1Password account budget (`1Password: N/1000 
 
 ## Built (v0.1.0, 2026-10-10)
 
-- `bin/token-ladder`: `collect` (timer), `status`, `pools --json`, `grok-set`, `route`, `mode claude|codex|auto`, `hook-prompt`, `hook-bash`. Python 3, no dependencies.
+- `rust/`: the program. `rust/target/release/token-ladder` answers `collect` (timer), `status`, `pools --json`, `grok-set`, `route`, `mode claude|codex|auto`, `hook-prompt`, `hook-bash`, `hook-agent`, and the `plan-pick` surface through `--plan-pick` or argv[0] `plan-pick`; `~/.local/bin/token-ladder` and `~/.local/bin/plan-pick` are symlinks to it.
 - `config.json`: floor, thresholds, Codex bonus reset expiry dates, and `plans` (what each subscription includes, where it runs and its extra cost; add new plans here).
 - `systemd/`: user timer, every 5 minutes (`systemctl --user status token-ladder.timer`).
 - Hooks in `~/.claude/settings.json`: prompt = pool states; Bash = no model ID containing `fast`, no paid fallback, no `cc-deepseek-apikey`/`ccr` (`TOKEN_LADDER_DEEPSEEK_OK=1` only after Valentin’s yes). Agent uses its own Claude pool, never legacy CODEX routing.

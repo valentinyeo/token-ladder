@@ -9,7 +9,7 @@ token-ladder reports subscription pool states read-only via `pools --json` and t
 
 ## How to get to it (user POV)
 
-- Operator runs `bin/token-ladder status` or `bin/token-ladder pools --json` to see usage before routing work.
+- Operator runs `token-ladder status` or `token-ladder pools --json` to see usage before routing work.
 
 ## Driving it with bash
 
@@ -17,9 +17,10 @@ Preconditions:
 
 - `export HOME=$(mktemp -d)`
 - `export TOKEN_LADDER_LOCAL_CONFIG=$PWD/.test-missing-config.local.json`
+- `export B=$PWD/rust/target/release/token-ladder`
 
-- **Pools JSON.** Run `bin/token-ladder pools --json`. Exit `0`. stdout JSON object has exactly keys `claude`, `codex`, `grok`, `google`. `$HOME` stays empty (no new files).
-- **Status empty home.** Run `bin/token-ladder status`. Exit `0`. stdout lines include `TOKEN MAX OK`, `FLOOR OK`, `FEED OK`, and provider lines with `? used, reset unknown`.
+- **Pools JSON.** Run `"$B" pools --json`. Exit `0`. stdout JSON object has exactly keys `claude`, `codex`, `grok`, `google`, every provider `state` is `unknown` with `note: "no reading"`, and `google.chat_only` is `true`. `$HOME` stays empty (no new files).
+- **Status empty home.** Run `"$B" status`. Exit `0`. stdout is one line: `Token ladder: Claude unknown; Codex unknown; Grok unknown; Google unknown. Mode unknown.`
 
 ## Gotchas
 

@@ -208,6 +208,31 @@ fn plan_pick_lane_ok_refuses_orchestrator_lanes_with_exit_three() {
 }
 
 #[test]
+fn plan_pick_keeps_the_cloud_lane_check_flag_for_cloud_agent() {
+    let home = scratch("lane-ok-cloud");
+    let brief = home.join("brief.txt");
+    std::fs::write(&brief, "Rung: medium\n").ok();
+    let args = [
+        "--lane-ok",
+        "antigravity",
+        "--cloud",
+        "--brief",
+        brief.to_str().unwrap_or("brief.txt"),
+    ];
+    let (code, out, err) = run_as(&home, "plan-pick", &args);
+    assert_eq!(code, 3, "{err}");
+    assert_eq!(out.trim(), "antigravity: chat-only pool, never workers");
+    let (code, out, err) = run_as(&home, "plan-pick", &["--cloud"]);
+    assert_eq!(code, 2);
+    assert!(out.is_empty());
+    assert!(
+        err.contains("plan-pick: --cloud requires --lane-ok"),
+        "{err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn claude_helper_and_loop_interval_answer_from_state() {
     let home = scratch("helper");
     write_state(

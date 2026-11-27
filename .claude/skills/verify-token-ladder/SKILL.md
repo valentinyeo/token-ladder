@@ -5,30 +5,31 @@ description: Verify Token Ladder CLI and CI (plan-pick, pools, ladder-call). Use
 
 # Verify Token Ladder
 
-Surface: Python CLI (`bin/token-ladder`, `bin/plan-pick`) and CI helpers (`ci/ladder-call`, `ci/lint-direct-model-calls`). Read `features/README.md` before driving. The live copy under the operator home drives real runners: never run `collect`, `mode`, or `grok-set` there.
+Surface: Rust CLI (`rust/target/release/token-ladder`; `--plan-pick <flags>` reaches the picker surface, and so does argv[0] `plan-pick`) and CI helpers (`ci/ladder-call`, `ci/lint-direct-model-calls`). Read `features/README.md` before driving. The live copy under the operator home drives real runners: never run `collect`, `mode`, or `grok-set` there.
 
 ## Launch
 
 No server. From the repo root:
 
 ```
-python3 -m py_compile bin/token-ladder bin/plan-pick bin/check-tests-changed bin/gateway_burn.py tests/*.py ci/ladder-call ci/ladder-agent ci/ladder-agent-stub-server.py ci/model_families.py ci/lint-direct-model-calls ci/ladder-call-stub-server.py ci/run-verifier ci/verdict.py ci/build-verifier-request.py ci/read-verifier-answer.py ci/regression-selftest.py && echo COMPILE_OK
+cd rust && cargo build --release --locked && cd .. && test -x rust/target/release/token-ladder && echo BUILD_OK
 ```
 
 ## Doctor
 
 ```
-python3 --version; test -x bin/token-ladder && test -x bin/plan-pick && test -f config.json && echo LAYOUT_OK
+test -x rust/target/release/token-ladder && test -f config.json && echo LAYOUT_OK
 ```
 
 ## Drive
 
 Use `HOME=$(mktemp -d)` and `TOKEN_LADDER_LOCAL_CONFIG` pointing at `.test-missing-config.local.json` (same as unit tests) so pools and state stay isolated.
 
-Pick one journey from `features/` and run its commands literally. For a PR-sized check also run:
+Pick one journey from `features/` and run its commands literally; `B=rust/target/release/token-ladder` is the program, and `"$B" --plan-pick <flags>` is plan-pick. For a PR-sized check also run:
 
 ```
-python3 -m unittest discover -s tests -p 'test_*.py' 2>&1 | tail -5
+timeout 300 python3 -m unittest discover -s tests 2>&1 | tail -5
+cd rust && timeout 300 cargo test --locked && timeout 300 cargo clippy --locked --all-targets -- -D warnings && cd ..
 node tools/strip-comments.mjs --check
 python3 ci/lint-direct-model-calls .
 ```
