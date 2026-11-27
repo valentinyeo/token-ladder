@@ -289,6 +289,7 @@ def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=N
 
 
 LAST_RESORT_LANES = frozenset({"openrouter"})
+FALLBACK_TIER_LANES = frozenset({"codex", "cursor"})
 
 
 def lane_balance_score(lane, pools):
@@ -346,9 +347,19 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
             return {"plan": name, "command": lane["command"], "reason": reason + clause}
         eligible.append((index, lane, pool))
     if eligible:
-        primary = [item for item in eligible if item[1]["lane"] not in LAST_RESORT_LANES
-                   and item[1]["lane"] not in held_last]
-        group = primary or eligible
+        def name(item):
+            return item[1]["lane"]
+
+        def primary(item):
+            return name(item) not in LAST_RESORT_LANES and name(item) not in FALLBACK_TIER_LANES
+
+        def unheld(item):
+            return name(item) not in held_last
+
+        group = ([item for item in eligible if primary(item) and unheld(item)]
+                 or [item for item in eligible if primary(item)]
+                 or [item for item in eligible if name(item) not in LAST_RESORT_LANES and unheld(item)]
+                 or eligible)
         _, chosen_lane, chosen_pool = min(group, key=lambda item: (lane_balance_score(item[1], pools), item[0]))
         if len(group) > 1:
             peers = ", ".join(item[1]["lane"] for item in group)

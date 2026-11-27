@@ -587,7 +587,7 @@ class BalanceLanesTests(unittest.TestCase):
     def test_config_enables_balance_lanes(self):
         self.assertTrue(self.cfg.get("balance_lanes"))
 
-    def test_picks_most_behind_pace_and_keeps_openrouter_last_resort(self):
+    def test_cheap_deepseek_lanes_win_before_codex_and_openrouter_stays_last_resort(self):
         pools = {
             "opencode": {"state": "ON", "pace_ratio": 0.95},
             "google": {"state": "ON", "pace_ratio": 0.80},
@@ -600,12 +600,37 @@ class BalanceLanesTests(unittest.TestCase):
         result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
         self.assertEqual(result["plan"], "commandcode")
         self.assertIn("lowest pace among free lanes", result["reason"])
+        self.assertNotIn("codex", result["reason"].split(":")[0])
         pools["credit:commandcode"] = {"state": "ON", "pace_ratio": 0.90}
-        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
-        self.assertEqual(result["plan"], "codex")
-        pools["codex"] = {"state": "ON", "pace_ratio": 0.95}
+        pools["codex"] = {"state": "ON", "pace_ratio": 0.10}
         result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
         self.assertEqual(result["plan"], "vercel")
+
+    def test_medium_picks_a_cheap_lane_over_a_lower_pace_codex(self):
+        pools = {
+            "opencode": {"state": "OFF"},
+            "credit:vercel": {"state": "ON", "pace_ratio": 0.90},
+            "credit:commandcode": {"state": "ON", "pace_ratio": 0.86},
+            "codex": {"state": "ON", "pace_ratio": 0.50},
+            "grok": {"state": "OFF"},
+        }
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
+        self.assertEqual(result["plan"], "commandcode")
+        self.assertIn("lowest pace among free lanes (vercel, commandcode)", result["reason"])
+
+    def test_medium_falls_back_to_codex_when_every_cheap_deepseek_lane_is_gone(self):
+        pools = {"codex": {"state": "ON", "pace_ratio": 0.50}, "grok": {"state": "OFF"}}
+        limits = {name: 160 for name in ("opencode", "vercel", "commandcode", "openrouter")}
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, limits, 1.1, now=100)
+        self.assertEqual(result["plan"], "codex")
+
+    def test_hard_still_picks_codex(self):
+        ctx = {"rung": "hard", "rung_source": "default", "rung_reason": "rung hard"}
+        pools = {"codex": {"state": "ON", "pace_ratio": 0.50},
+                 "credit:commandcode": {"state": "ON", "pace_ratio": 0.10},
+                 "grok": {"state": "OFF"}}
+        result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, ctx, {}, 1.1, now=100)
+        self.assertEqual(result["plan"], "codex")
 
     def test_burn_override_still_wins_over_balance_lanes(self):
         pools = {
