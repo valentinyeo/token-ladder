@@ -22,6 +22,7 @@ pub struct LaneContext<'a> {
 pub struct PickContext<'a> {
     pub lane: LaneContext<'a>,
     pub excluded: Vec<String>,
+    pub pinned: Option<&'a LaneSpec>,
 }
 
 impl<'a> PickContext<'a> {
@@ -42,6 +43,7 @@ impl<'a> PickContext<'a> {
                 status: None,
             },
             excluded: Vec::new(),
+            pinned: None,
         }
     }
 
@@ -52,6 +54,11 @@ impl<'a> PickContext<'a> {
 
     pub fn excluding(mut self, excluded: Vec<String>) -> Self {
         self.excluded = excluded;
+        self
+    }
+
+    pub fn pinning(mut self, pinned: Option<&'a LaneSpec>) -> Self {
+        self.pinned = pinned;
         self
     }
 }
@@ -273,6 +280,48 @@ pub fn lane_eligibility(
     }
 }
 
+fn pinned_lane_eligibility(
+    lane: &LaneSpec,
+    ctx: &LaneContext<'_>,
+    excluded: &[String],
+) -> LaneEligibility {
+    if is_orchestrator(lane, ctx.pools) {
+        return LaneEligibility::skipped(SkipReason::OrchestratorOnly);
+    }
+    if lane
+        .names()
+        .iter()
+        .any(|name| excluded.iter().any(|skip| skip == name))
+    {
+        return LaneEligibility::skipped(SkipReason::VendorExcluded);
+    }
+    if let Some(reason) = limit_skip(ctx.limits.get(&lane.lane), ctx.now) {
+        return LaneEligibility::skipped(reason);
+    }
+    let pool = lane_pool(lane, ctx.pools);
+    if let Some(pool) = pool {
+        if pool.credit_unknown {
+            return LaneEligibility::skipped(SkipReason::PoolOff {
+                note: "credit unknown".to_string(),
+            });
+        }
+        if pool.is_off() || pool.state_label() != "ON" {
+            return LaneEligibility::skipped(SkipReason::PoolOff {
+                note: pool.off_note(),
+            });
+        }
+    }
+    if let Some(reason) = credit_floor_skip(lane, pool, ctx.cfg) {
+        return LaneEligibility::skipped(reason);
+    }
+    if pool.is_none() && (lane.credit.is_some() || lane.pool.is_some()) {
+        return LaneEligibility::skipped(SkipReason::PoolOff {
+            note: "no reading".to_string(),
+        });
+    }
+    LaneEligibility::ready(0.0, "available; explicit pin ignores pace".to_string())
+}
+
 pub fn pool_note(pool: Option<&Pool>, cfg: &Config) -> String {
     let Some(pool) = pool else {
         return "no usage reader, a 429 or empty credit marks it limited".to_string();
@@ -343,6 +392,9 @@ fn skipped_clause(skipped: &[(String, String)]) -> String {
 }
 
 pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
+    if let Some(pinned) = ctx.pinned {
+        return pick_pinned(ctx, rung_ctx, pinned);
+    }
     let rung = rung_ctx.rung;
     let mut rated: Vec<Rated<'_>> = Vec::new();
     let mut skipped: Vec<(String, String)> = Vec::new();
@@ -355,8 +407,10 @@ pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
         if !eligibility.is_ready() {
             skipped.push((lane.lane.clone(), eligibility.reason()));
         }
-        if let Some(hours) = burn_lane(lane, &ctx.lane, &ctx.excluded) {
-            burn.push((lane, hours));
+        if rung != Rung::Hard || lane.role() == Role::Heavy {
+            if let Some(hours) = burn_lane(lane, &ctx.lane, &ctx.excluded) {
+                burn.push((lane, hours));
+            }
         }
         rated.push(Rated {
             index,
@@ -439,6 +493,24 @@ pub fn pick(ctx: &PickContext<'_>, rung_ctx: &RungContext) -> PickResult {
     }
 }
 
+fn pick_pinned(ctx: &PickContext<'_>, rung_ctx: &RungContext, pinned: &LaneSpec) -> PickResult {
+    let eligibility = pinned_lane_eligibility(pinned, &ctx.lane, &ctx.excluded);
+    let tier = pinned.role();
+    let source = format!("pinned lane {}", pinned.lane);
+    match eligibility {
+        LaneEligibility::Ready { reason, .. } => PickResult::lane(
+            pinned.lane.clone(),
+            pinned.command.clone(),
+            format!("{source} ({tier}): {reason}"),
+            rung_ctx,
+        ),
+        LaneEligibility::Skipped(reason) => refused(
+            format!("{source} cannot run: {reason}; no other lane runs instead"),
+            rung_ctx,
+        ),
+    }
+}
+
 fn clone_rated<'a>(item: &Rated<'a>) -> Rated<'a> {
     Rated {
         index: item.index,
@@ -458,6 +530,9 @@ pub fn lane_in_rung(cfg: &Config, lane: &LaneSpec, rung: Rung) -> bool {
 
 pub fn resolve_spec(cfg: &Config, spec: &str) -> Option<LaneSpec> {
     let wanted = spec.trim().to_ascii_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
     let wanted = match wanted.as_str() {
         "anthropic" => "claude".to_string(),
         "openai" => "codex".to_string(),
@@ -1033,6 +1108,115 @@ mod tests {
         let result = pick(&ctx, &RungContext::fixed(Rung::Hard));
         assert_eq!(result.plan, "codex");
         assert!(result.reason.starts_with("rung hard: heavy lane codex"));
+    }
+
+    #[test]
+    fn hard_never_falls_back_to_workhorse_even_with_a_bonus_reset() {
+        let (mut cfg, mut pools, credits) = workhorse_stack();
+        cfg.lanes[1].vendor = Some("openai".to_string());
+        cfg.lanes[1].pool = Some("commandcode".to_string());
+        with_bonus(&mut cfg, "codex", 10);
+        pools.insert("commandcode".to_string(), quiet_codex_pool(0.5));
+        pools.insert(
+            "codex".to_string(),
+            Pool {
+                state: Some("OFF".to_string()),
+                ..Pool::default()
+            },
+        );
+        let limits = empty_limits();
+        let ctx = context(&cfg, &pools, &credits, &limits);
+        let result = pick(&ctx, &RungContext::fixed(Rung::Hard));
+        assert_eq!(result.plan, "none");
+        assert!(result.command.is_none());
+    }
+
+    #[test]
+    fn pinned_codex_ignores_workhorse_order_and_pace_on_every_rung() {
+        let (cfg, mut pools, credits) = workhorse_stack();
+        pools.insert("codex".to_string(), quiet_codex_pool(1.5));
+        let limits = empty_limits();
+        let pinned = resolve_spec(&cfg, "codex").unwrap();
+        let ctx = context(&cfg, &pools, &credits, &limits).pinning(Some(&pinned));
+        for rung in [Rung::Light, Rung::Medium, Rung::Hard] {
+            let result = pick(&ctx, &RungContext::fixed(rung));
+            assert_eq!(result.plan, "codex");
+            assert_eq!(result.command.as_deref(), Some("run codex"));
+            assert!(result.reason.contains("pinned lane codex"));
+        }
+    }
+
+    #[test]
+    fn unavailable_pinned_lanes_never_fall_back() {
+        let (cfg, pools, credits) = workhorse_stack();
+        let pinned = resolve_spec(&cfg, "codex").unwrap();
+        for unavailable in [
+            "off",
+            "limited",
+            "excluded",
+            "unknown",
+            "missing",
+            "chat-only",
+        ] {
+            let mut pools = pools.clone();
+            let mut limits = empty_limits();
+            let mut excluded = Vec::new();
+            match unavailable {
+                "off" => {
+                    pools.get_mut("codex").unwrap().state = Some("OFF".to_string());
+                }
+                "limited" => {
+                    limits.insert("codex".to_string(), LimitEntry::Epoch((NOW + HOUR) as f64));
+                }
+                "excluded" => excluded.push("codex".to_string()),
+                "unknown" => {
+                    pools.get_mut("codex").unwrap().state = Some("unknown".to_string());
+                }
+                "missing" => {
+                    pools.remove("codex");
+                }
+                "chat-only" => {
+                    pools.get_mut("codex").unwrap().chat_only = true;
+                }
+                _ => unreachable!(),
+            }
+            let ctx = context(&cfg, &pools, &credits, &limits)
+                .pinning(Some(&pinned))
+                .excluding(excluded);
+            let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+            assert_eq!(result.plan, "none", "{unavailable}: {}", result.reason);
+            assert!(result.command.is_none());
+        }
+    }
+
+    #[test]
+    fn pinned_credit_lanes_must_stay_above_the_floor() {
+        let (cfg, mut pools, credits) = workhorse_stack();
+        let limits = empty_limits();
+        let pinned = resolve_spec(&cfg, "vercel").unwrap();
+        for remaining in [cfg.credit_floor_usd, cfg.credit_floor_usd - 1.0] {
+            pools.get_mut("credit:vercel").unwrap().credits_usd = Some(remaining);
+            let ctx = context(&cfg, &pools, &credits, &limits).pinning(Some(&pinned));
+            let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+            assert_eq!(result.plan, "none");
+            assert!(result.reason.contains("floor"));
+        }
+        pools.get_mut("credit:vercel").unwrap().credits_usd = Some(cfg.credit_floor_usd + 1.0);
+        let ctx = context(&cfg, &pools, &credits, &limits).pinning(Some(&pinned));
+        assert_eq!(pick(&ctx, &RungContext::fixed(Rung::Medium)).plan, "vercel");
+    }
+
+    #[test]
+    fn pinned_orchestrators_are_still_chat_only() {
+        let (cfg, pools, credits) = workhorse_stack();
+        let limits = empty_limits();
+        for name in ["antigravity", "claude"] {
+            let pinned = resolve_spec(&cfg, name).unwrap();
+            let ctx = context(&cfg, &pools, &credits, &limits).pinning(Some(&pinned));
+            let result = pick(&ctx, &RungContext::fixed(Rung::Medium));
+            assert_eq!(result.plan, "none");
+            assert!(result.reason.contains("chat-only pool, never workers"));
+        }
     }
 
     #[test]

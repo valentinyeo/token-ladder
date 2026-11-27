@@ -264,6 +264,70 @@ impl RungContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("lane needs one lane name, got {value:?}")]
+pub struct LaneError {
+    pub value: String,
+}
+
+impl LaneError {
+    pub fn new(value: impl Into<String>) -> Self {
+        LaneError {
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanePin {
+    pub spec: String,
+    pub source: String,
+    pub reason: String,
+}
+
+impl LanePin {
+    pub fn from_brief(text: &str) -> Result<Option<Self>, LaneError> {
+        let matches: Vec<&str> = text
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim_end_matches('\r');
+                trimmed
+                    .strip_prefix("Lane:")
+                    .map(|rest| rest.trim_matches([' ', '\t']))
+            })
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(LanePin::from_line(only)?)),
+            [_, ..] => Err(LaneError::new(format!("{} Lane lines", matches.len()))),
+        }
+    }
+
+    pub fn from_line(spec: &str) -> Result<Self, LaneError> {
+        let spec = spec.trim().to_ascii_lowercase();
+        if spec.is_empty() {
+            return Err(LaneError::new("(empty)"));
+        }
+        Ok(LanePin {
+            reason: format!("lane {spec}"),
+            spec,
+            source: "brief line".to_string(),
+        })
+    }
+
+    pub fn fixed(spec: &str) -> Result<Self, LaneError> {
+        let spec = spec.trim().to_ascii_lowercase();
+        if spec.is_empty() {
+            return Err(LaneError::new("(empty)"));
+        }
+        Ok(LanePin {
+            reason: format!("lane {spec}"),
+            spec,
+            source: "flag".to_string(),
+        })
+    }
+}
+
 pub fn trim_float(value: f64) -> String {
     if value.is_finite() && value.fract() == 0.0 && value.abs() < 1e15 {
         format!("{value:.0}")
@@ -309,6 +373,25 @@ mod tests {
     #[test]
     fn brief_with_unknown_rung_is_refused() {
         assert!(RungContext::from_brief("Rung: turbo\n", Rung::Medium).is_err());
+    }
+
+    #[test]
+    fn brief_lane_line_is_read_once_and_normalised() {
+        assert_eq!(LanePin::from_brief("Ticket: X\n").unwrap(), None);
+        let pin = LanePin::from_brief("Lane:  Codex \n").unwrap().unwrap();
+        assert_eq!(pin.spec, "codex");
+        assert_eq!(pin.source, "brief line");
+        assert_eq!(pin.reason, "lane codex");
+        assert!(LanePin::from_brief("Lane: codex\nLane: vercel\n").is_err());
+        assert!(LanePin::from_brief("Lane: \n").is_err());
+    }
+
+    #[test]
+    fn a_lane_flag_pin_trims_its_spec() {
+        let pin = LanePin::fixed(" OpenAI ").unwrap();
+        assert_eq!(pin.spec, "openai");
+        assert_eq!(pin.source, "flag");
+        assert!(LanePin::fixed("  ").is_err());
     }
 
     #[test]
