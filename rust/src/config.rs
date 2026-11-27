@@ -19,6 +19,8 @@ pub const DEFAULT_LOOP_USED_PCT: f64 = 95.0;
 pub const DEFAULT_LOOP_MIN_SECONDS: u64 = 1800;
 pub const DEFAULT_CREDIT_STALE_HOURS: f64 = 6.0;
 pub const DEFAULT_CREDIT_REFRESH_MINUTES: f64 = 30.0;
+pub const DEFAULT_RESET_BURN_HOURS: f64 = 36.0;
+pub const DEFAULT_RESET_USE_AT_PERCENT: f64 = 95.0;
 pub const COMMANDCODE_PLAN_CREDITS: f64 = 70.0;
 pub const COMMANDCODE_CREDITS_TO_USD: f64 = 100.0 / COMMANDCODE_PLAN_CREDITS;
 pub const STATE_DIR: &str = ".local/state/token-ladder";
@@ -37,6 +39,14 @@ pub enum ConfigError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("cannot write {path}: {source}")]
+    Write {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("{0}")]
+    Message(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,6 +288,50 @@ pub struct PlanSpec {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct BonusReset {
+    #[serde(default)]
+    pub expires: Option<String>,
+}
+
+impl BonusReset {
+    pub fn epoch(&self) -> Option<i64> {
+        self.expires.as_deref().and_then(parse_stamp)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct BurnEntry {
+    #[serde(default)]
+    pub left: Option<f64>,
+    #[serde(default)]
+    pub reset_hours: Option<f64>,
+    #[serde(default)]
+    pub reset: Option<String>,
+    #[serde(default)]
+    pub burn_now: bool,
+    #[serde(default)]
+    pub pace: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+pub struct BurnPlan {
+    #[serde(default)]
+    pub claude: BurnEntry,
+    #[serde(default)]
+    pub codex: BurnEntry,
+}
+
+impl BurnPlan {
+    pub fn entry(&self, plan: &str) -> Option<&BurnEntry> {
+        match plan.to_ascii_lowercase().as_str() {
+            "claude" => Some(&self.claude),
+            "codex" => Some(&self.codex),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct CodexCredits {
     #[serde(default)]
     pub approved: Option<String>,
@@ -306,6 +360,14 @@ pub struct Config {
     #[serde(default = "default_credit_limited_hours")]
     pub credit_limited_hours: f64,
     #[serde(default)]
+    pub codex_resets: Vec<BonusReset>,
+    #[serde(default)]
+    pub claude_resets: Vec<BonusReset>,
+    #[serde(default = "default_reset_burn_hours")]
+    pub reset_burn_hours: f64,
+    #[serde(default = "default_reset_use_at_percent")]
+    pub reset_use_at_percent: f64,
+    #[serde(default)]
     pub loop_interval: LoopRule,
     #[serde(default)]
     pub codex_credits: CodexCredits,
@@ -327,6 +389,14 @@ fn default_credit_stale_hours() -> f64 {
 
 fn default_credit_refresh_minutes() -> f64 {
     DEFAULT_CREDIT_REFRESH_MINUTES
+}
+
+fn default_reset_burn_hours() -> f64 {
+    DEFAULT_RESET_BURN_HOURS
+}
+
+fn default_reset_use_at_percent() -> f64 {
+    DEFAULT_RESET_USE_AT_PERCENT
 }
 
 fn default_pace_warn_ratio() -> f64 {
@@ -365,6 +435,10 @@ impl Default for Config {
             pool_off_pct: DEFAULT_POOL_OFF_PCT,
             limited_hours: DEFAULT_LIMITED_HOURS,
             credit_limited_hours: DEFAULT_CREDIT_LIMITED_HOURS,
+            codex_resets: Vec::new(),
+            claude_resets: Vec::new(),
+            reset_burn_hours: DEFAULT_RESET_BURN_HOURS,
+            reset_use_at_percent: DEFAULT_RESET_USE_AT_PERCENT,
             loop_interval: LoopRule::default(),
             codex_credits: CodexCredits::default(),
             balance_lanes: false,
@@ -402,6 +476,29 @@ impl Config {
             path: path.display().to_string(),
             source,
         })
+    }
+
+    pub fn resets_for(&self, plan: &str) -> &[BonusReset] {
+        match plan.to_ascii_lowercase().as_str() {
+            "codex" => &self.codex_resets,
+            "claude" => &self.claude_resets,
+            _ => &[],
+        }
+    }
+
+    pub fn bonus_reset_hours(&self, plan: &str, now: i64) -> Option<f64> {
+        let soonest = self
+            .resets_for(plan)
+            .iter()
+            .filter_map(BonusReset::epoch)
+            .filter(|epoch| *epoch > now)
+            .min()?;
+        Some((soonest - now) as f64 / 3600.0)
+    }
+
+    pub fn burn_now(&self, plan: &str, now: i64) -> Option<f64> {
+        let hours = self.bonus_reset_hours(plan, now)?;
+        (hours <= self.reset_burn_hours).then_some(hours)
     }
 
     pub fn usable_lanes(&self) -> Vec<LaneSpec> {
@@ -574,13 +671,6 @@ impl CreditEntry {
         self.resets_at
             .as_ref()
             .and_then(Stampish::epoch)
-            .or_else(|| {
-                self.windows
-                    .as_ref()
-                    .and_then(|windows| windows.weekly.as_ref())
-                    .and_then(|weekly| weekly.reset_at.as_ref())
-                    .and_then(Stampish::epoch)
-            })
             .or_else(|| self.period_end.as_ref().and_then(Stampish::epoch))
     }
 }
@@ -656,6 +746,8 @@ pub struct Status {
     pub mode: Option<String>,
     #[serde(default)]
     pub why: Option<String>,
+    #[serde(default)]
+    pub burn: Option<BurnPlan>,
     #[serde(default)]
     pub pools: Pools,
     #[serde(default)]
@@ -810,6 +902,126 @@ fn read_json(path: &Path) -> Result<serde_json::Value, ConfigError> {
         path: path.display().to_string(),
         source,
     })
+}
+
+pub fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+        path: parent.display().to_string(),
+        source,
+    })?;
+    let tmp = parent.join(format!(
+        ".{}-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config"),
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    std::fs::write(&tmp, bytes).map_err(|source| ConfigError::Write {
+        path: tmp.display().to_string(),
+        source,
+    })?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(source) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(ConfigError::Write {
+                path: path.display().to_string(),
+                source,
+            })
+        }
+    }
+}
+
+pub const BONUS_RESET_PLANS: [&str; 2] = ["codex", "claude"];
+
+pub fn bonus_reset_key(plan: &str) -> Option<String> {
+    let plan = plan.to_ascii_lowercase();
+    BONUS_RESET_PLANS
+        .contains(&plan.as_str())
+        .then(|| format!("{plan}_resets"))
+}
+
+pub fn plan_label(plan: &str) -> String {
+    match plan.to_ascii_lowercase().as_str() {
+        "codex" => "Codex".to_string(),
+        "claude" => "Claude".to_string(),
+        other => other.to_string(),
+    }
+}
+
+pub fn live_bonus_resets(value: &serde_json::Value, plan: &str, now: i64) -> Vec<i64> {
+    let Some(key) = bonus_reset_key(plan) else {
+        return Vec::new();
+    };
+    let mut epochs: Vec<i64> = value
+        .get(&key)
+        .and_then(serde_json::Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| {
+                    let row: BonusReset = serde_json::from_value(row.clone()).ok()?;
+                    row.epoch().filter(|epoch| *epoch > now)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    epochs.sort_unstable();
+    epochs
+}
+
+pub fn bonus_reset_lines(value: &serde_json::Value, now: i64) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for plan in BONUS_RESET_PLANS {
+        let epochs = live_bonus_resets(value, plan, now);
+        let head = plan_label(plan);
+        if epochs.is_empty() {
+            lines.push(format!("{head}: no active bonus reset."));
+            continue;
+        }
+        for epoch in epochs {
+            lines.push(format!(
+                "{head}: bonus reset {} in {:.0}h.",
+                iso_stamp(epoch),
+                (epoch - now) as f64 / 3600.0
+            ));
+        }
+    }
+    lines
+}
+
+pub fn add_bonus_reset(
+    path: &Path,
+    plan: &str,
+    epoch: i64,
+    now: i64,
+) -> Result<Vec<String>, ConfigError> {
+    let key = bonus_reset_key(plan)
+        .ok_or_else(|| ConfigError::Message("a bonus reset plan is codex or claude".to_string()))?;
+    let mut value = if path.is_file() {
+        read_json(path)?
+    } else {
+        serde_json::json!({})
+    };
+    let mut epochs: Vec<i64> = live_bonus_resets(&value, plan, now);
+    epochs.push(epoch);
+    epochs.sort_unstable();
+    epochs.dedup();
+    let rows: Vec<serde_json::Value> = epochs
+        .iter()
+        .map(|epoch| serde_json::json!({ "expires": iso_stamp(*epoch) }))
+        .collect();
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| ConfigError::Message("config must be a JSON object".to_string()))?;
+    object.insert(key, serde_json::Value::Array(rows));
+    let text = serde_json::to_string_pretty(&value).map_err(|source| ConfigError::Parse {
+        path: path.display().to_string(),
+        source,
+    })?;
+    write_atomic_bytes(path, format!("{text}\n").as_bytes())?;
+    Ok(bonus_reset_lines(&value, now))
 }
 
 pub fn merge_objects(base: &mut serde_json::Value, overlay: serde_json::Value) {
@@ -974,6 +1186,7 @@ mod tests {
     fn millisecond_reset_stamps_become_seconds() {
         let entry = CreditEntry {
             credits: Some(60.708),
+            resets_at: Some(Stampish::Epoch(1795990113512.0)),
             windows: Some(CreditWindows {
                 weekly: Some(CreditWindow {
                     used: Some(9.29),
@@ -990,6 +1203,46 @@ mod tests {
             Stampish::Epoch(1795988288.0).epoch(),
             Some(1795988288)
         );
+    }
+
+    #[test]
+    fn commandcode_reset_is_the_monthly_period_end_not_the_weekly_throttle() {
+        let now = 1_795_783_606i64;
+        let entry = CreditEntry {
+            credits: Some(60.7084),
+            windows: Some(CreditWindows {
+                weekly: Some(CreditWindow {
+                    used: Some(9.29),
+                    cap: Some(35.0),
+                    exceeded: Some(false),
+                    reset_at: Some(Stampish::Epoch((now + 2 * 86_400) as f64)),
+                }),
+                five_hour: None,
+            }),
+            period_end: Some(Stampish::Epoch((now + 25 * 86_400) as f64)),
+            ..CreditEntry::default()
+        };
+        let reset = entry.reset_epoch().unwrap();
+        assert_eq!(reset, now + 25 * 86_400);
+        assert_eq!((reset - now) / 86_400, 25);
+        let expiring = CreditEntry {
+            credits: Some(60.7084),
+            windows: entry.windows.clone(),
+            period_end: entry.period_end.clone(),
+            ..CreditEntry::default()
+        };
+        let lane = crate::config::LaneSpec {
+            lane: "commandcode".to_string(),
+            credit: Some("commandcode".to_string()),
+            command: "run commandcode".to_string(),
+            ..crate::config::LaneSpec::default()
+        };
+        let credits = Credits::from([("commandcode".to_string(), expiring)]);
+        let (per_day, remaining, days) =
+            crate::picker::expiring_value_per_day(&lane, &credits, now).unwrap();
+        assert!((days - 25.0).abs() < 0.001, "{days}");
+        assert!((remaining - 86.726).abs() < 0.01, "{remaining}");
+        assert!((per_day - 3.469).abs() < 0.01, "{per_day}");
     }
 
     #[test]

@@ -12,7 +12,7 @@ The program is Rust in `rust/`. `~/.local/bin/token-ladder` and `~/.local/bin/pl
 - Ship: Open a PR from a `ceo/<ticket>` branch; the required checks `secret-scan`, `tests`, `no-comments`, `rust` and `pstack-verifier` must be green; `gh pr merge --squash --delete-branch`; then on the primary server `git -C ~/projects/token-ladder pull --ff-only`, `cd ~/projects/token-ladder/rust && cargo build --release` and `systemctl --user daemon-reload` (the live unit points into that checkout). Check it live with `~/.local/bin/token-ladder status`.
 - Diff checks: `bin/check-tests-changed origin/main` (CI runs this).
 - Worker plan: `~/.local/bin/plan-pick` (or `--json`) prints which lane runs the next background worker, why, and the rung. `--plans` prints what each subscription includes. `--run` launches the picked lane, moves to the next one on a 429, 402, quota error or silent exit, and refuses a brief that tells the worker to wait for CI. `--lane-ok <lane>` answers for one lane (exit 0 allowed, 3 refused); `--cloud` keeps the call compatible with cloud-agent's launch check. `--claude-helper` answers for an in-chat Claude helper (exit 0 allowed under pace, 3 refused). `--loop-interval` prints the seconds a loop should wait. `--not-vendor <vendor>` excludes vendors. `--burn` and `--pace-log` report recorded spend and launch pace. `--limited`, `--set-credit`, `--read-credits` record or read lane state.
-- Run: `token-ladder collect | status | pools --json | grok-set | route | mode claude|codex|auto | hook-prompt | hook-bash | hook-agent`.
+- Run: `token-ladder collect | status | pools --json | grok-set | route | mode claude|codex|auto | hook-prompt | hook-bash | hook-agent | reset-add <codex|claude> <expires-iso>`.
 
 ## Layout
 

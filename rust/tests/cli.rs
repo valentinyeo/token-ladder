@@ -306,3 +306,126 @@ fn status_reports_stale_state_and_the_forced_mode() {
     assert!(out.contains("STALE"), "{out}");
     std::fs::remove_dir_all(&home).ok();
 }
+
+fn local_config(home: &Path) -> PathBuf {
+    home.join("config.local.json")
+}
+
+fn bonus_reset(hours: i64) -> String {
+    let at = chrono::Utc::now() + chrono::Duration::hours(hours);
+    format!("{}", at.format("%Y-%m-%dT%H:%M:%SZ"))
+}
+
+#[test]
+fn reset_add_writes_a_local_config_and_rejects_bad_timestamps() {
+    let home = scratch("reset-add");
+    let config = local_config(&home);
+    let (code, out, err) = run(
+        &home,
+        &[
+            "reset-add",
+            "codex",
+            "2099-12-01T18:00:00Z",
+            "--config",
+            config.to_str().unwrap_or("config.local.json"),
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Registered codex bonus reset at 2099-12-01T18:00:00Z"), "{out}");
+    assert!(out.contains("Codex: bonus reset 2099-12-01T18:00:00Z"), "{out}");
+    let written: Value = serde_json::from_str(&std::fs::read_to_string(&config).expect("config"))
+        .expect("valid json");
+    assert_eq!(written["codex_resets"][0]["expires"], "2099-12-01T18:00:00Z");
+    let (code, _, err) = run(
+        &home,
+        &[
+            "reset-add",
+            "codex",
+            "not a date",
+            "--config",
+            config.to_str().unwrap_or("config.local.json"),
+        ],
+        "",
+    );
+    assert_eq!(code, 2);
+    assert!(err.contains("ISO-8601 timestamp"), "{err}");
+    let (code, _, err) = run(
+        &home,
+        &[
+            "reset-add",
+            "antigravity",
+            "2099-12-01T18:00:00Z",
+            "--config",
+            config.to_str().unwrap_or("config.local.json"),
+        ],
+        "",
+    );
+    assert_eq!(code, 2);
+    assert!(err.contains("plan is codex or claude"), "{err}");
+    let (code, _, err) = run(
+        &home,
+        &[
+            "reset-add",
+            "claude",
+            "2001-01-01T00:00:00Z",
+            "--config",
+            config.to_str().unwrap_or("config.local.json"),
+        ],
+        "",
+    );
+    assert_eq!(code, 2);
+    assert!(err.contains("has expired"), "{err}");
+    let (code, out, err) = run(
+        &home,
+        &[
+            "reset-add",
+            "claude",
+            &bonus_reset(12),
+            "--config",
+            config.to_str().unwrap_or("config.local.json"),
+        ],
+        "",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("Claude: bonus reset"), "{out}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn status_and_hook_prompt_surface_an_expiring_complimentary_reset() {
+    let home = scratch("bonus-reset");
+    let config = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../config.json"),
+    )
+    .expect("repo config");
+    let mut config_value: Value = serde_json::from_str(&config).expect("config json");
+    if let Some(object) = config_value.as_object_mut() {
+        object.insert(
+            "codex_resets".to_string(),
+            serde_json::json!([{ "expires": bonus_reset(14) }]),
+        );
+        object.insert(
+            "claude_resets".to_string(),
+            serde_json::json!([{ "expires": bonus_reset(12) }]),
+        );
+    }
+    let status = serde_json::json!({
+        "ts": chrono::Utc::now().timestamp(),
+        "config": config_value,
+        "pools": {
+            "claude": {"state": "ON", "used_pct": 40.0},
+            "codex": {"state": "ON", "used_pct": 56.0}
+        }
+    });
+    write_state(&home, &status.to_string(), "{}", "{}");
+    let (code, out, _) = run(&home, &["status"], "");
+    assert_eq!(code, 0);
+    assert!(out.contains("Codex bonus reset in 14h (burn now)"), "{out}");
+    assert!(out.contains("Claude bonus reset in 12h (burn now)"), "{out}");
+    let (code, out, _) = run(&home, &["hook-prompt"], "{}");
+    assert_eq!(code, 0);
+    assert!(out.contains("Codex 56% wk (Codex bonus reset in 14h (burn now))"), "{out}");
+    assert!(out.contains("Claude 40% wk (Claude bonus reset in 12h (burn now))"), "{out}");
+    std::fs::remove_dir_all(&home).ok();
+}

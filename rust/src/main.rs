@@ -43,6 +43,7 @@ enum Command {
     GrokSet(GrokSetArgs),
     Pools(PoolsArgs),
     Pick(PickArgs),
+    ResetAdd(ResetAddArgs),
     HookBash,
     HookPrompt,
     HookAgent,
@@ -72,6 +73,16 @@ struct GrokSetArgs {
     reset: Option<String>,
     #[arg(long = "resets-at", value_name = "ISO8601")]
     resets_at: Option<String>,
+}
+
+#[derive(Args, Debug)]
+struct ResetAddArgs {
+    #[arg(value_name = "codex|claude")]
+    plan: String,
+    #[arg(value_name = "EXPIRES_ISO8601")]
+    expires: String,
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -342,7 +353,11 @@ fn hook_agent() -> ExitCode {
 
 fn hook_prompt() -> ExitCode {
     let state = State::load(&state_paths());
-    if let Some(line) = hooks::prompt_usage_line(&state.status, &state.credits, now_epoch()) {
+    let mut status = state.status.clone();
+    if status.config.is_none() {
+        status.config = load_config(None).ok();
+    }
+    if let Some(line) = hooks::prompt_usage_line(&status, &state.credits, now_epoch()) {
         println!("{line}");
     }
     ExitCode::from(ALLOWED_EXIT)
@@ -354,6 +369,10 @@ fn status_command() -> ExitCode {
     let now = now_epoch();
     let age = state.status.age_seconds(now);
     let mode = state.status.mode.clone().unwrap_or_else(|| "unknown".to_string());
+    let mut status = state.status.clone();
+    if status.config.is_none() {
+        status.config = load_config(None).ok();
+    }
     let states: Vec<String> = ["claude", "codex", "grok", "google"]
         .iter()
         .map(|name| {
@@ -371,7 +390,54 @@ fn status_command() -> ExitCode {
         "Token ladder: {}. Mode {mode}.{stale}",
         states.join("; ")
     );
+    for plan in token_ladder::config::BONUS_RESET_PLANS {
+        if let Some(note) = hooks::bonus_reset_note(&status, plan, now) {
+            println!("{note}.");
+        }
+    }
     ExitCode::from(ALLOWED_EXIT)
+}
+
+fn reset_add_command(args: &ResetAddArgs) -> ExitCode {
+    let now = now_epoch();
+    if token_ladder::config::bonus_reset_key(&args.plan).is_none() {
+        eprintln!("token-ladder: reset-add plan is codex or claude, got {}", args.plan);
+        return ExitCode::from(USAGE_EXIT);
+    }
+    let Some(epoch) = token_ladder::config::parse_stamp(&args.expires) else {
+        eprintln!(
+            "token-ladder: reset-add needs an ISO-8601 timestamp with a timezone, got {}",
+            args.expires
+        );
+        return ExitCode::from(USAGE_EXIT);
+    };
+    if epoch <= now {
+        eprintln!("token-ladder: reset-add needs a future reset, {} has expired", args.expires);
+        return ExitCode::from(USAGE_EXIT);
+    }
+    let path = match args.config.clone() {
+        Some(path) => path,
+        None => match token_ladder::config::local_config_path() {
+            Some(path) => path,
+            None => {
+                eprintln!("token-ladder: reset-add has no config.local.json to write");
+                return ExitCode::from(FAILED_EXIT);
+            }
+        },
+    };
+    match token_ladder::config::add_bonus_reset(&path, &args.plan, epoch, now) {
+        Ok(lines) => {
+            println!("Registered {} bonus reset at {}.", args.plan, iso_stamp(epoch));
+            for line in lines {
+                println!("{line}");
+            }
+            ExitCode::from(ALLOWED_EXIT)
+        }
+        Err(error) => {
+            eprintln!("token-ladder: {error}");
+            ExitCode::from(FAILED_EXIT)
+        }
+    }
 }
 
 fn capitalise(name: &str) -> String {
@@ -430,6 +496,7 @@ fn lane_context<'a>(
         credits,
         limits,
         now,
+        status: None,
     }
 }
 
@@ -623,6 +690,7 @@ fn run_command(
         cfg: config,
         pools: &pools,
         credits: &credits,
+        status: Some(&state.status),
         paths: &paths,
         brief: PathBuf::from(runner::DEFAULT_BRIEF),
         excluded: picker::vendor_exclusions(&args.not_vendor),
@@ -662,6 +730,10 @@ fn pick_command(args: &PickArgs) -> Result<ExitCode, String> {
     let credits = state.credits.clone();
     let limits = state.limits.clone();
     let lane_ctx = lane_context(&config, &pools, &credits, &limits, now);
+    let lane_ctx = LaneContext {
+        status: Some(&state.status),
+        ..lane_ctx
+    };
     if args.plans {
         return Ok(plans_report(&config, &state, &pools, args.json));
     }
@@ -890,6 +962,7 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
         Command::GrokSet(args) => grok_set_command(args),
         Command::Pools(args) => pools_command(args),
         Command::Pick(args) => pick_command(args),
+        Command::ResetAdd(args) => Ok(reset_add_command(args)),
         Command::HookBash => Ok(hook_bash()),
         Command::HookPrompt => Ok(hook_prompt()),
         Command::HookAgent => Ok(hook_agent()),

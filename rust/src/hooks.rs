@@ -405,13 +405,32 @@ pub fn age_text(seconds: f64) -> String {
     }
 }
 
-fn week_part(label: &str, pool: Option<&Pool>, week_used: Option<f64>) -> Option<String> {
+fn week_part(label: &str, pool: Option<&Pool>, week_used: Option<f64>, bonus: Option<&str>) -> Option<String> {
     let used = pool
         .and_then(|pool| pool.used_pct)
         .or(week_used)?;
     let estimated = pool.is_some_and(|pool| pool.estimated);
     let mark = if estimated { " est" } else { "" };
-    Some(format!("{label} {}% wk{mark}", trim_float(used)))
+    match bonus {
+        Some(bonus) => Some(format!("{label} {}% wk{mark} ({bonus})", trim_float(used))),
+        None => Some(format!("{label} {}% wk{mark}", trim_float(used))),
+    }
+}
+
+pub fn bonus_reset_note(status: &Status, plan: &str, now: i64) -> Option<String> {
+    let config = status.config.as_ref()?;
+    let label = crate::config::plan_label(plan);
+    let entry = status.burn.as_ref().and_then(|burn| burn.entry(plan));
+    let hours = entry
+        .and_then(|entry| entry.reset_hours)
+        .or_else(|| config.bonus_reset_hours(plan, now))?;
+    let burn_now = entry
+        .map(|entry| entry.burn_now)
+        .unwrap_or(hours <= config.reset_burn_hours);
+    if burn_now {
+        return Some(format!("{label} bonus reset in {hours:.0}h (burn now)"));
+    }
+    Some(format!("{label} bonus reset in {hours:.0}h"))
 }
 
 fn google_part(pool: Option<&Pool>) -> Option<String> {
@@ -483,7 +502,8 @@ pub fn prompt_usage_line(status: &Status, credits: &Credits, now: i64) -> Option
                     .account(key)
                     .and_then(|read| read.week.as_ref())
                     .and_then(|week| week.used);
-                week_part(label, status.pool(key), week_used)
+                let bonus = bonus_reset_note(status, key, now);
+                week_part(label, status.pool(key), week_used, bonus.as_deref())
             }
             "google" => google_part(status.pool("google")),
             other => credit_part(other, credits.get(other)),
