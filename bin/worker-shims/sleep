@@ -11,7 +11,10 @@ DURATION = re.compile(r"^\+?(\d+(?:\.\d+)?)([smhd]?)$")
 
 def real(name):
     for folder in os.environ.get("PATH", "").split(os.pathsep):
-        if not folder or os.path.realpath(folder) == SHIM_DIR:
+        if not folder:
+            continue
+        resolved = os.path.realpath(folder)
+        if resolved == SHIM_DIR or os.path.basename(resolved) == "worker-shims":
             continue
         path = os.path.join(folder, name)
         if os.path.isfile(path) and os.access(path, os.X_OK):
