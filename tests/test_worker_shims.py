@@ -10,9 +10,9 @@ from _load import REPO
 SHIMS = str(Path(REPO).resolve() / "bin" / "worker-shims")
 
 
-def fake(folder, name):
+def fake(folder, name, tag="real"):
     path = Path(folder, name)
-    path.write_text(f"#!/bin/sh\nprintf 'real {name}: %s\\n' \"$*\"\n")
+    path.write_text(f"#!/bin/sh\nprintf '{tag} {name}: %s\\n' \"$*\"\n")
     path.chmod(0o755)
 
 
@@ -49,6 +49,16 @@ class WorkerShimTests(unittest.TestCase):
                 self.assertEqual((out.returncode, out.stdout),
                                  (0, f"real sleep: {' '.join(args)}\n"), out.stderr)
 
+    def test_sleep_skips_any_worker_shims_folder_earlier_in_path(self):
+        loop = Path(self.tmp.name, "loop", "worker-shims")
+        loop.mkdir(parents=True)
+        fake(loop, "sleep", tag="loop")
+        self.env["PATH"] = os.pathsep.join([str(loop), SHIMS,
+                                           str(self.real), "/usr/bin:/bin"])
+        out = self.run_shim("sleep", "1")
+        self.assertEqual((out.returncode, out.stdout),
+                         (0, "real sleep: 1\n"), out.stderr)
+
     def test_gh_refuses_the_watching_forms(self):
         for args in (("pr", "checks", "--watch"), ("pr", "checks", "-w"), ("run", "watch")):
             with self.subTest(args=args):
@@ -67,6 +77,18 @@ class WorkerShimTests(unittest.TestCase):
                 out = self.run_shim("gh", *args)
                 self.assertEqual((out.returncode, out.stdout),
                                  (0, f"real gh: {' '.join(args)}\n"), out.stderr)
+
+    def test_gh_skips_any_worker_shims_folder_earlier_in_path(self):
+        loop = Path(self.tmp.name, "loop", "worker-shims")
+        loop.mkdir(parents=True)
+        fake(loop, "gh", tag="loop")
+        shim_link = Path(self.tmp.name, "loop-shims")
+        shim_link.symlink_to(loop)
+        self.env["PATH"] = os.pathsep.join([str(loop), str(shim_link), SHIMS,
+                                           str(self.real), "/usr/bin:/bin"])
+        out = self.run_shim("gh", "pr", "checks")
+        self.assertEqual((out.returncode, out.stdout),
+                         (0, "real gh: pr checks\n"), out.stderr)
 
 
 if __name__ == "__main__":
