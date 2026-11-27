@@ -167,7 +167,8 @@ class DashboardRendererTests(unittest.TestCase):
             "$6.12 prepaid left",
             "Google Antigravity plan",
             "Gemini 4 Neon",
-            "shared with chats",
+            "CHAT ONLY",
+            "chat-only pool, never workers",
             "1 / unknown local history entries today (UTC)",
             "antigravity",
             "CommandCode GOAT",
@@ -180,6 +181,19 @@ class DashboardRendererTests(unittest.TestCase):
         ):
             self.assertIn(text, page)
         self.assertNotIn("public repos only", page)
+
+    def test_antigravity_stays_chat_only_with_missing_pool_metadata(self):
+        s = base_status(pools={"google": {"state": "ON", "pace_ratio": 0.0}})
+        snap = tl.dashboard_data(s)
+        plan = next(p for p in snap["plans"] if p["pool_key"] == "google")
+        lane = next(l for l in snap["lanes"] if l["lane"] == "antigravity")
+        for item in (plan, lane):
+            self.assertEqual(item["status"], "CHAT ONLY")
+            self.assertTrue(item["chat_only"])
+            self.assertFalse(item["shared_with_chats"])
+        self.assertEqual(lane["reason"], "chat-only pool, never workers")
+        self.assertNotEqual(snap["picked"]["plan"], "antigravity")
+        self.assertIn("Google Antigravity plan", tl.render_dashboard(s))
 
     def test_cloud_agents_badges_follow_plan_fixtures(self):
         cfg = json.loads((FIXTURES / "dashboard-cloud-plans.json").read_text())
@@ -275,7 +289,9 @@ class DashboardRendererTests(unittest.TestCase):
         snap = tl.dashboard_data(base_status(limits={}))
         google_plan = next(p for p in snap["plans"] if p["pool_key"] == "google")
         cc_plan = next(p for p in snap["plans"] if p["pool_key"] == "credit:commandcode")
-        self.assertEqual(google_plan["status"], "USED UP")
+        self.assertEqual(google_plan["status"], "USED UP · CHAT ONLY")
+        self.assertTrue(google_plan["chat_only"])
+        self.assertFalse(google_plan["shared_with_chats"])
         self.assertEqual(cc_plan["status"], "USED UP")
         self.assertIn("Used up at 2026-11-23T09:05:00Z", page)
         self.assertIn("70 / 70 plan credits", page)

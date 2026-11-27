@@ -27,7 +27,7 @@ LANES = [{"lane": "opencode", "pool": "opencode", "command": "run opencode"},
          {"lane": "deepseek", "pool": None, "command": "run deepseek"},
          {"lane": "codex", "pool": "codex", "command": "run codex"},
          {"lane": "cursor", "pool": "grok", "command": "run cursor"}]
-AGENT_LANES = [{"lane": "antigravity", "pool": "google", "shared_with_chats": True, "command": "run agy"},
+AGENT_LANES = [{"lane": "cursor", "pool": "grok", "shared_with_chats": True, "command": "run cursor"},
                {"lane": "codex", "pool": "codex", "command": "run codex"}]
 T = 1_800_000_000
 
@@ -81,7 +81,6 @@ class LaneOkTests(unittest.TestCase):
     def test_lane_and_vendor_names_use_their_own_pool_not_the_first_usable_lane(self):
         for name, pool_name in (("cursor", "grok"), ("codex", "codex"), ("openai", "codex"),
                                 ("claude", "claude"), ("anthropic", "claude"),
-                                ("antigravity", "google"), ("google", "google"),
                                 ("opencode", "opencode"), ("vercel", "credit:vercel"),
                                 ("commandcode", "credit:commandcode"), ("openrouter", "credit:openrouter")):
             with self.subTest(name=name):
@@ -134,6 +133,16 @@ class LaneOkTests(unittest.TestCase):
         self.assertEqual(self.check_lane("opencode", {"opencode": state})[0], 0)
         state["credits_usd"] = 2
         self.assertEqual(self.check_lane("opencode", {"opencode": state})[0], 3)
+
+    def test_antigravity_refuses_even_when_pool_metadata_is_missing(self):
+        for name in ("antigravity", "google"):
+            for state in ({}, {"google": pool()}, {"google": dict(pool(), chat_only=False)},
+                          {"google": dict(pool(), chat_only=True, shared_with_chats=True)}):
+                with self.subTest(name=name, state=state):
+                    for cloud in (False, True):
+                        code, reason = self.check_lane(name, state, cloud=cloud)
+                        self.assertEqual(code, 3)
+                        self.assertEqual(reason, "antigravity: chat-only pool, never workers")
 
     def test_chat_only_pool_without_opt_in_refuses(self):
         cfg = {"lanes": [{"lane": "custom", "pool": "custom", "command": "unused"}]}
@@ -480,7 +489,7 @@ class AgentPlanHoldTests(unittest.TestCase):
     def providers(self, updated=T, **counts):
         return {"updated": datetime.fromtimestamp(updated, timezone.utc).isoformat(),
                 "chats": [{"workspace": "HT Product", "chat": "HT Bugs", "tmux": "live-abc",
-                           "provider": "antigravity", "model": "gemini-4-neon", "since": "2026-11-24T09:40:00Z"}],
+                           "provider": "cursor", "model": "composer-2.5", "since": "2026-11-24T09:40:00Z"}],
                 "by_provider": counts}
 
     def pick_with_file(self, payload, lanes=None, pools=None, now=T):
@@ -489,66 +498,66 @@ class AgentPlanHoldTests(unittest.TestCase):
             return pp.pick(AGENT_LANES if lanes is None else lanes, pools or {}, {}, now)
 
     def test_held_plan_moves_behind_a_free_lane_when_its_pool_is_pressed(self):
-        got = self.pick_with_file(self.providers(antigravity=3), pools={"google": {"used_pct": 62}})
+        got = self.pick_with_file(self.providers(cursor=3), pools={"grok": {"used_pct": 62}})
         self.assertEqual((got["plan"], got["command"]), ("codex", "run codex"))
-        self.assertIn("antigravity held by 3 agent chats, 62% used: tried last", got["reason"])
+        self.assertIn("cursor held by 3 agent chats, 62% used: tried last", got["reason"])
 
     def test_a_held_lane_with_plenty_left_keeps_its_rung_order(self):
-        got = self.pick_with_file(self.providers(antigravity=3),
-                                  pools={"google": {"used_pct": 0, "pace_ratio": 0.2}})
-        self.assertEqual((got["plan"], got["command"]), ("antigravity", "run agy"))
-        self.assertIn("antigravity held by 3 agent chats, but 0% used: normal order", got["reason"])
+        got = self.pick_with_file(self.providers(cursor=3),
+                                  pools={"grok": {"used_pct": 0, "pace_ratio": 0.2}})
+        self.assertEqual((got["plan"], got["command"]), ("cursor", "run cursor"))
+        self.assertIn("cursor held by 3 agent chats, but 0% used: normal order", got["reason"])
 
     def test_a_held_lane_without_a_reader_keeps_its_rung_order(self):
-        got = self.pick_with_file(self.providers(antigravity=1))
-        self.assertEqual(got["plan"], "antigravity")
-        self.assertIn("antigravity held by 1 agent chat, but usage unknown: normal order", got["reason"])
+        got = self.pick_with_file(self.providers(cursor=1))
+        self.assertEqual(got["plan"], "cursor")
+        self.assertIn("cursor held by 1 agent chat, but usage unknown: normal order", got["reason"])
 
     def test_half_used_presses_a_held_lane(self):
-        got = self.pick_with_file(self.providers(antigravity=2),
-                                  pools={"google": {"used_pct": 50, "pace_ratio": 0.9}})
+        got = self.pick_with_file(self.providers(cursor=2),
+                                  pools={"grok": {"used_pct": 50, "pace_ratio": 0.9}})
         self.assertEqual(got["plan"], "codex")
         self.assertIn("50% used: tried last", got["reason"])
 
     def test_pace_above_one_presses_a_held_lane(self):
-        got = self.pick_with_file(self.providers(antigravity=2),
-                                  pools={"google": {"used_pct": 10, "pace_ratio": 1.1}})
+        got = self.pick_with_file(self.providers(cursor=2),
+                                  pools={"grok": {"used_pct": 10, "pace_ratio": 1.1}})
         self.assertEqual(got["plan"], "codex")
         self.assertIn("pace 1.10x: tried last", got["reason"])
 
     def test_a_used_up_held_lane_goes_last(self):
-        got = self.pick_with_file(self.providers(antigravity=2),
-                                  pools={"google": {"used_pct": 10, "state": "OFF"}})
+        got = self.pick_with_file(self.providers(cursor=2),
+                                  pools={"grok": {"used_pct": 10, "state": "OFF"}})
         self.assertEqual(got["plan"], "codex")
         self.assertIn("used up: tried last", got["reason"])
 
     def test_a_file_with_no_chats_keeps_the_shipped_order(self):
-        got = self.pick_with_file(self.providers(antigravity=0, codex=0))
-        self.assertEqual(got["plan"], "antigravity")
+        got = self.pick_with_file(self.providers(cursor=0, codex=0))
+        self.assertEqual(got["plan"], "cursor")
         self.assertNotIn("held by agent chats", got["reason"])
 
     def test_only_pressed_plans_left_still_run_the_first_of_them(self):
-        got = self.pick_with_file(self.providers(antigravity=2, codex=1),
-                                  pools={"google": {"used_pct": 70}, "codex": {"used_pct": 80}})
-        self.assertEqual((got["plan"], got["command"]), ("antigravity", "run agy"))
-        self.assertIn("antigravity held by 2 agent chats, 70% used: tried last", got["reason"])
+        got = self.pick_with_file(self.providers(cursor=2, codex=1),
+                                  pools={"grok": {"used_pct": 70}, "codex": {"used_pct": 80}})
+        self.assertEqual((got["plan"], got["command"]), ("cursor", "run cursor"))
+        self.assertIn("cursor held by 2 agent chats, 70% used: tried last", got["reason"])
 
     def test_claude_and_unknown_providers_never_hold_a_lane(self):
         got = self.pick_with_file(self.providers(claude=4, baseten=2))
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "cursor")
         self.assertNotIn("held by agent chats", got["reason"])
 
     def test_counts_that_are_not_numbers_leave_the_order_alone(self):
         got = self.pick_with_file({"updated": datetime.fromtimestamp(T, timezone.utc).isoformat(),
-                                   "by_provider": {"antigravity": "3", "codex": None}})
-        self.assertEqual(got["plan"], "antigravity")
+                                   "by_provider": {"cursor": "3", "codex": None}})
+        self.assertEqual(got["plan"], "cursor")
 
     def test_missing_file_keeps_the_shipped_order_without_a_note(self):
         errors = io.StringIO()
         with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(self.home / "absent.json")}), \
                 redirect_stderr(errors):
             got = pp.pick(AGENT_LANES, {}, {}, T)
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "cursor")
         self.assertEqual(errors.getvalue(), "")
 
     def test_malformed_file_keeps_the_shipped_order_and_notes_it_once(self):
@@ -557,7 +566,7 @@ class AgentPlanHoldTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}), redirect_stderr(errors):
             first = pp.pick(AGENT_LANES, {}, {}, T)
             second = pp.pick(AGENT_LANES, {}, {}, T + 1)
-        self.assertEqual((first["plan"], second["plan"]), ("antigravity", "antigravity"))
+        self.assertEqual((first["plan"], second["plan"]), ("cursor", "cursor"))
         self.assertNotIn("held by agent chats", first["reason"])
         self.assertEqual(errors.getvalue().count("malformed"), 1)
         self.assertIn(str(path), errors.getvalue())
@@ -565,32 +574,32 @@ class AgentPlanHoldTests(unittest.TestCase):
     def test_a_file_without_by_provider_is_malformed(self):
         errors = io.StringIO()
         path = self.plans_file({"version": 1, "updated": datetime.fromtimestamp(T, timezone.utc).isoformat(),
-                                "plans": {"antigravity": {"workspaces": ["mine"], "chats": 12}}})
+                                "plans": {"cursor": {"workspaces": ["mine"], "chats": 12}}})
         with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}), redirect_stderr(errors):
             got = pp.pick(AGENT_LANES, {}, {}, T)
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "cursor")
         self.assertEqual(errors.getvalue().count("malformed"), 1)
 
     def test_a_file_older_than_a_day_is_ignored(self):
-        pressed = {"google": {"used_pct": 62}}
-        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, antigravity=3),
-                                             pools=pressed)["plan"], "antigravity")
-        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, antigravity=3),
+        pressed = {"grok": {"used_pct": 62}}
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 25 * 3600, cursor=3),
+                                             pools=pressed)["plan"], "cursor")
+        self.assertEqual(self.pick_with_file(self.providers(updated=T - 23 * 3600, cursor=3),
                                              pools=pressed)["plan"], "codex")
 
     def test_a_held_lane_keeps_its_rung_eligibility(self):
-        cfg = {"rungs": {rung: [{"lane": "antigravity"}, {"lane": "codex"}] for rung in pp.RUNGS}}
+        cfg = {"rungs": {rung: [{"lane": "cursor"}, {"lane": "codex"}] for rung in pp.RUNGS}}
         ctx = {"rung": "hard", "rung_source": "brief line", "rung_reason": "rung hard", "ticket": None,
                "job": "job", "state_path": str(self.home / "rung-attempts.json"),
                "cache_path": str(self.home / "verifier-cache.json")}
-        path = self.plans_file(self.providers(antigravity=3))
-        pools = {"google": {"used_pct": 62}}
+        path = self.plans_file(self.providers(cursor=3))
+        pools = {"grok": {"used_pct": 62}}
         with mock.patch.dict(os.environ, {"PLAN_PICK_AGENT_PLANS": str(path)}):
             free, _, _ = pp.pick_rung(AGENT_LANES, pools, cfg, ctx, {}, 1.1, T)
             stuck, _, _ = pp.pick_rung(AGENT_LANES, pools, cfg, ctx, {"codex": T + 600}, 1.1, T)
         self.assertEqual(free["plan"], "codex")
-        self.assertIn("antigravity held by 3 agent chats, 62% used: tried last", free["reason"])
-        self.assertEqual(stuck["plan"], "antigravity")
+        self.assertIn("cursor held by 3 agent chats, 62% used: tried last", free["reason"])
+        self.assertEqual(stuck["plan"], "cursor")
 
     def cli(self, pools):
         repo = Path(tempfile.mkdtemp())
@@ -602,19 +611,19 @@ class AgentPlanHoldTests(unittest.TestCase):
         return subprocess.run([sys.executable, str(repo / "bin" / "plan-pick"), "--pools", str(pools_path)],
                               capture_output=True, text=True,
                               env={"HOME": str(repo), "PATH": "/usr/bin:/bin",
-                                   "PLAN_PICK_AGENT_PLANS": str(self.plans_file(self.providers(antigravity=3)))})
+                                   "PLAN_PICK_AGENT_PLANS": str(self.plans_file(self.providers(cursor=3)))})
 
     def test_the_pick_line_says_a_pressed_held_lane_is_tried_last(self):
-        out = self.cli({"google": {"used_pct": 62}})
+        out = self.cli({"grok": {"used_pct": 62}})
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertTrue(out.stdout.startswith("Worker plan: codex."), out.stdout)
-        self.assertIn("antigravity held by 3 agent chats, 62% used: tried last", out.stdout)
+        self.assertIn("cursor held by 3 agent chats, 62% used: tried last", out.stdout)
 
     def test_the_pick_line_says_a_relaxed_held_lane_keeps_its_place(self):
-        out = self.cli({"google": {"used_pct": 0, "pace_ratio": 0.2}})
+        out = self.cli({"grok": {"used_pct": 0, "pace_ratio": 0.2}})
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertTrue(out.stdout.startswith("Worker plan: antigravity."), out.stdout)
-        self.assertIn("antigravity held by 3 agent chats, but 0% used: normal order", out.stdout)
+        self.assertTrue(out.stdout.startswith("Worker plan: cursor."), out.stdout)
+        self.assertIn("cursor held by 3 agent chats, but 0% used: normal order", out.stdout)
 
 
 class RunTests(unittest.TestCase):
@@ -1554,6 +1563,9 @@ class ConfigTests(unittest.TestCase):
     def test_shipped_commands_obey_the_model_rules(self):
         for lane in pp.lanes_from(pp.load_config()):
             with self.subTest(lane=lane["lane"]):
+                if lane.get("chat_only"):
+                    self.assertIn("orchestrator-only", tl.bash_refusal(lane["command"], {}))
+                    continue
                 command = lane["command"].lower()
                 self.assertNotIn("fast", command)
                 self.assertNotIn("baseten", command)
@@ -1610,7 +1622,24 @@ class PlansTests(unittest.TestCase):
 
 
 class ChatOnlyPoolTests(unittest.TestCase):
-    def test_a_chat_only_reading_is_never_picked_without_the_opt_in(self):
+    def test_lane_and_pool_flags_both_prevent_workers_even_with_shared_opt_in(self):
+        for lane_only, pool_only in ((True, False), (False, True), (True, True)):
+            lane = {"lane": "custom", "pool": "custom", "command": "echo forbidden",
+                    "chat_only": lane_only, "shared_with_chats": True}
+            pools = {"custom": dict(pool(), chat_only=pool_only)}
+            with self.subTest(lane_only=lane_only, pool_only=pool_only):
+                self.assertEqual(pp.lane_skip_reason(lane, pools, {}, T, 1.1), "chat-only pool, never workers")
+                self.assertEqual(pp.lane_ok("custom", [lane], pools, {}, now=T),
+                                 {"allowed": False, "reason": "custom: chat-only pool, never workers"})
+                for burn in (None, {"lane": "custom", "until": T + 3600}):
+                    got = pp.pick([lane], pools, now=T, burn=burn, balance=True)
+                    self.assertEqual(got["plan"], "none")
+                    self.assertIn("chat-only pool, never workers", got["reason"])
+                got = pp.pick([lane], pools, {"custom": T + 60}, now=T)
+                self.assertIsNone(got["next_free"])
+                self.assertIn("chat-only pool, never workers", got["reason"])
+
+    def test_a_chat_only_reading_is_never_picked(self):
         lane = {"lane": "renamed", "pool": "google", "command": "echo forbidden"}
         pools = {"google": {"state": "ON", "used_pct": 40.0, "pace_ratio": 0.1, "chat_only": True}}
         got = pp.pick([lane], pools, now=T)
@@ -1618,11 +1647,11 @@ class ChatOnlyPoolTests(unittest.TestCase):
         self.assertIsNone(got["command"])
         self.assertIn("chat-only", got["reason"])
 
-    def test_the_opt_in_lane_shares_the_plan_and_runs(self):
-        lane = {"lane": "antigravity", "pool": "google", "shared_with_chats": True, "command": "echo allowed"}
-        pools = {"google": {"state": "ON", "used_pct": 40.0, "pace_ratio": None,
+    def test_a_non_chat_only_lane_shares_the_plan_and_runs(self):
+        lane = {"lane": "custom", "pool": "custom", "shared_with_chats": True, "command": "echo allowed"}
+        pools = {"custom": {"state": "ON", "used_pct": 40.0, "pace_ratio": None,
                             "chat_only": False, "shared_with_chats": True}}
-        self.assertEqual(pp.pick([lane], pools, now=T)["plan"], "antigravity")
+        self.assertEqual(pp.pick([lane], pools, now=T)["plan"], "custom")
         runner = mock.Mock(return_value=(0, "done", 4.0, True))
         with tempfile.TemporaryDirectory() as home:
             code = pp.run_lanes([lane], pools, {}, 1.1, runner=runner,
@@ -1645,11 +1674,12 @@ class ChatOnlyPoolTests(unittest.TestCase):
         cfg = pp.load_config()
         google = next(plan for plan in pp.plans_from(cfg) if plan["vendor"] == "google")
         self.assertEqual(google["pool"], "google")
-        self.assertTrue(google["shared_with_chats"])
-        self.assertNotIn("chat_only", google)
+        self.assertFalse(google.get("shared_with_chats"))
+        self.assertTrue(google["chat_only"])
         lane = next(lane for lane in pp.lanes_from(cfg) if lane["pool"] == "google")
         self.assertEqual(lane["lane"], "antigravity")
-        self.assertTrue(lane["shared_with_chats"])
+        self.assertFalse(lane.get("shared_with_chats"))
+        self.assertTrue(lane["chat_only"])
 
 
 class WorkerEnvTests(unittest.TestCase):
@@ -1905,7 +1935,7 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(out.stdout.startswith("Lane vercel is skipped until"), out.stdout)
         self.cli("--limited", "opencode")
         got = json.loads(self.run_cli({}, "--json").stdout)
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "codex")
         self.assertIn("opencode (limited until", got["reason"])
         self.cli("--limited", "antigravity")
         self.assertEqual(json.loads(self.run_cli({}, "--json").stdout)["plan"], "codex")
@@ -1975,9 +2005,9 @@ class CommandTests(unittest.TestCase):
     def test_not_vendor_skips_the_authors_vendor(self):
         pools = {"google": pool(), "codex": pool()}
         got = json.loads(self.run_cli(pools, "--json", "--not-vendor", "deepseek").stdout)
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "codex")
         line = self.run_cli(pools, "--not-vendor", "deepseek").stdout
-        self.assertTrue(line.startswith("Worker plan: antigravity. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
+        self.assertTrue(line.startswith("Worker plan: codex. Launch: ~/.local/bin/plan-pick --run --not-vendor deepseek ("), line)
 
     def test_not_vendor_excludes_google_for_a_google_author(self):
         self.cli("--limited", "opencode")
@@ -1985,9 +2015,9 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(got["plan"], "vercel")
 
     def test_not_vendor_excludes_each_lane_by_its_own_vendor(self):
-        cases = (("opencode", (), "antigravity"),
+        cases = (("opencode", (), "vercel"),
                  ("google", (), "opencode"),
-                 ("vercel", ("opencode",), "antigravity"),
+                 ("vercel", ("opencode",), "codex"),
                  ("antigravity", ("opencode",), "vercel"),
                  ("deepseek", ("opencode", "antigravity"), "codex"),
                  ("codex", ("opencode", "antigravity", "vercel", "commandcode", "openrouter"), "cursor"))
@@ -2073,7 +2103,7 @@ class CommandTests(unittest.TestCase):
         self.assertIn('anchored credit $24.64', got['reason'])
         path = Path(self.home, '.pi/agent/sessions/worker/run.jsonl')
         path.parent.mkdir(parents=True)
-        for cost, plan, balance in ((1.5, 'opencode', '23.14'), (22.65, 'antigravity', '1.99')):
+        for cost, plan, balance in ((1.5, 'opencode', '23.14'), (22.65, 'vercel', '1.99')):
             path.write_text(json.dumps(lane_use(now - 60, cost=cost)) + '\n')
             got = json.loads(self.run_cli({}, '--json').stdout)
             self.assertEqual(got['plan'], plan)
@@ -2122,7 +2152,9 @@ class CommandTests(unittest.TestCase):
         plans = json.loads(out.stdout)
         google = next(plan for plan in plans if plan["vendor"] == "google")
         self.assertEqual(google["usage"]["state"], "unknown")
-        self.assertTrue(google["usage"]["shared_with_chats"])
+        self.assertFalse(google["usage"]["shared_with_chats"])
+        self.assertTrue(google["usage"]["chat_only"])
+        self.assertTrue(google["chat_only"])
         self.assertIsNone(google["usage"]["limit"])
         for plan in plans:
             plan.pop("usage", None)
@@ -2133,12 +2165,28 @@ class CommandTests(unittest.TestCase):
             plan.pop("resets_at", None)
         self.assertEqual(plans, pp.plans_from(pp.load_config()))
 
+    def test_plans_honors_the_lane_flag_without_plan_or_pool_metadata(self):
+        cfg = json.loads(Path(self.ordered_config).read_text())
+        cfg["plans"] = [dict(plan) for plan in pp.plans_from(pp.load_config())]
+        google = next(plan for plan in cfg["plans"] if plan["vendor"] == "google")
+        google.pop("chat_only")
+        google["shared_with_chats"] = True
+        Path(self.ordered_config).write_text(json.dumps(cfg))
+        out = self.run_cli({"google": pool()}, "--plans", "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        google = next(plan for plan in json.loads(out.stdout) if plan["vendor"] == "google")
+        self.assertTrue(google["chat_only"])
+        out = self.run_cli({"google": pool()}, "--plans")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("Chat-only / orchestrator-only; chat-only pool, never workers.", out.stdout)
+        self.assertNotIn("burns the full quota", out.stdout)
+
     def test_plans_prints_google_count_without_claiming_a_known_quota(self):
         usage = {"state": "unknown", "used": 3, "limit": None, "pace_ratio": None,
                  "unit": "local history entries today (UTC)", "shared_with_chats": True}
         out = self.run_cli({"google": usage}, "--plans")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("Pool: google. Shared with chats; the antigravity lane burns the full quota.", out.stdout)
+        self.assertIn("Pool: google. Chat-only / orchestrator-only; chat-only pool, never workers.", out.stdout)
         self.assertIn("Used: 3 local history entries today (UTC). Limit: unknown. Pace: unknown.", out.stdout)
         self.assertNotIn("Used up", out.stdout)
         plans = json.loads(self.run_cli({"google": usage}, "--plans", "--json").stdout)
@@ -2158,7 +2206,7 @@ class CommandTests(unittest.TestCase):
     def test_plans_survives_unavailable_google_reading(self):
         out = self.cli("--plans", "--pools", "/nonexistent")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("Pool: google. Shared with chats; the antigravity lane burns the full quota. "
+        self.assertIn("Pool: google. Chat-only / orchestrator-only; chat-only pool, never workers. "
                       "Used: unknown. Limit: unknown. Pace: unknown.", out.stdout)
 
     def test_plans_prints_the_agy_percentage_and_both_groups(self):

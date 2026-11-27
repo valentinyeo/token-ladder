@@ -251,7 +251,7 @@ def limit_note(skip):
 def lane_skip_reason(lane, pools, limits, now, warn, no_pace=False):
     name = lane["lane"]
     pool = lane_pool(lane, pools)
-    if isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"):
+    if lane.get("chat_only") or (isinstance(pool, dict) and pool.get("chat_only")):
         return "chat-only pool, never workers"
     skip = parse_limit(limits, name, now)
     if skip is not None:
@@ -270,13 +270,15 @@ def lane_ok(spec, lanes, pools, limits, now=None, warn=DEFAULT_PACE_WARN, rung=N
         lane = {"lane": "claude", "pool": "claude", "shared_with_chats": True}
     if lane is None:
         return {"allowed": False, "reason": f"unknown lane or vendor {spec}"}
+    pool = lane_pool(lane, pools)
+    why = lane_skip_reason(lane, pools, limits, now, warn)
+    if why == "chat-only pool, never workers":
+        return {"allowed": False, "reason": f"{lane['lane']}: {why}"}
     if rung and cfg and configured:
         allowed = {item["lane"] for item in rung_lanes(lanes, cfg, rung["rung"])}
         if lane["lane"] not in allowed:
             return {"allowed": False,
                     "reason": f"{lane['lane']}: not in rung {rung['rung']} ({rung['rung_reason']})"}
-    pool = lane_pool(lane, pools)
-    why = lane_skip_reason(lane, pools, limits, now, warn)
     if not why and lane.get("credit") and not isinstance(pool, dict):
         why = "credit unknown"
     if not why and isinstance(pool, dict):
@@ -324,10 +326,9 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
         pool = lane_pool(lane, pools)
         no_pace = burn is not None and name == burn["lane"]
         skip = parse_limit(limits, name, now)
-        if skip is not None:
+        why = lane_skip_reason(lane, pools, limits, now, warn, no_pace)
+        if skip is not None and why != "chat-only pool, never workers":
             why = f"limited until {skip['until_text']}" + (f" ({limit_note(skip)})" if skip["explicit_reason"] else "")
-        else:
-            why = lane_skip_reason(lane, pools, limits, now, warn, no_pace)
         if why:
             skipped[name] = why
             if why.startswith("pace"):
@@ -364,8 +365,8 @@ def pick(lanes, pools, limits=None, now=None, warn=DEFAULT_PACE_WARN, burn=None,
         name = lane["lane"]
         skip = parse_limit(limits, name, now)
         pool = lane_pool(lane, pools)
-        if skip and (not codex_ahead or (not skip_reason(pool, warn, no_pace=True) and not (
-                isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats")))):
+        if (skip and not lane.get("chat_only") and not (isinstance(pool, dict) and pool.get("chat_only"))
+                and (not codex_ahead or not skip_reason(pool, warn, no_pace=True))):
             frees[name] = skip["until"]
     if not ahead or strict_pace or (codex_ahead and frees):
         reason = "every lane is ahead of pace, used up or limited: " + ", ".join(f"{p} ({w})" for p, w in skipped.items())
@@ -722,8 +723,10 @@ def plan_line(plan, credit=None):
                                       for key in ("used", "used_pct", "limit", "pace_ratio"))
         estimated = bool(usage.get("estimated"))
         line += f" Pool: {plan['pool']}."
-        if plan.get("shared_with_chats"):
-            line += " Shared with chats; the antigravity lane burns the full quota."
+        if plan.get("chat_only") or usage.get("chat_only"):
+            line += " Chat-only / orchestrator-only; chat-only pool, never workers."
+        elif plan.get("shared_with_chats"):
+            line += " Shared with chats."
         if used_pct is not None:
             line += f" Used: {used_pct:g}%" + (" (estimated)" if estimated else "")
         elif used is not None:
@@ -2798,7 +2801,7 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
         pool = all_pools.get(pkey) if pkey else None
         skip = lane_skip(lane)
         no_pace = burn is not None and name == burn["lane"]
-        chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not lane.get("shared_with_chats"))
+        chat_only = bool(lane.get("chat_only") or (isinstance(pool, dict) and pool.get("chat_only")))
         shared = bool(lane.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats")))
         plan_idx = lane_to_plan.get(name)
         plan = plans[plan_idx] if plan_idx is not None else {}
@@ -2871,7 +2874,8 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
             skip = parse_limit(limits, plan["vendor"], now)
         shared = bool(plan.get("shared_with_chats") or (isinstance(pool, dict) and pool.get("shared_with_chats"))
                       or any(l.get("shared_with_chats") for l in matched))
-        chat_only = bool(isinstance(pool, dict) and pool.get("chat_only") and not shared)
+        chat_only = bool(plan.get("chat_only") or (isinstance(pool, dict) and pool.get("chat_only"))
+                         or any(l.get("chat_only") for l in matched))
         retired = isinstance(plan.get("extra_cost"), str) and plan["extra_cost"].lower().startswith("retired")
         no_pace = bool(burn and any(l["lane"] == burn["lane"] for l in matched))
         st = entry_status(pool, skip, now, warn, chat_only=chat_only, retired=retired, no_pace=no_pace)
@@ -2901,7 +2905,7 @@ def dashboard_snapshot(cfg, pools=None, now=None, limits=None, credits_data=None
         matched = [l for l in lanes if lane_pool_key(l) == pkey]
         skip = next((lane_skip(l) for l in matched if lane_skip(l)), None) or parse_limit(limits, pkey, now)
         shared = bool(pool.get("shared_with_chats") or any(l.get("shared_with_chats") for l in matched))
-        chat_only = bool(pool.get("chat_only") and not shared)
+        chat_only = bool(pool.get("chat_only") or any(l.get("chat_only") for l in matched))
         st = entry_status(pool, skip, now, warn, chat_only=chat_only)
         plan_rows.append({
             "name": pkey,
@@ -3056,6 +3060,11 @@ def main(argv):
         if not args.pools:
             pools = with_credits(pools, [lane for lane in lanes_from(cfg) if lane.get("credit") == "commandcode"], cfg)
         plans = [dict(plan, usage=pools.get(plan["pool"]) or {}) if plan.get("pool") else plan for plan in plans]
+        by_plan, _ = match_lanes_to_plans(plans, lanes_from(cfg))
+        plans = [dict(plan, chat_only=True)
+                 if plan.get("chat_only") or (plan.get("usage") or {}).get("chat_only")
+                 or any(lane.get("chat_only") for lane in by_plan[idx]) else plan
+                 for idx, plan in enumerate(plans)]
         state = opencode_pool(None, cfg)
         plans = [dict(plan, status=("included allowance used up; extra usage " + state["state"])
                       if state.get("included_exhausted") else state["state"], note=state["note"],

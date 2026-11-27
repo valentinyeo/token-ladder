@@ -960,7 +960,7 @@ def agy_pool(groups, now, cfg):
     pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
             "pace_ratio": None, "elapsed_pct": None, "window_minutes": 10080,
             "five_hour_used_pct": None, "five_hour_resets_at": None,
-            "chat_only": False, "shared_with_chats": True, "estimated": False, "source": "agy /usage"}
+            "chat_only": True, "shared_with_chats": False, "estimated": False, "source": "agy /usage"}
     for key in ("gemini", "claude_gpt"):
         if groups.get(key):
             pool[key] = agy_group_readout(groups[key])
@@ -986,7 +986,7 @@ def agy_pool(groups, now, cfg):
 
 def read_google(now):
     pool = {"used_pct": None, "hours_left": None, "resets_at": None, "state": "unknown",
-            "pace_ratio": None, "chat_only": False, "shared_with_chats": True, "used": None, "limit": None,
+            "pace_ratio": None, "chat_only": True, "shared_with_chats": False, "used": None, "limit": None,
             "unit": "local history entries today (UTC)",
             "source": "agy local history timestamps; Antigravity quota unavailable"}
     start = datetime.fromtimestamp(now, timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -1815,7 +1815,7 @@ def plan_google_part(pool):
     part = f"Antigravity Gemini {used:g}% wk"
     if five is not None:
         part += f", 5h {five:g}%"
-    return part + (" est" if pool.get("estimated") else "")
+    return part + (" est" if pool.get("estimated") else "") + (" (chat-only)" if pool.get("chat_only") else "")
 
 
 def plan_credit_part(plan, entry):
@@ -1994,6 +1994,25 @@ def bash_refusal(cmd, environment=None):
     for words, assigned in shell_commands(cmd):
         exe = os.path.basename(words[0])
         env = dict(environment, **assigned)
+        if exe in ("bash", "sh", "zsh"):
+            for i, word in enumerate(words[1:-1], 1):
+                if word.startswith("-") and not word.startswith("--") and "c" in word:
+                    reason = bash_refusal(words[i + 1], env)
+                    if reason:
+                        return reason
+                    break
+        if exe == "agy":
+            prompts = []
+            for i, word in enumerate(words[1:], 1):
+                if word in ("--print", "-p"):
+                    prompts.append(words[i + 1] if i + 1 < len(words) else "")
+                elif word.startswith(("--print=", "-p=")):
+                    prompts.append(word.split("=", 1)[1])
+                elif word.startswith("-p"):
+                    prompts.append(word[2:])
+            if any(prompt != "/usage" for prompt in prompts):
+                return ("Token ladder: Antigravity is orchestrator-only (chat-only); never run agy workers. "
+                        "Delegate via plan-pick --run to pi-deepseek or codex.")
         if exe in ("cc-deepseek-apikey", "ccr") and env.get("TOKEN_LADDER_DEEPSEEK_OK") != "1":
             return "no DeepSeek fallback (Valentin 2026-10-25)"
         if exe not in ("claude", "hax", "codex", "pi", "cursor", "cursor-agent", "agent", "grok"):

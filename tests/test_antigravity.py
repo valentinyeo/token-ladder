@@ -19,7 +19,7 @@ EXHAUSTED = ("E1122 09:05:00.123456      47 quota_manager.go:120] doRefreshQuota
 
 def google(used=None, limit=None, state="unknown"):
     return {"state": state, "used_pct": None, "pace_ratio": None, "used": used, "limit": limit,
-            "unit": "local history entries today (UTC)", "chat_only": False, "shared_with_chats": True}
+            "unit": "local history entries today (UTC)", "chat_only": True, "shared_with_chats": False}
 
 
 def lanes(now=AFTER_CURSOR):
@@ -36,11 +36,11 @@ class LaneOrderTests(unittest.TestCase):
         self.assertEqual(lane_in_order("antigravity"), lane_in_order("opencode") + 1)
         self.assertEqual(lane_in_order("antigravity"), lane_in_order("vercel") - 1)
 
-    def test_the_lane_is_picked_once_opencode_is_out(self):
+    def test_the_chat_only_lane_is_skipped_once_opencode_is_out(self):
         names = [lane["lane"] for lane in lanes()]
         got = pp.pick(lanes(), {lane["lane"]: {"state": "ON", "pace_ratio": 0.2} for lane in lanes()},
                       {"opencode": NOW + 600}, NOW)
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "vercel")
         self.assertTrue(got["command"].endswith("</dev/null"))
         self.assertEqual(names[:2], ["opencode", "antigravity"])
 
@@ -99,7 +99,9 @@ class CommandShapeTests(unittest.TestCase):
     def test_the_google_plan_points_at_this_lane(self):
         plan = next(plan for plan in pp.plans_from(pp.load_config()) if plan["vendor"] == "google")
         self.assertEqual(plan["pool"], self.lane["pool"])
-        self.assertTrue(plan["shared_with_chats"])
+        self.assertTrue(plan["chat_only"])
+        self.assertFalse(plan.get("shared_with_chats"))
+        self.assertTrue(self.lane["chat_only"])
 
 
 class ReserveTests(unittest.TestCase):
@@ -116,47 +118,15 @@ class ReserveTests(unittest.TestCase):
         pools = pp.with_antigravity_reserve({"google": pool}, cfg or {}, NOW, self.launches)
         return pp.pick(lanes(), pools, {"opencode": NOW + 600}, NOW)
 
-    def test_the_default_burns_todays_whole_known_limit(self):
-        self.assertEqual(self.pick(google(used=7, limit=10))["plan"], "antigravity")
-        self.assertEqual(self.pick(google(used=10, limit=10))["plan"], "antigravity")
-
-    def test_a_lowered_share_still_keeps_room_for_chats(self):
-        got = self.pick(google(used=7, limit=10), {"antigravity_reserve_share_pct": 60})
-        self.assertEqual(got["plan"], "vercel")
-        self.assertIn("daily limit", got["reason"])
-
-    def test_a_share_under_the_used_count_keeps_the_lane(self):
-        self.assertEqual(self.pick(google(used=7, limit=10), {"antigravity_reserve_share_pct": 80})["plan"],
-                         "antigravity")
-
-    def test_there_is_no_default_daily_run_cap(self):
-        self.write_launches(50)
-        self.assertEqual(self.pick(google(used=50))["plan"], "antigravity")
-
-    def test_a_configured_daily_run_cap_still_applies(self):
-        self.write_launches(2)
-        self.assertEqual(self.pick(google(used=2), {"antigravity_max_daily_runs": 3})["plan"], "antigravity")
-        got = self.pick(google(used=2), {"antigravity_max_daily_runs": 2})
-        self.assertEqual(got["plan"], "vercel")
-        self.assertIn("2 worker runs today, cap 2", got["reason"])
-
-    def test_other_lanes_and_older_days_do_not_count(self):
-        self.write_launches(20, lane="vercel")
-        self.write_launches(20, at=NOW - 36 * 3600)
-        self.assertEqual(self.pick(google(used=20), {"antigravity_max_daily_runs": 5})["plan"], "antigravity")
-
-    def test_absent_or_null_config_values_keep_burning(self):
-        self.write_launches(50)
-        self.assertEqual(self.pick(google(used=50), {})["plan"], "antigravity")
-        self.assertEqual(self.pick(google(used=50), {"antigravity_max_daily_runs": None})["plan"], "antigravity")
-        self.assertEqual(self.pick(google(used=50), {"antigravity_reserve_share_pct": None})["plan"],
-                         "antigravity")
-
-    def test_the_shipped_defaults_burn_the_quota(self):
-        cfg = pp.load_config()
-        self.assertEqual(cfg["antigravity_reserve_share_pct"], 100)
-        self.assertNotIn("antigravity_max_daily_runs", cfg)
-        self.assertIsNone(pp.DEFAULT_ANTIGRAVITY_MAX_DAILY_RUNS)
+    def test_reserve_and_cap_settings_never_enable_chat_only_workers(self):
+        for cfg in ({}, {"antigravity_reserve_share_pct": 60}, {"antigravity_reserve_share_pct": 100},
+                    {"antigravity_max_daily_runs": 2}, {"antigravity_max_daily_runs": None}):
+            for used, limit in ((None, None), (2, None), (7, 10), (10, 10)):
+                with self.subTest(cfg=cfg, used=used, limit=limit):
+                    self.write_launches(2)
+                    got = self.pick(google(used=used, limit=limit), cfg)
+                    self.assertEqual(got["plan"], "vercel")
+                    self.assertIn("antigravity (chat-only pool, never workers)", got["reason"])
 
     def test_a_used_up_reading_is_left_alone(self):
         pools = {"google": {"state": "OFF", "used": 3, "limit": 10, "used_up": True}}
@@ -188,28 +158,24 @@ class QuotaFallthroughTests(unittest.TestCase):
         self.log.write_text(EXHAUSTED + "\n")
         got = pp.pick(lanes(), {"google": self.google_reading()}, {"opencode": NOW + 600}, NOW)
         self.assertEqual(got["plan"], "vercel")
-        self.assertIn("antigravity (used up", got["reason"])
+        self.assertIn("antigravity (chat-only pool, never workers)", got["reason"])
 
-    def test_a_recovered_log_line_keeps_the_lane(self):
+    def test_a_recovered_log_line_does_not_enable_workers(self):
         self.log.write_text(EXHAUSTED + "\n"
                             "I1122 09:20:00.000000      47 quota_manager.go:61] doRefreshQuota: refresh complete\n")
         got = pp.pick(lanes(), {"google": self.google_reading()}, {"opencode": NOW + 600}, NOW)
-        self.assertEqual(got["plan"], "antigravity")
+        self.assertEqual(got["plan"], "vercel")
 
-    def test_an_early_quota_error_runs_the_next_lane_and_marks_this_one_limited(self):
-        tail = '{"status":"ERROR","error":"rpc error: code = ResourceExhausted desc = quota exceeded"}'
-        runner = mock.Mock(side_effect=[(1, tail, 4.0, False), (0, "worker-done", 9.0, True)])
+    def test_run_skips_antigravity_even_without_a_google_reading(self):
+        runner = mock.Mock(return_value=(0, "worker-done", 9.0, True))
         code = pp.run_lanes(lanes(), {"opencode": {"state": "OFF"}}, {}, 1.1, runner=runner,
                             limits_path=self.limits, now=NOW, say=self.said.append, launches_path=self.launches)
         self.assertEqual(code, 0)
-        self.assertEqual(runner.call_count, 2)
-        self.assertTrue(self.said[0].startswith("lane antigravity:"), self.said[0])
-        self.assertIn("lane antigravity hit a rate or usage limit", self.said[1])
-        entry = json.loads(Path(self.limits).read_text())["antigravity"]
-        self.assertEqual(entry["until"], NOW + 300)
-        self.assertEqual(entry["source"], "quota error")
-        self.assertIn("ResourceExhausted", entry["error_line"])
-        self.assertEqual(json.loads(Path(self.launches).read_text().splitlines()[1])["lane"], "vercel")
+        runner.assert_called_once()
+        self.assertNotIn("agy", runner.call_args.args[0])
+        rows = [json.loads(line) for line in Path(self.launches).read_text().splitlines()]
+        self.assertEqual(rows[0]["lane"], "vercel")
+        self.assertFalse(Path(self.limits).exists())
 
     def test_a_used_up_reading_leaves_nothing_to_run(self):
         self.log.write_text(EXHAUSTED + "\n")
@@ -219,7 +185,7 @@ class QuotaFallthroughTests(unittest.TestCase):
                             limits_path=self.limits, now=NOW, say=self.said.append, launches_path=self.launches)
         self.assertEqual(code, 75)
         self.assertIn("no lane left", self.said[-1])
-        self.assertIn("antigravity (used up", self.said[-1])
+        self.assertIn("antigravity (chat-only pool, never workers)", self.said[-1])
         runner.assert_not_called()
 
 

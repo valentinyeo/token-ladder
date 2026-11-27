@@ -43,13 +43,26 @@ class RungTests(unittest.TestCase):
         medium = pp.rung_lanes(self.lanes, self.cfg, "medium")
         self.assertEqual(light[0]["lane"], "opencode")
         self.assertTrue(all(l["vendor"] in ("deepseek", "zai") and l["effort"] == "low" for l in light))
-        self.assertEqual([l["lane"] for l in hard], ["codex", "antigravity"])
+        self.assertEqual([l["lane"] for l in hard], ["codex"])
         self.assertEqual(hard[0]["model"], "gpt-6.1-sol")
         self.assertIn("--effort high", hard[0]["command"])
-        self.assertEqual(hard[1]["model"], "gemini-4-neon-high")
-        self.assertEqual([l["lane"] for l in medium], [l["lane"] for l in self.lanes if l["lane"] != "vercel-zai"])
+        self.assertEqual([l["lane"] for l in medium],
+                         [l["lane"] for l in self.lanes if l["lane"] not in ("vercel-zai", "antigravity")])
         for lane in light + medium + hard:
             self.assertIn(lane["model"], self.cfg["list_prices"])
+
+    def test_no_rung_or_default_pick_can_launch_antigravity(self):
+        pools = {"google": {"state": "ON", "pace_ratio": 0.0}}
+        limits = {lane["lane"]: 200 for lane in self.lanes if lane["lane"] != "antigravity"}
+        for rung in pp.RUNGS:
+            with self.subTest(rung=rung):
+                self.assertNotIn("antigravity", [lane["lane"] for lane in pp.rung_lanes(self.lanes, self.cfg, rung)])
+                result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.context(f"Rung: {rung}\n"),
+                                            limits, 1.1, now=100)
+                self.assertEqual(result["plan"], "none")
+        result = pp.pick(self.lanes, pools, limits, now=100)
+        self.assertEqual(result["plan"], "none")
+        self.assertIn("antigravity (chat-only pool, never workers)", result["reason"])
 
     def test_guard_allows_only_the_pinned_glm_flash_lane(self):
         lane = next(l for l in self.lanes if l["lane"] == "vercel-zai")
@@ -592,7 +605,7 @@ class BalanceLanesTests(unittest.TestCase):
         self.assertEqual(result["plan"], "codex")
         pools["codex"] = {"state": "ON", "pace_ratio": 0.95}
         result, _, _ = pp.pick_rung(self.lanes, pools, self.cfg, self.ctx, {}, 1.1, now=100)
-        self.assertEqual(result["plan"], "antigravity")
+        self.assertEqual(result["plan"], "vercel")
 
     def test_burn_override_still_wins_over_balance_lanes(self):
         pools = {

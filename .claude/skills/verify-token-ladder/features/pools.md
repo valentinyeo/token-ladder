@@ -4,7 +4,7 @@ token-ladder reports subscription pool states read-only via `pools --json` and t
 
 ## Sub-features
 
-- `pools-json` prints claude, codex, grok and the shared-with-chats google pool objects without network or subprocess side effects.
+- `pools-json` prints claude, codex, grok and the chat-only google pool objects without network or subprocess side effects.
 - `status-lines` prints TOKEN MAX, FLOOR, FEED, and per-provider lines on an empty home.
 
 ## How to get to it (user POV)

@@ -32,7 +32,7 @@
       "vendor": "google",
       "effort": "high",
       "pool": "google",
-      "shared_with_chats": true,
+      "chat_only": true,
       "print_timeout": "45m",
       "command": "~/.local/bin/agy --print \"$(cat brief.txt)\" --model gemini-4-neon-high --dangerously-skip-permissions --print-timeout 45m --output-format json </dev/null"
     },
@@ -136,7 +136,7 @@
       "name": "Google Antigravity plan",
       "vendor": "google",
       "pool": "google",
-      "shared_with_chats": true,
+      "chat_only": true,
       "included_models": ["Gemini 4 Neon"],
       "runs_on": ["local"],
       "extra_cost": "none within the plan quota; never buys overages",
@@ -238,9 +238,6 @@
         "lane": "opencode"
       },
       {
-        "lane": "antigravity"
-      },
-      {
         "lane": "vercel"
       },
       {
@@ -261,10 +258,6 @@
         "lane": "codex",
         "model": "gpt-6.1-sol",
         "effort": "high"
-      },
-      {
-        "lane": "antigravity",
-        "model": "gemini-4-neon-high"
       }
     ]
   },
