@@ -1995,12 +1995,21 @@ def bash_refusal(cmd, environment=None):
         exe = os.path.basename(words[0])
         env = dict(environment, **assigned)
         if exe in ("bash", "sh", "zsh"):
-            for i, word in enumerate(words[1:-1], 1):
-                if word.startswith("-") and not word.startswith("--") and "c" in word:
-                    reason = bash_refusal(words[i + 1], env)
-                    if reason:
-                        return reason
+            i, has_command = 1, False
+            while i < len(words):
+                word = words[i]
+                if word == "--":
+                    i += 1
                     break
+                if not word.startswith("-") or word == "-":
+                    break
+                if not word.startswith("--") and "c" in word:
+                    has_command = True
+                i += 1
+            if has_command and i < len(words):
+                reason = bash_refusal(words[i], env)
+                if reason:
+                    return reason
         if exe == "agy":
             prompts = []
             for i, word in enumerate(words[1:], 1):

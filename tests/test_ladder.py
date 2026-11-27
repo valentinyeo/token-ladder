@@ -244,14 +244,18 @@ class AntigravityHookTests(unittest.TestCase):
                         'timeout 60 agy --print "implement this"',
                         'env FOO=1 nohup ~/.local/bin/agy -p "implement this"',
                         'cd repo && agy --print "implement this"',
-                        'bash -lc \'agy -p "implement this"\''):
+                        'bash -lc \'agy -p "implement this"\'',
+                        "bash -c -- 'agy --print code'",
+                        "bash -lc -- 'agy --print code'",
+                        "sh -c -e -- 'agy -p code'"):
             with self.subTest(command=command):
                 self.assertEqual(tl.bash_refusal(command, {}), reason)
 
     def test_read_only_diagnostics_and_quota_collector_are_allowed(self):
         for command in ('agy /usage', 'agy --version', 'agy --status', 'agy /status',
                         'agy -p /usage --print-timeout 45s', 'agy --print=/usage',
-                        'echo "agy --print implement"'):
+                        'echo "agy --print implement"',
+                        "bash -c -- 'agy --print /usage'"):
             with self.subTest(command=command):
                 self.assertIsNone(tl.bash_refusal(command, {}))
 
