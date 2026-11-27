@@ -14,7 +14,8 @@ pub use config::{
     StatePaths, Status,
 };
 pub use domain::{
-    LaneEligibility, PickResult, Role, Rung, RungContext, RungError, SkipReason, NO_LANE, RUNGS,
+    LaneEligibility, LaneError, LanePin, PickResult, Role, Rung, RungContext, RungError,
+    SkipReason, NO_LANE, RUNGS,
 };
 pub use picker::{
     claude_helper_allowed, lane_ok, loop_interval_answer, loop_interval_seconds, pick,

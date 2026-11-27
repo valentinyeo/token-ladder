@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use token_ladder::collect;
 use token_ladder::config::{
-    iso_stamp, trim_float, Config, Credits, Limits, Pool, Pools, State, StatePaths,
+    iso_stamp, trim_float, Config, Credits, LaneSpec, Limits, Pool, Pools, State, StatePaths,
 };
 use token_ladder::ledger;
 use token_ladder::usage;
-use token_ladder::domain::{PickResult, Rung, RungContext};
+use token_ladder::domain::{LanePin, PickResult, Rung, RungContext};
 use token_ladder::hooks;
 use token_ladder::picker::{self, LaneContext, PickContext};
 use token_ladder::runner::{self, RunRequest};
@@ -103,6 +103,8 @@ struct PickArgs {
     brief: PathBuf,
     #[arg(long, value_name = "light|medium|hard")]
     rung: Option<String>,
+    #[arg(long, value_name = "LANE")]
+    lane: Option<String>,
     #[arg(long = "plans")]
     plans: bool,
     #[arg(long = "lane-ok", value_name = "LANE_OR_VENDOR")]
@@ -483,6 +485,43 @@ fn rung_for(args: &PickArgs) -> Result<RungContext, String> {
     }
 }
 
+fn brief_text(args: &PickArgs) -> String {
+    std::fs::read_to_string(&args.brief).unwrap_or_default()
+}
+
+fn lane_pin_for(args: &PickArgs, brief: &str) -> Result<Option<LanePin>, String> {
+    match args.lane.as_deref() {
+        Some(value) => LanePin::fixed(value)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        None => LanePin::from_brief(brief).map_err(|error| error.to_string()),
+    }
+}
+
+fn pinned_spec(config: &Config, pin: Option<&LanePin>) -> Result<Option<LaneSpec>, String> {
+    let Some(pin) = pin else {
+        return Ok(None);
+    };
+    match picker::resolve_spec(config, &pin.spec) {
+        Some(spec) if spec.usable() || spec.role() == token_ladder::Role::Orchestrator => {
+            Ok(Some(spec))
+        }
+        Some(_) => Err(format!(
+            "lane {} for {} has no command to run",
+            pin.spec, pin.reason
+        )),
+        None => {
+            let names: Vec<String> = config.lanes.iter().map(|lane| lane.lane.clone()).collect();
+            Err(format!(
+                "unknown lane {} for {}; lanes: {}",
+                pin.spec,
+                pin.reason,
+                names.join(", ")
+            ))
+        }
+    }
+}
+
 fn lane_context<'a>(
     config: &'a Config,
     pools: &'a Pools,
@@ -686,6 +725,17 @@ fn run_command(
     let paths = state_paths();
     let credits = state.credits.clone();
     let pools = load_pools(args.pools.as_deref(), state, config)?;
+    let rung = match args.rung.as_deref() {
+        Some(value) => Some(
+            value
+                .parse::<Rung>()
+                .map(RungContext::fixed)
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let pin = lane_pin_for(args, &brief_text(args))?;
+    let pinned = pinned_spec(config, pin.as_ref())?;
     let request = RunRequest {
         cfg: config,
         pools: &pools,
@@ -694,6 +744,8 @@ fn run_command(
         paths: &paths,
         brief: PathBuf::from(runner::DEFAULT_BRIEF),
         excluded: picker::vendor_exclusions(&args.not_vendor),
+        rung,
+        pinned,
         now: now as f64,
     };
     runner::run(&request)
@@ -774,10 +826,13 @@ fn pick_command(args: &PickArgs) -> Result<ExitCode, String> {
             REFUSED_EXIT
         }));
     }
+    let pin = lane_pin_for(args, &brief_text(args))?;
+    let pinned = pinned_spec(&config, pin.as_ref())?;
     let excluded = picker::vendor_exclusions(&args.not_vendor);
     let ctx = PickContext {
         lane: lane_ctx,
         excluded,
+        pinned: pinned.as_ref(),
     };
     let result = picker::pick(&ctx, &rung_ctx);
     print_pick(&result, args.json);
@@ -1174,6 +1229,7 @@ mod tests {
             json: false,
             brief: brief.clone(),
             rung: None,
+            lane: None,
             plans: false,
             lane_ok: None,
             cloud: false,
@@ -1215,6 +1271,7 @@ mod tests {
             json: false,
             brief: PathBuf::from("/nonexistent/brief.txt"),
             rung: None,
+            lane: None,
             plans: false,
             lane_ok: None,
             cloud: false,
@@ -1273,7 +1330,14 @@ mod tests {
         let limits = Limits::new();
         let ctx = lane_context(&config, &pools, &credits, &limits, 1_795_783_606);
         let rung = RungContext::fixed(Rung::Medium);
-        let result = picker::pick(&PickContext { lane: ctx, excluded: vec![] }, &rung);
+        let result = picker::pick(
+            &PickContext {
+                lane: ctx,
+                excluded: vec![],
+                pinned: None,
+            },
+            &rung,
+        );
         assert_eq!(result.plan, "commandcode");
         let role = config.lane("antigravity").unwrap().role();
         assert_eq!(role, Role::Orchestrator);

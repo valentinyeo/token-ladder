@@ -314,6 +314,143 @@ fn run_appends_the_author_model_line_to_the_worker_brief() {
     assert!(!out.contains("gets no Author model line"), "{err}");
 }
 
+fn pinned_config(codex_command: &str) -> Value {
+    config(vec![
+        lane("commandcode", "echo commandcode >> ran.txt; echo launched"),
+        lane("vercel", "echo vercel >> ran.txt; echo launched"),
+        json!({"lane": "codex", "pool": "codex", "command": codex_command}),
+    ])
+}
+
+#[test]
+fn plan_pick_run_hard_flag_launches_only_heavy_without_a_brief_rung() {
+    let sandbox = Sandbox::new("hard-flag")
+        .with_config(pinned_config("echo codex >> ran.txt; echo launched"));
+    std::fs::write(sandbox.worktree.join("brief.txt"), "Ticket: VSTA-351\n").unwrap();
+    sandbox.write_state(
+        "status.json",
+        r#"{"pools":{"codex":{"state":"ON","pace_ratio":0.5}}}"#,
+    );
+    let (code, _out, err) = sandbox.run_as_plan_pick(&["--run", "--rung", "hard"]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(sandbox.worktree_text("ran.txt"), "codex\n");
+    let launches = sandbox.launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(launches[0]["lane"], "codex");
+    assert_eq!(launches[0]["rung"], "hard");
+    assert_eq!(launches[0]["rung_source"], "flag");
+}
+
+#[test]
+fn plan_pick_run_hard_refuses_instead_of_running_a_workhorse() {
+    let sandbox = Sandbox::new("hard-unavailable")
+        .with_config(pinned_config("echo codex >> ran.txt; echo launched"));
+    sandbox.write_state("status.json", r#"{"pools":{"codex":{"state":"OFF"}}}"#);
+    let (code, _out, err) = sandbox.run_as_plan_pick(&["--run", "--rung", "hard"]);
+    assert_eq!(code, 75, "{err}");
+    assert!(sandbox.worktree_text("ran.txt").is_empty());
+    let launches = sandbox.launches();
+    assert_eq!(launches.len(), 1);
+    assert!(launches[0]["lane"].is_null());
+    assert_eq!(launches[0]["rung"], "hard");
+}
+
+#[test]
+fn plan_pick_run_lane_flag_and_brief_pin_launch_only_codex_despite_pace() {
+    for source in ["flag", "brief"] {
+        let sandbox = Sandbox::new(&format!("pin-{source}"))
+            .with_config(pinned_config("echo codex >> ran.txt; echo launched"));
+        sandbox.write_state(
+            "status.json",
+            r#"{"pools":{"codex":{"state":"ON","pace_ratio":1.5}}}"#,
+        );
+        let args = if source == "flag" {
+            vec!["--run", "--lane", "codex"]
+        } else {
+            std::fs::write(
+                sandbox.worktree.join("brief.txt"),
+                "Ticket: VSTA-351\nLane: codex\n",
+            )
+            .unwrap();
+            vec!["--run"]
+        };
+        let (code, _out, err) = sandbox.run_as_plan_pick(&args);
+        assert_eq!(code, 0, "{source}: {err}");
+        assert_eq!(sandbox.worktree_text("ran.txt"), "codex\n");
+        assert_eq!(sandbox.launches()[0]["lane"], "codex");
+    }
+}
+
+#[test]
+fn plan_pick_run_pinned_codex_refuses_off_limited_and_quota_without_fallback() {
+    for source in ["flag", "brief"] {
+        for unavailable in ["off", "limited", "429", "quota", "silent"] {
+            let command = match unavailable {
+                "429" => "echo codex >> ran.txt; echo '429 rate limit exceeded'; exit 1",
+                "quota" => "echo codex >> ran.txt; echo '402 payment required'; exit 1",
+                "silent" => "echo codex >> ran.txt",
+                _ => "echo codex >> ran.txt; echo launched",
+            };
+            let sandbox = Sandbox::new(&format!("pin-{source}-{unavailable}"))
+                .with_config(pinned_config(command));
+            let state = if unavailable == "off" { "OFF" } else { "ON" };
+            sandbox.write_state(
+                "status.json",
+                &json!({"pools":{"codex":{"state":state}}}).to_string(),
+            );
+            if unavailable == "limited" {
+                sandbox.write_state(
+                    "limits.json",
+                    &json!({"codex":now_epoch() + 3600.0}).to_string(),
+                );
+            }
+            let args = if source == "flag" {
+                vec!["--run", "--lane", "codex"]
+            } else {
+                std::fs::write(
+                    sandbox.worktree.join("brief.txt"),
+                    "Ticket: VSTA-351\nLane: codex\n",
+                )
+                .unwrap();
+                vec!["--run"]
+            };
+            let (code, _out, err) = sandbox.run_as_plan_pick(&args);
+            assert_eq!(code, 75, "{source} {unavailable}: {err}");
+            let attempted = matches!(unavailable, "429" | "quota" | "silent");
+            assert_eq!(
+                sandbox.worktree_text("ran.txt"),
+                if attempted { "codex\n" } else { "" }
+            );
+            let launches = sandbox.launches();
+            assert_eq!(launches.len(), if attempted { 2 } else { 1 });
+            let last = launches.last().expect("null launch");
+            assert!(last["lane"].is_null());
+            assert_eq!(last["outcome"], "none");
+            if attempted {
+                assert_eq!(launches[0]["lane"], "codex");
+                assert_eq!(launches[0]["outcome"], "limited");
+                assert!(sandbox.limits()["codex"]["until"].as_f64().unwrap() > now_epoch());
+                assert!(!err.contains("trying the next lane"), "{err}");
+            }
+        }
+    }
+}
+
+#[test]
+fn plan_pick_run_pinned_orchestrators_are_refused_as_chat_only() {
+    let sandbox = Sandbox::new("pin-chat-only").with_config(config(vec![
+        lane("commandcode", "echo commandcode >> ran.txt"),
+        lane("antigravity", "echo antigravity >> ran.txt"),
+    ]));
+    for name in ["antigravity", "claude"] {
+        let (code, _out, err) = sandbox.run_as_plan_pick(&["--run", "--lane", name]);
+        assert_eq!(code, 75, "{err}");
+        assert!(err.contains("chat-only pool, never workers"), "{err}");
+        assert!(sandbox.worktree_text("ran.txt").is_empty());
+        assert!(sandbox.launches().last().expect("null launch")["lane"].is_null());
+    }
+}
+
 #[test]
 fn plan_pick_limited_writes_limits_json_atomically() {
     let sandbox = Sandbox::new("limited").with_config(config(vec![lane("stub-a", "true")]));

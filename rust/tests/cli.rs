@@ -193,6 +193,81 @@ fn plan_pick_name_dispatches_the_pick_surface() {
 }
 
 #[test]
+fn plan_pick_lane_flag_and_brief_header_pin_codex_even_ahead_of_pace() {
+    let home = scratch("lane-pin");
+    let brief = home.join("brief.txt");
+    let pools = home.join("pools.json");
+    std::fs::write(&pools, r#"{"codex":{"state":"ON","pace_ratio":1.5},"credit:commandcode":{"state":"ON","credits_usd":50},"credit:vercel":{"state":"ON","credits_usd":50}}"#).unwrap();
+    for source in ["flag", "brief", "override"] {
+        let text = match source {
+            "brief" => "Ticket: VSTA-351\nLane: codex\n",
+            "override" => "Lane: vercel\n",
+            _ => "Ticket: VSTA-351\n",
+        };
+        std::fs::write(&brief, text).unwrap();
+        let mut args = vec![
+            "--json",
+            "--brief",
+            brief.to_str().unwrap(),
+            "--pools",
+            pools.to_str().unwrap(),
+        ];
+        if source != "brief" {
+            args.extend(["--lane", "codex"]);
+        }
+        let (code, out, err) = run_as(&home, "plan-pick", &args);
+        assert_eq!(code, 0, "{source}: {err}");
+        let value: Value = serde_json::from_str(&out).expect("json pick");
+        assert_eq!(value["plan"], "codex", "{out}");
+        assert!(value["command"]
+            .as_str()
+            .unwrap()
+            .contains("--provider=codex"));
+        assert!(value["reason"]
+            .as_str()
+            .unwrap()
+            .contains("pinned lane codex"));
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn plan_pick_lane_pins_refuse_chat_only_pools_and_unknown_lanes() {
+    let home = scratch("lane-pin-refused");
+    let brief = home.join("brief.txt");
+    std::fs::write(&brief, "Ticket: VSTA-351\n").unwrap();
+    for name in ["antigravity", "claude"] {
+        let (code, out, err) = run_as(
+            &home,
+            "plan-pick",
+            &["--json", "--lane", name, "--brief", brief.to_str().unwrap()],
+        );
+        assert_eq!(code, 0, "{err}");
+        let value: Value = serde_json::from_str(&out).expect("json refusal");
+        assert_eq!(value["plan"], "none");
+        assert!(value["command"].is_null());
+        assert!(value["reason"]
+            .as_str()
+            .unwrap()
+            .contains("chat-only pool, never workers"));
+    }
+    let (code, _out, err) = run_as(&home, "plan-pick", &["--json", "--lane", "no-such-lane"]);
+    assert_eq!(code, 1);
+    assert!(err.contains("unknown lane no-such-lane"), "{err}");
+    for text in ["Lane: \n", "Lane: codex\nLane: vercel\n"] {
+        std::fs::write(&brief, text).unwrap();
+        let (code, _out, err) = run_as(
+            &home,
+            "plan-pick",
+            &["--json", "--brief", brief.to_str().unwrap()],
+        );
+        assert_eq!(code, 1, "{text}: {err}");
+        assert!(err.contains("lane needs one lane name"), "{err}");
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn plan_pick_lane_ok_refuses_orchestrator_lanes_with_exit_three() {
     let home = scratch("lane-ok");
     let brief = home.join("brief.txt");

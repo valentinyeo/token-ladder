@@ -145,6 +145,8 @@ pub struct RunRequest<'a> {
     pub paths: &'a StatePaths,
     pub brief: PathBuf,
     pub excluded: Vec<String>,
+    pub rung: Option<RungContext>,
+    pub pinned: Option<LaneSpec>,
     pub now: f64,
 }
 
@@ -159,7 +161,10 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
     let brief_text = std::fs::read_to_string(&request.brief).unwrap_or_default();
     let job = job_key(&brief_text);
     let attempts = read_attempts(&request.paths.rung_attempts())?;
-    let rung_ctx = resolve_rung(&brief_text, &attempts, &job)?;
+    let rung_ctx = match &request.rung {
+        Some(explicit) => explicit.clone(),
+        None => resolve_rung(&brief_text, &attempts, &job)?,
+    };
     let limits_path = request.paths.limits();
     let launches_path = request.paths.launches();
     let attempts_path = request.paths.rung_attempts();
@@ -185,7 +190,8 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
         let limits: Limits = read_limits(&limits_path)?;
         let stamp = now.max(0.0) as i64;
         let ctx = PickContext::new(&cfg, request.pools, request.credits, &limits, stamp)
-            .excluding(request.excluded.clone());
+            .excluding(request.excluded.iter().chain(&tried).cloned().collect())
+            .pinning(request.pinned.as_ref());
         let ctx = match request.status {
             Some(status) => ctx.with_status(status),
             None => ctx,
@@ -291,8 +297,13 @@ pub fn run(request: &RunRequest<'_>) -> Result<u8, RunnerError> {
                     finished_at: Some(finished_at(started_at, attempt.seconds)),
                 },
             )?;
+            let next = if request.pinned.is_some() {
+                "pinned lane, no fallback"
+            } else {
+                "trying the next lane"
+            };
             eprintln!(
-                "plan-pick: {reason} (exit {}); skipped until {}, trying the next lane",
+                "plan-pick: {reason} (exit {}); skipped until {}, {next}",
                 attempt.code,
                 until_text(until, now)
             );
