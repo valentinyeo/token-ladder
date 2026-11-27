@@ -4,11 +4,9 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
-from _load import REPO, load_bin
+from _load import REPO
 
-pp = load_bin("plan-pick")
 SHIMS = str(Path(REPO).resolve() / "bin" / "worker-shims")
 
 
@@ -69,20 +67,6 @@ class WorkerShimTests(unittest.TestCase):
                 out = self.run_shim("gh", *args)
                 self.assertEqual((out.returncode, out.stdout),
                                  (0, f"real gh: {' '.join(args)}\n"), out.stderr)
-
-    def test_plan_pick_reads_both_refusals_as_worker_shim_refusals(self):
-        for name, args in (("sleep", ("240",)), ("gh", ("pr", "checks", "--watch"))):
-            with self.subTest(name=name):
-                refused = pp.shim_refusal(self.run_shim(name, *args).stderr)
-                self.assertIsNotNone(refused)
-                self.assertTrue(refused.startswith(f"{name} "), refused)
-
-    def test_a_worker_command_meets_the_sleep_shim_before_the_real_sleep(self):
-        with mock.patch.dict(os.environ, self.env):
-            code, tail = pp.run_command("sleep 240")
-        self.assertEqual(code, 3, tail)
-        self.assertEqual(pp.shim_refusal(tail),
-                         "sleep 240 (over 30s; workers push and exit, the parent waits)")
 
 
 if __name__ == "__main__":

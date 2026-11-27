@@ -4,7 +4,7 @@ Read this index before driving. Each feature file is a user- or operator-facing 
 
 ## Baseline preconditions
 
-- Repo root with `config.json` and executable `bin/token-ladder` and `bin/plan-pick`.
+- Repo root with `config.json` and an executable `rust/target/release/token-ladder` (`cd rust && cargo build --release --locked`).
 - `HOME=$(mktemp -d)` and `TOKEN_LADDER_LOCAL_CONFIG=$PWD/.test-missing-config.local.json`.
 - For ladder-call journeys: stub server and stub API keys only; never call production endpoints with real keys during map runs.
 
@@ -16,6 +16,6 @@ Read this index before driving. Each feature file is a user- or operator-facing 
 
 ## Features
 
-- [plan-pick](./plan-pick.md) worker plan pick, JSON output, plans listing, loop interval, Claude helper gate, and stub `--run`.
-- [pools](./pools.md) read-only `token-ladder pools` and `status` against isolated home.
+- [plan-pick](./plan-pick.md) worker plan pick through `--plan-pick`: JSON output, plans listing, loop interval, Claude helper gate and the lane gate.
+- [pools](./pools.md) read-only `pools --json` and `status` against isolated home.
 - [ladder-call](./ladder-call.md) `ci/ladder-call` through the stub server and `ci/lint-direct-model-calls` on the repo tree.

@@ -927,7 +927,7 @@ pub fn mirror(env: &usage::Env, cfg: &Value) -> usize {
                 continue;
             };
             let install = format!(
-                "sudo -n install -D -o {user} -m 644 .local/state/token-ladder/status.json /home/{user}/.local/state/token-ladder/status.json && sudo -n install -D -o {user} -m 755 projects/token-ladder/bin/token-ladder /home/{user}/.local/bin/token-ladder && sudo -n install -D -o {user} -m 644 projects/token-ladder/config.json /home/{user}/.local/config.json"
+                "sudo -n install -D -o {user} -m 644 .local/state/token-ladder/status.json /home/{user}/.local/state/token-ladder/status.json && sudo -n install -D -o {user} -m 755 projects/token-ladder/rust/target/release/token-ladder /home/{user}/.local/bin/token-ladder && sudo -n install -D -o {user} -m 644 projects/token-ladder/config.json /home/{user}/.local/config.json"
             );
             let mut ssh = Command::new(&env.ssh);
             ssh.args(["-o", "BatchMode=yes", host, install.as_str()])
@@ -1085,7 +1085,7 @@ pub fn set_mode(request: &CollectRequest<'_>, mode: &str) -> Result<i32, String>
         command
             .args([
                 ssh.as_str(),
-                "projects/token-ladder/bin/token-ladder",
+                ".local/bin/token-ladder",
                 "mode",
                 mode,
             ])

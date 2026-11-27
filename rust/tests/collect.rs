@@ -504,7 +504,7 @@ fn mode_forwards_to_the_primary_host_off_it() {
     assert_eq!(output.status.code(), Some(0));
     let forwarded = std::fs::read_to_string(&recorder).unwrap_or_default();
     assert!(forwarded.contains("ladder-test-host"), "{forwarded}");
-    assert!(forwarded.contains("projects/token-ladder/bin/token-ladder"), "{forwarded}");
+    assert!(forwarded.contains(".local/bin/token-ladder"), "{forwarded}");
     assert!(forwarded.trim_end().ends_with("mode claude"), "{forwarded}");
     assert!(!sandbox.state("override").exists());
 }
